@@ -26,7 +26,16 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct | — |
 | `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART | — |
 
-Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/regles-acceptation.docx` ; chaque docstring cite la règle qu'elle applique. Architecture du moteur : https://claude.ai/artifact/EjLcKZ13a82uCpUaLsTpMp
+Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/regles-acceptation.docx` ; chaque docstring cite la règle qu'elle applique.
+
+## Documentation
+
+| Document | Contenu |
+|---|---|
+| [Architecture du moteur NORTH](https://claude.ai/artifact/EjLcKZ13a82uCpUaLsTpMp) | Modules et dépendances, boucle du moteur, tables D-ACC et D-DEPART, calcul d'un plan de tournée, état en mémoire, hypothèses A1–E18 et écarts connus |
+| [Pile documentaire NORTH](https://claude.ai/artifact/WwhHYhgT4Jkip186zLZKF9) | Les cinq couches du standard de documentation : processus et RACI, règles métier, glossaire et modèle du domaine, matrice de traçabilité (règle → fonction → test → preuve), code |
+| `../3 - Documentation/regles-acceptation.docx` | Catalogue des règles `R-…` et motifs `REF-…` (sa matrice de traçabilité date d'avant le codage : celle de la pile documentaire suit le code) |
+| `../3 - Documentation/standard-documentation.md` | Standard de documentation de l'équipe |
 
 ## Données hors du dossier de code
 
