@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Projet NORTH : sorties locales et données hors dépôt (confidentielles)
+_build/
+donnees/
