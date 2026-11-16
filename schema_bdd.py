@@ -3,11 +3,12 @@
 Pour chaque table ou vue visible par l'utilisateur ``dcjc`` :
 
 * ses colonnes (ordre, nom, type, NULL autorisé, valeur par défaut) ;
-* les clés primaires / étrangères déclarées ;
+* les clés déclarées : primaires, étrangères, contraintes UNIQUE et index uniques ;
 * les droits de l'utilisateur (SELECT, INSERT, UPDATE...).
 
-Les requêtes interrogent le catalogue standard ``information_schema`` :
-aucune table du projet n'est modifiée.
+Les requêtes interrogent le catalogue standard ``information_schema`` (et
+la vue ``pg_indexes`` pour les index uniques) : aucune table du projet n'est
+modifiée.
 
 Lancement depuis un terminal (sur la VM ENSIBS) : ``python3 schema_bdd.py``
 """
@@ -36,9 +37,17 @@ REQ_CLES = """
          ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
     LEFT JOIN information_schema.constraint_column_usage ccu
          ON ccu.constraint_name = tc.constraint_name AND tc.constraint_type = 'FOREIGN KEY'
-    WHERE tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')
+    WHERE tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE')
       AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
     ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position
+"""
+
+#Index uniques créés sans contrainte (CREATE UNIQUE INDEX), absents d'information_schema
+REQ_INDEX_UNIQUES = """
+    SELECT schemaname, tablename, indexdef
+    FROM pg_indexes
+    WHERE indexdef LIKE 'CREATE UNIQUE INDEX%'
+      AND schemaname NOT IN ('pg_catalog', 'information_schema')
 """
 
 REQ_DROITS = """
@@ -85,13 +94,20 @@ def lire_schema(cur):
             type_col = "%s(%d)" % (type_col, taille)
         entree["colonnes"].append([pos, nom, type_col, nullable, defaut])
 
-    #Clés primaires et étrangères
+    #Clés primaires, étrangères et contraintes UNIQUE
     for sch, table, type_cle, colonne, ref_table, ref_col in executer(cur, REQ_CLES):
         if (sch, table) in schema:
             if type_cle == 'FOREIGN KEY':
                 schema[(sch, table)]["cles"].append("FK %s -> %s.%s" % (colonne, ref_table, ref_col))
+            elif type_cle == 'UNIQUE':
+                schema[(sch, table)]["cles"].append("UNIQUE %s" % colonne)
             else:
                 schema[(sch, table)]["cles"].append("PK %s" % colonne)
+
+    #Index uniques (une PK ou une contrainte UNIQUE en crée aussi un : doublon possible)
+    for sch, table, definition in executer(cur, REQ_INDEX_UNIQUES):
+        if (sch, table) in schema:
+            schema[(sch, table)]["cles"].append("INDEX %s" % definition.split(" USING ")[-1])
 
     #Droits de l'utilisateur connecté
     for sch, table, droits in executer(cur, REQ_DROITS):

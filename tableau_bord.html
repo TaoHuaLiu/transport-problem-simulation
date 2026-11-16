@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NORTH · tableau de bord d'audit</title>
+<!-- Servi par tableau_bord.py ; Chart.js 2.5 local (/chart.js), aucune ressource externe (VM sans internet) -->
+<script src="/chart.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f3f2ee; --surface-1: #fcfcfb; --border: rgba(11,11,11,0.10);
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7973;
+    --grid: #e1e0d9; --axis: #c3c2b7;
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+    --ramp-high: #184f95; --ramp-mid: #2a78d6; --ramp-low: #86b6ef;
+    --good: #0ca30c; --good-text: #006300; --warning: #fab219; --critical: #d03b3b;
+    --target: #52514e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface-0: #111110; --surface-1: #1a1a19; --border: rgba(255,255,255,0.10);
+      --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+      --grid: #2c2c2a; --axis: #383835;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+      --ramp-high: #86b6ef; --ramp-mid: #3987e5; --ramp-low: #1c5cab;
+      --good-text: #0ca30c; --target: #c3c2b7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+         font: 14px/1.45 "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+  header { padding: 18px 28px 14px; border-bottom: 1px solid var(--border); background: var(--surface-1);
+           position: sticky; top: 0; z-index: 2; }
+  .titre { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  h1 small { font-weight: 400; color: var(--text-secondary); font-size: 14px; margin-left: 6px; }
+  .etats { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  .pastille { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+              border: 1px solid var(--border); font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+  .pastille b { color: var(--text-primary); font-weight: 600; }
+  .point { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+  .point.ok { background: var(--good); } .point.ko { background: var(--critical); } .point.att { background: var(--warning); }
+  .fenetre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
+  .fenetre label { color: var(--text-secondary); }
+  input, select, button { font: inherit; color: var(--text-primary); background: var(--surface-1);
+                          border: 1px solid var(--axis); border-radius: 6px; padding: 4px 8px; }
+  button { cursor: pointer; } button:hover { background: var(--surface-0); }
+  button.principal { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
+  a.bouton { color: var(--text-primary); text-decoration: none; border: 1px solid var(--axis); border-radius: 6px; padding: 4px 8px; }
+  .progression { flex: 1 1 220px; min-width: 200px; display: flex; align-items: center; gap: 8px; }
+  .barre { flex: 1; height: 6px; background: var(--grid); border-radius: 3px; overflow: hidden; }
+  .barre > div { height: 100%; width: 0; background: var(--text-primary); }
+  main { padding: 20px 28px 40px; display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
+  .carte { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .carte h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .carte .sous { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; }
+  .k3 { grid-column: span 3; } .k4 { grid-column: span 4; } .k6 { grid-column: span 6; }
+  .k8 { grid-column: span 8; } .k12 { grid-column: span 12; }
+  @media (max-width: 1100px) { .k3 { grid-column: span 6; } .k4, .k6, .k8 { grid-column: span 12; } }
+  .tuile .valeur { font-size: 38px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
+  .tuile .detail { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+  .note { display: inline-flex; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px;
+          padding: 2px 8px; border-radius: 6px; background: var(--surface-0); }
+  .note b { font-size: 13px; }
+  .chiffres { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px 16px; }
+  .chiffres div span { display: block; font-size: 12px; color: var(--text-secondary); }
+  .chiffres div b { font-size: 20px; font-weight: 600; }
+  .graphe { position: relative; height: 240px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-weight: 600; color: var(--text-secondary); font-size: 12px; border-bottom: 1px solid var(--axis); padding: 6px 8px; }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  td.d, th.d { text-align: right; }
+  .statut { white-space: nowrap; font-weight: 600; }
+  .statut.ok { color: var(--good-text); } .statut.ko { color: var(--critical); } .statut.info { color: var(--text-secondary); }
+  .ids { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-muted); word-break: break-all; }
+  .defile { max-height: 340px; overflow: auto; }
+  .alerte { grid-column: span 12; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--critical);
+            color: var(--critical); background: var(--surface-1); display: none; }
+  footer { padding: 0 28px 24px; color: var(--text-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="titre">
+    <h1>Logistique NORTH <small>tableau de bord d'audit · EURO-TransFRET NORTH-EU</small></h1>
+    <div class="etats">
+      <span class="pastille" id="p-horloge"><span class="point"></span>horloge <b>—</b></span>
+      <span class="pastille" id="p-moteur"><span class="point"></span>moteur <b>—</b></span>
+      <span class="pastille" id="p-collecteur"><span class="point"></span>collecteur <b>—</b></span>
+      <span class="pastille" id="p-maj"><span class="point"></span>mise à jour <b>—</b></span>
+    </div>
+  </div>
+  <div class="fenetre">
+    <label for="debut">Début de l'audit</label>
+    <input type="datetime-local" id="debut" step="1">
+    <label for="duree">durée</label>
+    <select id="duree">
+      <option value="">jusqu'à maintenant</option>
+      <option value="30">30 min réelles</option>
+      <option value="60">1 h réelle</option>
+      <option value="120" selected>2 h réelles (audit)</option>
+      <option value="240">4 h réelles</option>
+    </select>
+    <button class="principal" id="b-maintenant" title="Fixe le début à l'heure de référence actuelle, durée 2 h">Démarrer l'audit maintenant</button>
+    <button id="b-tout" title="Tout le journal, sans fenêtre">Tout le journal</button>
+    <div class="progression"><div class="barre"><div id="barre"></div></div><span class="num" id="t-progression">—</span></div>
+    <a class="bouton" id="l-rapport" href="/api/rapport.json">Rapport JSON</a>
+    <a class="bouton" id="l-statuts" href="/api/statuts.csv">Statuts CSV</a>
+  </div>
+</header>
+
+<main>
+  <div class="alerte" id="alerte"></div>
+
+  <section class="carte tuile k3">
+    <h2>Taux d'acceptation (TA)</h2>
+    <p class="sous">demandes NORTH parties à temps / reçues</p>
+    <div class="valeur num" id="v-ta">—</div>
+    <div class="detail num" id="d-ta"></div>
+    <div class="note num" id="n-ta"></div>
+  </section>
+  <section class="carte tuile k3">
+    <h2>Taux de remplissage (TR)</h2>
+    <p class="sous">moyenne au départ du premier lieu de chargement</p>
+    <div class="valeur num" id="v-tr">—</div>
+    <div class="detail num" id="d-tr"></div>
+    <div class="note num" id="n-tr"></div>
+  </section>
+  <section class="carte tuile k3">
+    <h2>Gamme haute</h2>
+    <p class="sous">part des demandes parties en gamme haute</p>
+    <div class="valeur num" id="v-haute">—</div>
+    <div class="detail num" id="d-haute"></div>
+    <div class="note num" id="n-haute"></div>
+  </section>
+  <section class="carte tuile k3">
+    <h2>Traçabilité</h2>
+    <p class="sous">contrôles bloquants passés (professionnalisme)</p>
+    <div class="valeur num" id="v-pro">—</div>
+    <div class="detail" id="d-pro"></div>
+  </section>
+
+  <section class="carte k12">
+    <div class="chiffres num" id="chiffres"></div>
+  </section>
+
+  <section class="carte k8">
+    <h2>Demandes NORTH par heure de réception</h2>
+    <p class="sous" id="s-statuts">statut final de chaque demande, regroupée par heure de réception</p>
+    <div class="graphe"><canvas id="g-statuts"></canvas></div>
+  </section>
+  <section class="carte k4">
+    <h2>TA cumulé</h2>
+    <p class="sous">depuis le début de la fenêtre ; pointillés : cible du contrat</p>
+    <div class="graphe"><canvas id="g-ta"></canvas></div>
+  </section>
+
+  <section class="carte k4">
+    <h2>Remplissage des tournées par heure de départ</h2>
+    <p class="sous">moyenne des tournées parties dans chaque intervalle</p>
+    <div class="graphe"><canvas id="g-tr"></canvas></div>
+  </section>
+  <section class="carte k4">
+    <h2>Distribution du remplissage au départ</h2>
+    <p class="sous" id="s-histo">nombre de tournées par tranche de 10 %</p>
+    <div class="graphe"><canvas id="g-histo"></canvas></div>
+  </section>
+  <section class="carte k4">
+    <h2>Gammes et motifs de refus</h2>
+    <p class="sous">demandes parties par gamme ; demandes refusées par motif</p>
+    <div class="graphe" style="height:110px"><canvas id="g-gammes"></canvas></div>
+    <div class="graphe" style="height:120px"><canvas id="g-motifs"></canvas></div>
+  </section>
+
+  <section class="carte k6">
+    <h2>Par usine et par sens</h2>
+    <p class="sous">les imports port → usine NORTH sont à nous (R-PER-02)</p>
+    <table class="num"><thead><tr><th>Usine</th><th>Sens</th><th class="d">Reçues</th><th class="d">Parties</th>
+      <th class="d">Refusées</th><th class="d">En attente</th><th class="d">TA</th></tr></thead><tbody id="t-usines"></tbody></table>
+  </section>
+  <section class="carte k6">
+    <h2>Contrôles d'audit</h2>
+    <p class="sous">ce que le Contrôle peut vérifier depuis le journal et les demandes reçues</p>
+    <div class="defile"><table><thead><tr><th>État</th><th>Contrôle</th><th class="d">Nombre</th></tr></thead><tbody id="t-controles"></tbody></table></div>
+  </section>
+
+  <section class="carte k12">
+    <h2>Derniers événements du moteur</h2>
+    <p class="sous" id="s-journal">tronçons masqués</p>
+    <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Événement</th><th>Demande</th><th>Tournée</th><th>Camion</th>
+      <th>De</th><th>Vers</th><th class="d">Remplissage</th><th>Gamme</th><th>Motif</th></tr></thead><tbody id="t-evenements"></tbody></table></div>
+  </section>
+</main>
+<footer id="pied">1 minute réelle = 1 heure projet. Les heures affichées sont réelles. Indicateurs recalculés depuis les fichiers (audit.py), indépendamment de l'état du moteur.</footer>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- Réglages
+var PERIODE_MS = 5000;           // rafraîchissement
+var css = getComputedStyle(document.documentElement);
+function v(nom) { return css.getPropertyValue(nom).trim(); }
+var C = { s1: v("--series-1"), s2: v("--series-2"), s3: v("--series-3"), haute: v("--ramp-high"), mediane: v("--ramp-mid"),
+          basse: v("--ramp-low"), grille: v("--grid"), axe: v("--axis"), texte: v("--text-secondary"), cible: v("--target") };
+
+Chart.defaults.global.defaultFontColor = C.texte;
+Chart.defaults.global.defaultFontFamily = getComputedStyle(document.body).fontFamily;
+Chart.defaults.global.defaultFontSize = 11;
+Chart.defaults.global.animation.duration = 0;
+Chart.defaults.global.maintainAspectRatio = false;
+Chart.defaults.global.legend.labels.boxWidth = 10;
+
+function pct(x, d) { return x === null || x === undefined ? "—" : (100 * x).toFixed(d === undefined ? 1 : d) + " %"; }
+function nb(x, d) { return x === null || x === undefined ? "—" : Number(x).toLocaleString("fr-FR", { maximumFractionDigits: d || 0 }); }
+function esc(t) { return String(t === undefined || t === null ? "" : t).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+function axes(empile, maxY, pourcent) {
+  // Chart.js 2.5 recopie les clés « undefined » sur ses valeurs par défaut : ne mettre que les options utilisées
+  var ticksY = { beginAtZero: true };
+  if (maxY !== undefined) ticksY.max = maxY;
+  if (pourcent) ticksY.callback = function (x) { return Math.round(100 * x) + " %"; };
+  return { xAxes: [{ stacked: !!empile, gridLines: { display: false, color: C.grille, zeroLineColor: C.axe }, ticks: { maxRotation: 0, autoSkipPadding: 8 } }],
+           yAxes: [{ stacked: !!empile, gridLines: { color: C.grille, zeroLineColor: C.axe, drawBorder: false }, ticks: ticksY }] };
+}
+function infobulle(pourcent) {
+  var bulle = { mode: "index", intersect: false };
+  if (pourcent) bulle.callbacks = { label: function (i, d) { return d.datasets[i.datasetIndex].label + " : " + pct(i.yLabel); } };
+  return bulle;
+}
+
+// ---------------------------------------------------------------- Graphiques (créés une fois, mis à jour ensuite)
+var G = {};
+G.statuts = new Chart(document.getElementById("g-statuts"), { type: "bar",
+  data: { labels: [], datasets: [
+    { label: "Parties", backgroundColor: C.s1, borderColor: v("--surface-1"), borderWidth: 1, data: [] },
+    { label: "Refusées", backgroundColor: C.s2, borderColor: v("--surface-1"), borderWidth: 1, data: [] },
+    { label: "En attente / sans décision", backgroundColor: C.s3, borderColor: v("--surface-1"), borderWidth: 1, data: [] }] },
+  options: { scales: axes(true), tooltips: infobulle(false), legend: { position: "top", align: "start" } } });
+G.ta = new Chart(document.getElementById("g-ta"), { type: "line",
+  data: { labels: [], datasets: [
+    { label: "TA cumulé", borderColor: C.s1, backgroundColor: C.s1, borderWidth: 2, fill: false, lineTension: 0, pointRadius: 0, pointHitRadius: 8, data: [] },
+    { label: "Cible", borderColor: C.cible, borderWidth: 1, borderDash: [4, 4], fill: false, pointRadius: 0, data: [] }] },
+  options: { scales: axes(false, 1, true), tooltips: infobulle(true), legend: { display: false } } });
+G.tr = new Chart(document.getElementById("g-tr"), { type: "line",
+  data: { labels: [], datasets: [
+    { label: "Remplissage moyen", borderColor: C.s1, backgroundColor: C.s1, borderWidth: 2, fill: false, lineTension: 0, pointRadius: 3, pointHitRadius: 8, spanGaps: true, data: [] },
+    { label: "Cible", borderColor: C.cible, borderWidth: 1, borderDash: [4, 4], fill: false, pointRadius: 0, data: [] },
+    { label: "Seuil de rentabilité", borderColor: C.s2, borderWidth: 1, borderDash: [2, 3], fill: false, pointRadius: 0, data: [] }] },
+  options: { scales: axes(false, 1, true), tooltips: infobulle(true), legend: { display: false } } });
+G.histo = new Chart(document.getElementById("g-histo"), { type: "bar",
+  data: { labels: ["0–10", "10–20", "20–30", "30–40", "40–50", "50–60", "60–70", "70–80", "80–90", "90–100"],
+          datasets: [{ label: "Tournées", backgroundColor: [], data: [] }] },
+  options: { scales: axes(false), tooltips: { callbacks: { title: function (i) { return "Remplissage " + i[0].xLabel + " %"; } } }, legend: { display: false } } });
+G.gammes = new Chart(document.getElementById("g-gammes"), { type: "horizontalBar",
+  data: { labels: ["Haute", "Médiane", "Basse"], datasets: [{ label: "Demandes parties", backgroundColor: [C.haute, C.mediane, C.basse], data: [] }] },
+  options: { scales: { xAxes: [{ gridLines: { color: C.grille, drawBorder: false }, ticks: { beginAtZero: true } }], yAxes: [{ gridLines: { display: false } }] },
+             legend: { display: false } } });
+G.motifs = new Chart(document.getElementById("g-motifs"), { type: "horizontalBar",
+  data: { labels: [], datasets: [{ label: "Demandes refusées", backgroundColor: C.s2, data: [] }] },
+  options: { scales: { xAxes: [{ gridLines: { color: C.grille, drawBorder: false }, ticks: { beginAtZero: true } }], yAxes: [{ gridLines: { display: false } }] },
+             legend: { display: false } } });
+
+// ---------------------------------------------------------------- Fenêtre d'audit (gardée dans le navigateur)
+var champDebut = document.getElementById("debut"), champDuree = document.getElementById("duree");
+champDebut.value = localStorage.getItem("north_debut") || "";
+champDuree.value = localStorage.getItem("north_duree") !== null ? localStorage.getItem("north_duree") : "";
+var dernier = null;
+function memoriser() { localStorage.setItem("north_debut", champDebut.value); localStorage.setItem("north_duree", champDuree.value); rafraichir(); }
+champDebut.addEventListener("change", memoriser);
+champDuree.addEventListener("change", memoriser);
+document.getElementById("b-maintenant").addEventListener("click", function () {
+  // Heure de référence du serveur : heure réelle en direct, dernier événement pour un rejeu
+  var ref = dernier ? dernier.maintenant : new Date().toISOString().slice(0, 19);
+  champDebut.value = ref.replace(" ", "T"); champDuree.value = "120"; memoriser();
+});
+document.getElementById("b-tout").addEventListener("click", function () { champDebut.value = ""; champDuree.value = ""; memoriser(); });
+function requete() {
+  var q = [];
+  if (champDebut.value) q.push("debut=" + encodeURIComponent(champDebut.value));
+  if (champDuree.value) q.push("duree=" + encodeURIComponent(champDuree.value));
+  return q.length ? "?" + q.join("&") : "";
+}
+
+// ---------------------------------------------------------------- Affichage
+function pastille(id, etat, texte) {
+  var el = document.getElementById(id);
+  el.querySelector(".point").className = "point " + etat;
+  el.querySelector("b").textContent = texte;
+}
+function age(texte, ref) {
+  if (!texte) return null;
+  return (new Date(ref.replace(" ", "T")) - new Date(texte.replace(" ", "T"))) / 1000;
+}
+function note(id, objectif) {
+  var el = document.getElementById(id);
+  if (!objectif || objectif.cible === null || objectif.cible === undefined) { el.innerHTML = "cible non saisie"; return; }
+  if (objectif.note === null) { el.innerHTML = "cible " + pct(objectif.cible, 0) + " · pas encore de mesure"; return; }
+  var signe = objectif.note >= 8.5 ? "✓" : objectif.note >= 6 ? "!" : "✗";
+  el.innerHTML = signe + " cible " + pct(objectif.cible, 0) + " · écart " + pct(objectif.ecart) + " · note <b>" + objectif.note + "/10</b>";
+}
+function constante(valeur, n) { var t = []; for (var i = 0; i < n; i++) t.push(valeur); return t; }
+
+function afficher(r) {
+  dernier = r;
+  var a = r.acceptation, t = r.remplissage, g = r.gammes, f = r.flotte, s = r.series;
+
+  // Pastilles d'état
+  pastille("p-horloge", r.horloge === "reelle" ? "ok" : "att", r.horloge === "reelle" ? "réelle (direct)" : "journal figé · " + r.maintenant.slice(11));
+  var aM = age(r.sources.dernier_evenement, r.maintenant), aC = age(r.sources.derniere_reception, r.maintenant);
+  pastille("p-moteur", aM === null ? "ko" : r.horloge === "journal" || aM <= 60 ? "ok" : "ko", aM === null ? "aucun journal" : "il y a " + Math.round(aM) + " s");
+  pastille("p-collecteur", aC === null ? "ko" : r.horloge === "journal" || aC <= 60 ? "ok" : "ko", aC === null ? "aucune demande" : "il y a " + Math.round(aC) + " s");
+  pastille("p-maj", "ok", r.genere.slice(11));
+
+  // Progression de la fenêtre
+  var fe = r.fenetre;
+  if (fe.restant_min !== null) {
+    document.getElementById("barre").style.width = Math.min(100, 100 * fe.ecoule_min / fe.duree_min) + "%";
+    document.getElementById("t-progression").textContent = Math.round(fe.ecoule_min) + " / " + Math.round(fe.duree_min) + " min · reste " + Math.round(fe.restant_min) + " min";
+  } else {
+    document.getElementById("barre").style.width = "100%";
+    document.getElementById("t-progression").textContent = fe.debut.slice(11, 16) + " → " + fe.fin.slice(11, 16) + " (" + Math.round(fe.duree_min) + " min)";
+  }
+  document.getElementById("l-rapport").href = "/api/rapport.json" + requete();
+  document.getElementById("l-statuts").href = "/api/statuts.csv" + requete();
+
+  // Tuiles
+  document.getElementById("v-ta").textContent = pct(a.ta);
+  document.getElementById("d-ta").textContent = nb(a.partie) + " parties / " + nb(a.recues) + " reçues · projeté " + pct(a.ta_projete);
+  note("n-ta", a.objectif);
+  document.getElementById("v-tr").textContent = pct(t.tr);
+  document.getElementById("d-tr").textContent = nb(t.quantiles.n) + " tournées · médiane " + pct(t.quantiles.med) + " · P10 " + pct(t.quantiles.p10);
+  note("n-tr", t.objectif);
+  document.getElementById("v-haute").textContent = pct(g.part_haute);
+  document.getElementById("d-haute").textContent = "haute " + nb(g.comptes.haute) + " · médiane " + nb(g.comptes.mediane) + " · basse " + nb(g.comptes.basse);
+  note("n-haute", g.objectif);
+  var bloquants = r.controles.filter(function (c) { return c.bloquant; });
+  var passes = bloquants.filter(function (c) { return c.ok; }).length;
+  document.getElementById("v-pro").textContent = passes + " / " + bloquants.length;
+  var ko = r.controles.filter(function (c) { return !c.ok && c.bloquant; });
+  document.getElementById("d-pro").innerHTML = ko.length ? "✗ " + ko.map(function (c) { return esc(c.code); }).join(", ") : "✓ aucun défaut bloquant";
+
+  // Alerte en tête si un contrôle bloquant échoue en direct
+  var alerte = document.getElementById("alerte");
+  if (ko.length && r.horloge === "reelle") { alerte.style.display = "block"; alerte.textContent = "✗ À corriger avant l'audit : " + ko.map(function (c) { return c.libelle + " (" + c.n + ")"; }).join(" · "); }
+  else alerte.style.display = "none";
+
+  // Chiffres secondaires
+  var chiffres = [["Reçues NORTH", nb(a.recues)], ["Parties", nb(a.partie)], ["Refusées", nb(a.refusee)],
+    ["En attente", nb(a.en_attente)], ["En retard", nb(a.en_retard)], ["Sans décision", nb(a.sans_decision)],
+    ["TA sur décidées", pct(a.ta_decidees)], ["Tournées", nb(f.tournees)], ["Camions", nb(f.camions)],
+    ["Demandes / tournée", nb(f.demandes_par_tournee, 2)], ["TR pondéré tronçons", pct(t.tr_troncons)],
+    ["Heures à vide", pct(f.part_heures_vide)], ["h-camion / demande", nb(f.heures_camion_par_demande, 1) + " h"]];
+  if (r.confidentiel) chiffres.push(["Coût / demande (hors énergie)", f.cout_par_demande === null ? "—" : nb(f.cout_par_demande, 0) + " €"]);
+  if (t.seuil !== null) chiffres.push(["Tournées sous le seuil de rentabilité", nb(t.sous_seuil)]);
+  document.getElementById("chiffres").innerHTML = chiffres.map(function (c) { return "<div><span>" + esc(c[0]) + "</span><b>" + esc(c[1]) + "</b></div>"; }).join("");
+
+  // Graphiques
+  var n = s.etiquettes.length;
+  document.getElementById("s-statuts").textContent = "statut final de chaque demande, par tranche de " + s.pas_min + " min réelles (= " + s.pas_min + " h projet) de réception";
+  G.statuts.data.labels = s.etiquettes;
+  G.statuts.data.datasets[0].data = s.partie; G.statuts.data.datasets[1].data = s.refusee; G.statuts.data.datasets[2].data = s.attente;
+  G.statuts.update(0);
+  G.ta.data.labels = s.etiquettes; G.ta.data.datasets[0].data = s.ta_cumule;
+  G.ta.data.datasets[1].data = a.objectif.cible ? constante(a.objectif.cible, n) : [];
+  G.ta.update(0);
+  G.tr.data.labels = s.etiquettes; G.tr.data.datasets[0].data = s.tr;
+  G.tr.data.datasets[1].data = t.objectif.cible ? constante(t.objectif.cible, n) : [];
+  G.tr.data.datasets[2].data = t.seuil !== null ? constante(t.seuil, n) : [];
+  G.tr.update(0);
+  G.histo.data.datasets[0].data = t.histogramme;
+  G.histo.data.datasets[0].backgroundColor = t.histogramme.map(function (_, i) { return t.seuil !== null && (i + 1) / 10 <= t.seuil + 1e-9 ? C.basse : C.s1; });
+  document.getElementById("s-histo").textContent = "nombre de tournées par tranche de 10 %" + (t.seuil !== null ? " ; clair : sous le seuil de rentabilité " + pct(t.seuil, 1) : "");
+  G.histo.update(0);
+  G.gammes.data.datasets[0].data = [g.comptes.haute, g.comptes.mediane, g.comptes.basse]; G.gammes.update(0);
+  var motifs = Object.keys(a.motifs).sort(function (x, y) { return a.motifs[y] - a.motifs[x]; });
+  G.motifs.data.labels = motifs.length ? motifs : ["aucun refus"];
+  G.motifs.data.datasets[0].data = motifs.length ? motifs.map(function (m) { return a.motifs[m]; }) : [0];
+  G.motifs.update(0);
+
+  // Tableaux
+  document.getElementById("t-usines").innerHTML = a.par_usine.map(function (l) {
+    return "<tr><td>" + esc(l.usine) + "</td><td>" + esc(l.sens) + "</td><td class=d>" + nb(l.recues) + "</td><td class=d>" + nb(l.partie) +
+      "</td><td class=d>" + nb(l.refusee) + "</td><td class=d>" + nb(l.en_attente + l.en_retard + l.sans_decision) + "</td><td class=d><b>" + pct(l.ta) + "</b></td></tr>";
+  }).join("") || "<tr><td colspan=7>aucune demande NORTH dans la fenêtre</td></tr>";
+  document.getElementById("t-controles").innerHTML = r.controles.map(function (c) {
+    var etat = c.ok ? "<span class='statut ok'>✓ OK</span>" : c.bloquant ? "<span class='statut ko'>✗ défaut</span>" : "<span class='statut info'>ⓘ à suivre</span>";
+    return "<tr><td>" + etat + "</td><td>" + esc(c.libelle) + (c.exemples.length ? "<div class=ids>" + c.exemples.map(esc).join(" ") + (c.n > c.exemples.length ? " …" : "") + "</div>" : "") +
+      "</td><td class=d>" + nb(c.n) + "</td></tr>";
+  }).join("");
+  document.getElementById("s-journal").textContent = "tronçons masqués · " + nb(r.sources.evenements) + " événements dans " + (r.sources.journal || "aucun journal");
+  document.getElementById("t-evenements").innerHTML = r.derniers_evenements.map(function (e) {
+    return "<tr><td>" + esc(e.h) + "</td><td>" + esc(e.evenement) + "</td><td class=ids>" + esc(e.demande) + "</td><td>" + esc(e.tournee) + "</td><td>" + esc(e.immat) +
+      "</td><td>" + esc(e.de) + "</td><td>" + esc(e.vers) + "</td><td class=d>" + (e.remplissage ? pct(parseFloat(e.remplissage), 0) : "") + "</td><td>" + esc(e.gamme) + "</td><td>" + esc(e.motif) + "</td></tr>";
+  }).join("");
+}
+
+function rafraichir() {
+  var x = new XMLHttpRequest();
+  x.open("GET", "/api/kpi" + requete());
+  x.timeout = 15000;
+  x.onload = function () {
+    if (x.status === 200) afficher(JSON.parse(x.responseText));
+    else pastille("p-maj", "ko", "erreur " + x.status);
+  };
+  x.onerror = x.ontimeout = function () { pastille("p-maj", "ko", "serveur injoignable"); };
+  x.send();
+}
+rafraichir();
+setInterval(rafraichir, PERIODE_MS);
+</script>
+</body>
+</html>
