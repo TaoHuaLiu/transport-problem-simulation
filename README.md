@@ -26,6 +26,7 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct | — |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
+| `nord.sh` | Lancement sur la VM : démarrer, arrêter, état, surveillance des trois processus | — |
 | `tableau_bord.html`, `static/Chart_min.js` | Page du tableau de bord et Chart.js 2.5 (copie locale, licence MIT) | — |
 | `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART | — |
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
@@ -55,6 +56,22 @@ Le code lit et écrit dans `../donnees/` (hors git) :
 Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul le classement des plans compte) et le seuil θ de `hypotheses.SEUIL_DEPART_DEFAUT`. Sans `referentiels.json`, il génère un référentiel d'exemple dans `_build/` (valeurs du sujet + estimations, signalées au démarrage).
 
 ## Sur la VM ENSIBS
+
+`nord.sh` lance et surveille la chaîne (collecteur, moteur `--direct --bdd`, tableau de bord sur le VLAN) :
+
+```bash
+sh nord.sh demarrer                       # collecteur + copie du référentiel + moteur + tableau de bord (http://IP_VM:10000/)
+sh nord.sh demarrer --seuil 0.85 --marge 0.5   # politique θ / W du balayage (sinon valeurs de hypotheses.py)
+sh nord.sh etat                           # processus, dernières lignes des logs, nombre de demandes et d'événements
+sh nord.sh surveiller                     # relance toutes les 30 s ce qui s'est arrêté (pendant l'audit)
+sh nord.sh redemarrer                     # moteur et tableau de bord seulement : le collecteur continue
+sh nord.sh arreter [--tout]               # --tout arrête aussi le collecteur
+sh nord.sh journaux                       # suit les logs
+```
+
+Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si la base est indisponible), `--confidentiel` (valeurs de l'Annexe 2 dans le tableau de bord : usage interne), `--port N`, `--local` (tableau de bord sur `127.0.0.1` seulement). Les options du dernier lancement sont mémorisées dans `../donnees/run/options` : `etat`, `redemarrer` et `surveiller` sans option les reprennent. PID dans `../donnees/run/`, logs dans `../donnees/logs/`. Relancer le moteur ouvre un nouveau journal (l'état n'est pas repris, question E18) : le tableau de bord lit le plus récent.
+
+À la main, sans le script :
 
 ```bash
 mkdir -p ../donnees
