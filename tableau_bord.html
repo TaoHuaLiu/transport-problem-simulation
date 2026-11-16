@@ -3,89 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NORTH · tableau de bord d'audit</title>
+<title>NORTH · Tableau de bord d’audit</title>
 <!-- Servi par tableau_bord.py ; Chart.js 2.5 local (/chart.js), aucune ressource externe (VM sans internet) -->
 <script src="/chart.js"></script>
 <style>
+  /* Système de design ENSIBS (charte UBS 2020) : thème clair seulement, aucune ombre ni dégradé.
+     Polices : ITC Avant Garde Gothic → Jost → URW Gothic (présente sur Linux) ; Arial pour le texte d'interface. */
   :root {
     color-scheme: light;
-    --surface-0: #f3f2ee; --surface-1: #fcfcfb; --border: rgba(11,11,11,0.10);
-    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7973;
-    --grid: #e1e0d9; --axis: #c3c2b7;
-    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
-    --ramp-high: #184f95; --ramp-mid: #2a78d6; --ramp-low: #86b6ef;
-    --good: #0ca30c; --good-text: #006300; --warning: #fab219; --critical: #d03b3b;
-    --target: #52514e;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color-scheme: dark;
-      --surface-0: #111110; --surface-1: #1a1a19; --border: rgba(255,255,255,0.10);
-      --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
-      --grid: #2c2c2a; --axis: #383835;
-      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-      --ramp-high: #86b6ef; --ramp-mid: #3987e5; --ramp-low: #1c5cab;
-      --good-text: #0ca30c; --target: #c3c2b7;
-    }
+    --white: #ffffff; --ink: #231f20; --ink-soft: #656263;
+    --ensibs-green: #8dc63f; --ensibs-green-deep: #1d6434; --ensibs-tint: #f4f9ee;
+    --ensibs-green-6: #51a737; --ensibs-green-3: #80c53c;
+    --ubs-navy: #0e4d81; --ubs-blue: #008fd0; --ubs-sky: #29c4f4;
+    --flat-pink: #ed286e; --flat-orange: #f36f22; --flat-amber: #fdb822; --flat-sand: #ccc2b6;
+    --surface: var(--white); --surface-tint: var(--ensibs-tint);
+    --text: var(--ink); --text-muted: var(--ink-soft); --text-brand: var(--ensibs-green-deep);
+    --accent: var(--ensibs-green); --on-accent: var(--ink); --parent: var(--ubs-navy);
+    --grid: #e6e9e1; --axis: #c9cdc2; --border: #dfe6d6;
+    /* Données : trio validé (CVD) parmi les jetons ; gammes = rampe ordinale de verts ENSIBS */
+    --series-1: var(--ubs-blue); --series-2: var(--flat-pink); --series-3: var(--ensibs-green);
+    --ramp-high: var(--ensibs-green-deep); --ramp-mid: var(--ensibs-green-6); --ramp-low: var(--ensibs-green-3);
+    --good-text: var(--ensibs-green-deep); --critical: var(--flat-pink); --warning: var(--flat-amber);
+    --target: var(--ink-soft);
+    --space-1: 4px; --space-2: 8px; --space-3: 16px; --space-4: 24px; --space-5: 40px;
+    --radius-sm: 4px; --radius-md: 12px; --radius-tournant: 48px;
+    --font-display: "ITC Avant Garde Gothic", Jost, "URW Gothic", "URW Gothic L", "Century Gothic", sans-serif;
+    --font-admin: Arial, "Liberation Sans", "Helvetica Neue", Helvetica, sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--surface-0); color: var(--text-primary);
-         font: 14px/1.45 "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+  body { margin: 0; background: var(--surface-tint); color: var(--text); font: 14px/1.45 var(--font-admin); }
   .num { font-variant-numeric: tabular-nums; }
-  header { padding: 18px 28px 14px; border-bottom: 1px solid var(--border); background: var(--surface-1);
-           position: sticky; top: 0; z-index: 2; }
-  .titre { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
-  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-  h1 small { font-weight: 400; color: var(--text-secondary); font-size: 14px; margin-left: 6px; }
-  .etats { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  header { padding: var(--space-3) var(--space-5) var(--space-3); background: var(--surface);
+           border-bottom: 4px solid var(--accent); position: sticky; top: 0; z-index: 2; }
+  .titre { display: flex; align-items: baseline; gap: var(--space-3); flex-wrap: wrap; }
+  .ecole { font: 700 12px/1 var(--font-display); letter-spacing: 0.08em; color: var(--text-brand); text-transform: uppercase; }
+  .ecole span { color: var(--parent); font-weight: 500; letter-spacing: 0.02em; text-transform: none; }
+  h1 { font: 700 24px/1.15 var(--font-display); margin: var(--space-1) 0 0; color: var(--text-brand); letter-spacing: -0.005em; }
+  h1 small { font: 500 15px/1.2 var(--font-display); color: var(--text-muted); margin-left: var(--space-2); }
+  .etats { display: flex; gap: var(--space-2); flex-wrap: wrap; margin-left: auto; align-self: center; }
   .pastille { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
-              border: 1px solid var(--border); font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
-  .pastille b { color: var(--text-primary); font-weight: 600; }
-  .point { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
-  .point.ok { background: var(--good); } .point.ko { background: var(--critical); } .point.att { background: var(--warning); }
-  .fenetre { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
-  .fenetre label { color: var(--text-secondary); }
-  input, select, button { font: inherit; color: var(--text-primary); background: var(--surface-1);
-                          border: 1px solid var(--axis); border-radius: 6px; padding: 4px 8px; }
-  button { cursor: pointer; } button:hover { background: var(--surface-0); }
-  button.principal { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
-  a.bouton { color: var(--text-primary); text-decoration: none; border: 1px solid var(--axis); border-radius: 6px; padding: 4px 8px; }
-  .progression { flex: 1 1 220px; min-width: 200px; display: flex; align-items: center; gap: 8px; }
-  .barre { flex: 1; height: 6px; background: var(--grid); border-radius: 3px; overflow: hidden; }
-  .barre > div { height: 100%; width: 0; background: var(--text-primary); }
-  main { padding: 20px 28px 40px; display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
-  .carte { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; min-width: 0; }
-  .carte h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
-  .carte .sous { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; }
+              border: 1px solid var(--border); background: var(--surface); font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+  .pastille b { color: var(--text); font-weight: 700; }
+  /* Pastille d'état : le point de l'étalon, toujours accompagné d'un libellé */
+  .point { width: 9px; height: 9px; border-radius: 50%; background: var(--flat-sand); }
+  .point.ok { background: var(--ensibs-green); } .point.ko { background: var(--critical); } .point.att { background: var(--warning); }
+  .fenetre { display: flex; align-items: center; gap: var(--space-2) 12px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
+  .fenetre label { color: var(--text-muted); }
+  input, select, button { font: inherit; color: var(--text); background: var(--surface);
+                          border: 1px solid var(--axis); border-radius: var(--radius-sm); padding: 5px 9px; }
+  button { cursor: pointer; } button:hover { background: var(--surface-tint); }
+  button.principal { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 700; }
+  button.principal:hover { background: var(--ensibs-green-6); border-color: var(--ensibs-green-6); }
+  a.bouton { color: var(--text-brand); font-weight: 700; text-decoration: none; border: 1px solid var(--axis);
+             border-radius: var(--radius-sm); padding: 5px 9px; background: var(--surface); }
+  a.bouton:hover { background: var(--surface-tint); }
+  .progression { flex: 1 1 220px; min-width: 200px; display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); }
+  .barre { flex: 1; height: 8px; background: var(--surface-tint); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .barre > div { height: 100%; width: 0; background: var(--ensibs-green-deep); }
+  main { padding: var(--space-4) var(--space-5) var(--space-5); display: grid; gap: var(--space-3); grid-template-columns: repeat(12, 1fr); }
+  .carte { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: var(--space-3) 20px; min-width: 0; }
+  .carte h2 { font: 700 15px/1.25 var(--font-display); margin: 0 0 2px; color: var(--text); }
+  .carte .sous { font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
   .k3 { grid-column: span 3; } .k4 { grid-column: span 4; } .k6 { grid-column: span 6; }
   .k8 { grid-column: span 8; } .k12 { grid-column: span 12; }
   @media (max-width: 1100px) { .k3 { grid-column: span 6; } .k4, .k6, .k8 { grid-column: span 12; } }
-  .tuile .valeur { font-size: 38px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
-  .tuile .detail { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
-  .note { display: inline-flex; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px;
-          padding: 2px 8px; border-radius: 6px; background: var(--surface-0); }
+  /* Tuiles d'indicateurs : filet vert ENSIBS à gauche, chiffre en titrage */
+  .tuile { border-left: 6px solid var(--accent); }
+  .tuile .valeur { font: 700 40px/1.1 var(--font-display); color: var(--text-brand); letter-spacing: -0.01em; }
+  .tuile .detail { font-size: 12px; color: var(--text-muted); margin-top: var(--space-1); }
+  .note { display: inline-flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 12px;
+          padding: 3px 10px; border-radius: var(--radius-sm); background: var(--surface-tint); color: var(--text); }
   .note b { font-size: 13px; }
-  .chiffres { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px 16px; }
-  .chiffres div span { display: block; font-size: 12px; color: var(--text-secondary); }
-  .chiffres div b { font-size: 20px; font-weight: 600; }
+  .chiffres { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px var(--space-3); }
+  .chiffres div span { display: block; font-size: 12px; color: var(--text-muted); }
+  .chiffres div b { font: 700 20px/1.25 var(--font-display); color: var(--text); }
   .graphe { position: relative; height: 240px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; font-weight: 600; color: var(--text-secondary); font-size: 12px; border-bottom: 1px solid var(--axis); padding: 6px 8px; }
+  th { text-align: left; font-weight: 700; color: var(--text-brand); font-size: 12px; border-bottom: 2px solid var(--accent); padding: 6px 8px; }
   td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
   td.d, th.d { text-align: right; }
-  .statut { white-space: nowrap; font-weight: 600; }
-  .statut.ok { color: var(--good-text); } .statut.ko { color: var(--critical); } .statut.info { color: var(--text-secondary); }
-  .ids { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-muted); word-break: break-all; }
+  .statut { white-space: nowrap; font-weight: 700; }
+  .statut.ok { color: var(--good-text); } .statut.ko { color: var(--critical); } .statut.info { color: var(--text-muted); }
+  .ids { font-family: ui-monospace, "DejaVu Sans Mono", Menlo, monospace; font-size: 11px; color: var(--text-muted); word-break: break-all; }
   .defile { max-height: 340px; overflow: auto; }
-  .alerte { grid-column: span 12; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--critical);
-            color: var(--critical); background: var(--surface-1); display: none; }
-  footer { padding: 0 28px 24px; color: var(--text-muted); font-size: 12px; }
+  .alerte { grid-column: span 12; padding: 12px var(--space-3); border-radius: var(--radius-md); border: 2px solid var(--critical);
+            color: var(--text); background: var(--surface); font-weight: 700; display: none; }
+  /* Pied de page : le « blanc tournant » de la charte, coin supérieur droit arrondi */
+  footer { margin: 0 var(--space-5) var(--space-5); padding: var(--space-3) var(--space-4); background: var(--surface);
+           border-top-right-radius: var(--radius-tournant); color: var(--text-muted); font-size: 12px;
+           display: flex; gap: var(--space-3); flex-wrap: wrap; justify-content: space-between; align-items: flex-end; }
+  footer .site { font: 700 13px/1.3 var(--font-display); color: var(--text-brand); }
 </style>
 </head>
 <body>
 <header>
   <div class="titre">
-    <h1>Logistique NORTH <small>tableau de bord d'audit · EURO-TransFRET NORTH-EU</small></h1>
+    <div>
+      <div class="ecole">ENSIBS <span>· Université Bretagne Sud · Du capteur jusqu’au Cloud</span></div>
+      <h1>Logistique NORTH <small>Tableau de bord d’audit · EURO-TransFRET NORTH-EU</small></h1>
+    </div>
     <div class="etats">
       <span class="pastille" id="p-horloge"><span class="point"></span>horloge <b>—</b></span>
       <span class="pastille" id="p-moteur"><span class="point"></span>moteur <b>—</b></span>
@@ -94,17 +110,17 @@
     </div>
   </div>
   <div class="fenetre">
-    <label for="debut">Début de l'audit</label>
+    <label for="debut">Début de l’audit</label>
     <input type="datetime-local" id="debut" step="1">
     <label for="duree">durée</label>
     <select id="duree">
-      <option value="">jusqu'à maintenant</option>
+      <option value="">jusqu’à maintenant</option>
       <option value="30">30 min réelles</option>
       <option value="60">1 h réelle</option>
       <option value="120" selected>2 h réelles (audit)</option>
       <option value="240">4 h réelles</option>
     </select>
-    <button class="principal" id="b-maintenant" title="Fixe le début à l'heure de référence actuelle, durée 2 h">Démarrer l'audit maintenant</button>
+    <button class="principal" id="b-maintenant" title="Fixe le début à l’heure de référence actuelle, durée 2 h">Démarrer l’audit maintenant</button>
     <button id="b-tout" title="Tout le journal, sans fenêtre">Tout le journal</button>
     <div class="progression"><div class="barre"><div id="barre"></div></div><span class="num" id="t-progression">—</span></div>
     <a class="bouton" id="l-rapport" href="/api/rapport.json">Rapport JSON</a>
@@ -116,7 +132,7 @@
   <div class="alerte" id="alerte"></div>
 
   <section class="carte tuile k3">
-    <h2>Taux d'acceptation (TA)</h2>
+    <h2>Taux d’acceptation (TA)</h2>
     <p class="sous">demandes NORTH parties à temps / reçues</p>
     <div class="valeur num" id="v-ta">—</div>
     <div class="detail num" id="d-ta"></div>
@@ -182,7 +198,7 @@
       <th class="d">Refusées</th><th class="d">En attente</th><th class="d">TA</th></tr></thead><tbody id="t-usines"></tbody></table>
   </section>
   <section class="carte k6">
-    <h2>Contrôles d'audit</h2>
+    <h2>Contrôles d’audit</h2>
     <p class="sous">ce que le Contrôle peut vérifier depuis le journal et les demandes reçues</p>
     <div class="defile"><table><thead><tr><th>État</th><th>Contrôle</th><th class="d">Nombre</th></tr></thead><tbody id="t-controles"></tbody></table></div>
   </section>
@@ -194,7 +210,10 @@
       <th>De</th><th>Vers</th><th class="d">Remplissage</th><th>Gamme</th><th>Motif</th></tr></thead><tbody id="t-evenements"></tbody></table></div>
   </section>
 </main>
-<footer id="pied">1 minute réelle = 1 heure projet. Les heures affichées sont réelles. Indicateurs recalculés depuis les fichiers (audit.py), indépendamment de l'état du moteur.</footer>
+<footer id="pied">
+  <span>1 minute réelle = 1 heure projet. Les heures affichées sont réelles. Indicateurs recalculés depuis les fichiers (audit.py), indépendamment de l’état du moteur.</span>
+  <span class="site">www-ensibs.univ-ubs.fr</span>
+</footer>
 
 <script>
 "use strict";
@@ -203,23 +222,24 @@ var PERIODE_MS = 5000;           // rafraîchissement
 var css = getComputedStyle(document.documentElement);
 function v(nom) { return css.getPropertyValue(nom).trim(); }
 var C = { s1: v("--series-1"), s2: v("--series-2"), s3: v("--series-3"), haute: v("--ramp-high"), mediane: v("--ramp-mid"),
-          basse: v("--ramp-low"), grille: v("--grid"), axe: v("--axis"), texte: v("--text-secondary"), cible: v("--target") };
+          basse: v("--ramp-low"), sous: v("--ubs-sky"), seuil: v("--flat-orange"), grille: v("--grid"), axe: v("--axis"), texte: v("--text-muted"), cible: v("--target") };
 
 Chart.defaults.global.defaultFontColor = C.texte;
-Chart.defaults.global.defaultFontFamily = getComputedStyle(document.body).fontFamily;
+Chart.defaults.global.defaultFontFamily = v("--font-admin");
 Chart.defaults.global.defaultFontSize = 11;
 Chart.defaults.global.animation.duration = 0;
 Chart.defaults.global.maintainAspectRatio = false;
 Chart.defaults.global.legend.labels.boxWidth = 10;
 
-function pct(x, d) { return x === null || x === undefined ? "—" : (100 * x).toFixed(d === undefined ? 1 : d) + " %"; }
+// Typographie française : virgule décimale, espace insécable avant « % »
+function pct(x, d) { return x === null || x === undefined ? "—" : (100 * x).toFixed(d === undefined ? 1 : d).replace(".", ",") + "\u00a0%"; }
 function nb(x, d) { return x === null || x === undefined ? "—" : Number(x).toLocaleString("fr-FR", { maximumFractionDigits: d || 0 }); }
 function esc(t) { return String(t === undefined || t === null ? "" : t).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 function axes(empile, maxY, pourcent) {
   // Chart.js 2.5 recopie les clés « undefined » sur ses valeurs par défaut : ne mettre que les options utilisées
   var ticksY = { beginAtZero: true };
   if (maxY !== undefined) ticksY.max = maxY;
-  if (pourcent) ticksY.callback = function (x) { return Math.round(100 * x) + " %"; };
+  if (pourcent) ticksY.callback = function (x) { return Math.round(100 * x) + "\u00a0%"; };
   return { xAxes: [{ stacked: !!empile, gridLines: { display: false, color: C.grille, zeroLineColor: C.axe }, ticks: { maxRotation: 0, autoSkipPadding: 8 } }],
            yAxes: [{ stacked: !!empile, gridLines: { color: C.grille, zeroLineColor: C.axe, drawBorder: false }, ticks: ticksY }] };
 }
@@ -233,9 +253,9 @@ function infobulle(pourcent) {
 var G = {};
 G.statuts = new Chart(document.getElementById("g-statuts"), { type: "bar",
   data: { labels: [], datasets: [
-    { label: "Parties", backgroundColor: C.s1, borderColor: v("--surface-1"), borderWidth: 1, data: [] },
-    { label: "Refusées", backgroundColor: C.s2, borderColor: v("--surface-1"), borderWidth: 1, data: [] },
-    { label: "En attente / sans décision", backgroundColor: C.s3, borderColor: v("--surface-1"), borderWidth: 1, data: [] }] },
+    { label: "Parties", backgroundColor: C.s1, borderColor: v("--surface"), borderWidth: 1, data: [] },
+    { label: "Refusées", backgroundColor: C.s2, borderColor: v("--surface"), borderWidth: 1, data: [] },
+    { label: "En attente / sans décision", backgroundColor: C.s3, borderColor: v("--surface"), borderWidth: 1, data: [] }] },
   options: { scales: axes(true), tooltips: infobulle(false), legend: { position: "top", align: "start" } } });
 G.ta = new Chart(document.getElementById("g-ta"), { type: "line",
   data: { labels: [], datasets: [
@@ -246,7 +266,7 @@ G.tr = new Chart(document.getElementById("g-tr"), { type: "line",
   data: { labels: [], datasets: [
     { label: "Remplissage moyen", borderColor: C.s1, backgroundColor: C.s1, borderWidth: 2, fill: false, lineTension: 0, pointRadius: 3, pointHitRadius: 8, spanGaps: true, data: [] },
     { label: "Cible", borderColor: C.cible, borderWidth: 1, borderDash: [4, 4], fill: false, pointRadius: 0, data: [] },
-    { label: "Seuil de rentabilité", borderColor: C.s2, borderWidth: 1, borderDash: [2, 3], fill: false, pointRadius: 0, data: [] }] },
+    { label: "Seuil de rentabilité", borderColor: C.seuil, borderWidth: 1, borderDash: [2, 3], fill: false, pointRadius: 0, data: [] }] },
   options: { scales: axes(false, 1, true), tooltips: infobulle(true), legend: { display: false } } });
 G.histo = new Chart(document.getElementById("g-histo"), { type: "bar",
   data: { labels: ["0–10", "10–20", "20–30", "30–40", "40–50", "50–60", "60–70", "70–80", "80–90", "90–100"],
@@ -297,7 +317,7 @@ function note(id, objectif) {
   if (!objectif || objectif.cible === null || objectif.cible === undefined) { el.innerHTML = "cible non saisie"; return; }
   if (objectif.note === null) { el.innerHTML = "cible " + pct(objectif.cible, 0) + " · pas encore de mesure"; return; }
   var signe = objectif.note >= 8.5 ? "✓" : objectif.note >= 6 ? "!" : "✗";
-  el.innerHTML = signe + " cible " + pct(objectif.cible, 0) + " · écart " + pct(objectif.ecart) + " · note <b>" + objectif.note + "/10</b>";
+  el.innerHTML = signe + " cible " + pct(objectif.cible, 0) + " · écart " + pct(objectif.ecart) + " · note <b>" + nb(objectif.note, 1) + "/10</b>";
 }
 function constante(valeur, n) { var t = []; for (var i = 0; i < n; i++) t.push(valeur); return t; }
 
@@ -336,13 +356,13 @@ function afficher(r) {
   note("n-haute", g.objectif);
   var bloquants = r.controles.filter(function (c) { return c.bloquant; });
   var passes = bloquants.filter(function (c) { return c.ok; }).length;
-  document.getElementById("v-pro").textContent = passes + " / " + bloquants.length;
+  document.getElementById("v-pro").textContent = passes + "\u00a0/\u00a0" + bloquants.length;
   var ko = r.controles.filter(function (c) { return !c.ok && c.bloquant; });
   document.getElementById("d-pro").innerHTML = ko.length ? "✗ " + ko.map(function (c) { return esc(c.code); }).join(", ") : "✓ aucun défaut bloquant";
 
   // Alerte en tête si un contrôle bloquant échoue en direct
   var alerte = document.getElementById("alerte");
-  if (ko.length && r.horloge === "reelle") { alerte.style.display = "block"; alerte.textContent = "✗ À corriger avant l'audit : " + ko.map(function (c) { return c.libelle + " (" + c.n + ")"; }).join(" · "); }
+  if (ko.length && r.horloge === "reelle") { alerte.style.display = "block"; alerte.textContent = "✗ À corriger avant l’audit\u00a0: " + ko.map(function (c) { return c.libelle + " (" + c.n + ")"; }).join(" · "); }
   else alerte.style.display = "none";
 
   // Chiffres secondaires
@@ -369,8 +389,8 @@ function afficher(r) {
   G.tr.data.datasets[2].data = t.seuil !== null ? constante(t.seuil, n) : [];
   G.tr.update(0);
   G.histo.data.datasets[0].data = t.histogramme;
-  G.histo.data.datasets[0].backgroundColor = t.histogramme.map(function (_, i) { return t.seuil !== null && (i + 1) / 10 <= t.seuil + 1e-9 ? C.basse : C.s1; });
-  document.getElementById("s-histo").textContent = "nombre de tournées par tranche de 10 %" + (t.seuil !== null ? " ; clair : sous le seuil de rentabilité " + pct(t.seuil, 1) : "");
+  G.histo.data.datasets[0].backgroundColor = t.histogramme.map(function (_, i) { return t.seuil !== null && (i + 1) / 10 <= t.seuil + 1e-9 ? C.sous : C.s1; });
+  document.getElementById("s-histo").textContent = "nombre de tournées par tranche de 10 %" + (t.seuil !== null ? "\u00a0; bleu clair\u00a0: sous le seuil de rentabilité " + pct(t.seuil, 1) : "");
   G.histo.update(0);
   G.gammes.data.datasets[0].data = [g.comptes.haute, g.comptes.mediane, g.comptes.basse]; G.gammes.update(0);
   var motifs = Object.keys(a.motifs).sort(function (x, y) { return a.motifs[y] - a.motifs[x]; });

@@ -106,6 +106,7 @@ python3 tableau_bord.py --journal "../../_build/rejeu-audit/balayage/x10-th0.85-
 - **Cibles** : `../donnees/cibles_contrat.json` (hors git), par exemple `{"ta": 0.85, "tr": 0.75, "part_haute": 0.3}`, ou les options `--cible-…`. Sans cible, seule celle du TA (notre proposition, 85 %) est affichée.
 - **Horloge** : en direct, l'heure réelle ; si le journal n'a pas bougé depuis 2 minutes (rejeu, moteur arrêté), l'heure de son dernier événement. On peut forcer avec `--horloge reelle|journal`.
 - **Données confidentielles** : le seuil de rentabilité et le coût estimé par demande (hors énergie) tirés de l'Annexe 2 ne s'affichent qu'avec `--confidentiel`. Sans cette option, on peut ouvrir la page depuis le VLAN ou la montrer au Contrôle.
+- **Mise en forme** : système de design ENSIBS (charte UBS 2020) : verts ENSIBS et bleu UBS, thème clair, typographie française ; polices Avant Garde Gothic, sinon Jost, URW Gothic ou Century Gothic, et Arial pour le texte (aucune police téléchargée : la VM n’a pas internet).
 - Une requête à la fois : le serveur relit les fichiers seulement s'ils ont changé (≈ 0,1 s pour un audit de 2 h à 10 fois la flotte).
 
 ## Fichiers du collecteur
