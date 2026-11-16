@@ -3,9 +3,9 @@
 Code du groupe Logistique NORTH (structure NORTH-EU d'EURO-TransFRET) pour le projet « Du capteur jusqu'au Cloud » (ENSIBS, 2026-2027). La chaîne a deux étapes :
 
 1. `collecteur.py` écoute l'ERP de Garden Food (broadcast UDP) et enregistre chaque demande de transport ;
-2. `moteur.py` décide de chaque demande NORTH (accepter, refuser avec un motif `REF-…`, ignorer), construit les tournées, les fait partir et tient le journal de traçabilité.
+2. `moteur.py` décide de chaque demande NORTH (accepter, refuser avec un motif `REF-…`, ignorer), construit les tournées, les fait partir, tient le journal de traçabilité et, sur la VM, met à jour nos tables `CAMION_NORTH`, `TRAJET_NORTH` et `ARCHIVAGE_COMMANDE_NORTH` (`archivage.py`).
 
-Python 3.10+, bibliothèque standard uniquement ; `psycopg2` seulement pour lire la base sur la VM. Toutes les commandes se lancent depuis ce dossier.
+Python 3.10+, bibliothèque standard uniquement ; `psycopg2` seulement sur la VM, pour lire la base et écrire nos tables `*_NORTH`. Toutes les commandes se lancent depuis ce dossier.
 
 Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique : https://github.com/TaoHuaLiu/transport-problem-simulation). Les chemins en `../` renvoient au reste du projet, qui n'est pas dans le dépôt.
 
@@ -23,6 +23,7 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `planification.py` | Plan d'une tournée (chargements puis livraisons), pauses, gamme, coût ; table D-DEPART | R-DEL-01, R-CON-01, R-GAM, R-SPEC-02 |
 | `decision.py` | Table D-ACC : ignorer, refuser ou accepter dans le meilleur plan | D-ACC, R-OPT-01/02/03 |
 | `tracabilite.py` | Journal CSV des événements ; calcul de TA et TR | R-KPI-TA, R-KPI-TR |
+| `archivage.py` | Écrit l'état du moteur dans `CAMION_NORTH`, `TRAJET_NORTH`, `ARCHIVAGE_COMMANDE_NORTH` (`../3 - Documentation/tables-nord.sql`) ; `--etat` pour compter les lignes | R-SPEC-02, R-DEL-01, R-GAM, R-KPI-TR |
 | `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct | — |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
@@ -30,6 +31,7 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `tableau_bord.html`, `static/Chart_min.js` | Page du tableau de bord et Chart.js 2.5 (copie locale, licence MIT) | — |
 | `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART | — |
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
+| `tests/test_archivage.py` | Lignes et contraintes des tables `*_NORTH`, statuts des trajets dans le temps, prix, écritures (base simulée), reprise après arrêt | — |
 
 Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/regles-acceptation.docx` ; chaque docstring cite la règle qu'elle applique.
 
@@ -57,7 +59,7 @@ Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul l
 
 ## Sur la VM ENSIBS
 
-`nord.sh` lance et surveille la chaîne (collecteur, moteur `--direct --bdd`, tableau de bord sur le VLAN) :
+`nord.sh` lance et surveille la chaîne (collecteur, moteur `--direct --bdd --archiver`, tableau de bord sur le VLAN) :
 
 ```bash
 sh nord.sh demarrer                       # collecteur + copie du référentiel + moteur + tableau de bord (http://IP_VM:10000/)
@@ -69,7 +71,7 @@ sh nord.sh arreter [--tout]               # --tout arrête aussi le collecteur
 sh nord.sh journaux                       # suit les logs
 ```
 
-Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si la base est indisponible), `--confidentiel` (valeurs de l'Annexe 2 dans le tableau de bord : usage interne), `--port N`, `--local` (tableau de bord sur `127.0.0.1` seulement). Les options du dernier lancement sont mémorisées dans `../donnees/run/options` : `etat`, `redemarrer` et `surveiller` sans option les reprennent. PID dans `../donnees/run/`, logs dans `../donnees/logs/`. Relancer le moteur ouvre un nouveau journal (l'état n'est pas repris, question E18) : le tableau de bord lit le plus récent.
+Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si la base est indisponible ; le moteur n'écrit alors pas les tables `*_NORTH`), `--sans-archive` (lit la base sans écrire les tables `*_NORTH`), `--confidentiel` (valeurs de l'Annexe 2 dans le tableau de bord : usage interne), `--port N`, `--local` (tableau de bord sur `127.0.0.1` seulement). Les options du dernier lancement sont mémorisées dans `../donnees/run/options` : `etat`, `redemarrer` et `surveiller` sans option les reprennent. PID dans `../donnees/run/`, logs dans `../donnees/logs/`. Relancer le moteur ouvre un nouveau journal (l'état n'est pas repris, question E18) : le tableau de bord lit le plus récent.
 
 À la main, sans le script :
 
@@ -77,7 +79,8 @@ Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si 
 mkdir -p ../donnees
 nohup python3 collecteur.py >> ../donnees/collecteur.log 2>&1 &   # en continu
 python3 referentiels.py --export                                   # copie la base dans ../donnees/referentiels.json
-python3 moteur.py --direct --bdd                                   # lit le CSV du jour, rafraîchit la base chaque minute réelle
+python3 moteur.py --direct --bdd --archiver                        # lit le CSV du jour, rafraîchit la base chaque minute réelle, écrit les tables *_NORTH
+python3 archivage.py --etat                                        # lignes par statut dans les tables *_NORTH (lecture seule)
 python3 tableau_bord.py --hote 0.0.0.0                             # tableau de bord : http://IP_VM:10000/
 ```
 
@@ -146,8 +149,22 @@ Une paire de fichiers par jour **réel** :
 
 Les noms de villes sont recopiés tels qu'envoyés (sans accents dans l'échantillon du 2026-10-19) ; le moteur les normalise quand même avant la jointure avec `LOCATIONS_NAMES`. Volume attendu : environ 2 500 demandes par heure réelle.
 
+## Tables `*_NORTH` (archivage)
+
+Avec `--archiver` (mode direct seulement), le moteur tient à jour les trois tables créées par `../3 - Documentation/tables-nord.sql`. À chaque tick, `archivage.py` recalcule les lignes depuis l'état du moteur et n'écrit que celles qui ont changé (`INSERT … ON CONFLICT DO UPDATE`, une transaction, ordre camions → trajets → commandes). Aucune table fournie n'est modifiée.
+
+| Table | Contenu | Remarques |
+|---|---|---|
+| `CAMION_NORTH` | Un camion de la flotte NORTH par ligne, écrit au démarrage | `DISPO` : ni réservé par une tournée ouverte, ni en tournée |
+| `TRAJET_NORTH` | Une tournée par ligne ; `ID_TRAJET` = `T<AAMMJJhhmmss>-<n°>` (heure de démarrage du moteur : unique d'un lancement à l'autre) | `TAUX_REMPL` en % (remplissage du plan) ; `STATUT` suit le plan dans le temps : `EN_CONSTITUTION` (ouverte, ou export encore en chargement à l'usine), `VIDE_VERS_PORT`, `ATTENTE_PORT`, `ENTRE_CHARGEMENTS`, `EN_LIVRAISON`, `TERMINE`, `ANNULE` |
+| `ARCHIVAGE_COMMANDE_NORTH` | Une demande NORTH décidée par ligne | `STATUT` = état du moteur ; `JUSTI_REFUS` = motif `REF-…` et libellé ; `H_DEP_R` = instant comparé à `H_DEP` (R-DEL-01) ; `SPEC_*` vide si non demandée, sinon respectée ou non par le camion ; `COUT_PREST` = **prix facturé** (part d'un camion au seuil de rentabilité × coefficient de gamme, `methode-contrat.md` §3), seulement pour une demande partie et avec `annexe2_confidentiel.json` |
+
+- Les refus REF-DONNEES dont un champ viole une contrainte (lieu inconnu, type invalide…) ne sont pas archivés : ils restent au journal CSV.
+- Base injoignable : le moteur continue, les lignes en retard sont écrites quand la connexion revient (un message par minute au plus dans le log). Une ligne refusée par une contrainte est mise de côté et affichée, sans bloquer les autres.
+- Redémarrage : les commandes encore `ACCEPTEE` du lancement précédent passent `EXPIREE` (« moteur redémarré avant le départ »), ses trajets `EN_CONSTITUTION` passent `ANNULE`, et les demandes déjà en base ne sont ni redécidées ni réécrites. Les trajets déjà partis gardent leur dernier statut.
+
 ## Journal du moteur
 
-Une ligne par événement (`ACQUITTEMENT`, `REFUS` avec motif, `DEPART`, `TRONCON`, `PARTIE` avec gamme, `EXPIRATION`), séparateur `;`. Les demandes hors périmètre NORTH ne sont pas journalisées. Ce journal sert de source à la table de traçabilité partagée, dont le schéma est fixé par le groupe Contrôle (question A1) : l'écriture dans cette table n'est pas encore codée.
+Une ligne par événement (`ACQUITTEMENT`, `REFUS` avec motif, `DEPART`, `TRONCON`, `PARTIE` avec gamme, `EXPIRATION`), séparateur `;`. Les demandes hors périmètre NORTH ne sont pas journalisées. Ce journal reste la source de référence (les tables `*_NORTH` en sont le reflet en base). La table de traçabilité partagée, dont le schéma est fixé par le groupe Contrôle (question A1), n'est pas encore écrite.
 
 Unités : 1 minute réelle = 1 heure projet. Les dates sont en heure réelle, les durées en heures projet.

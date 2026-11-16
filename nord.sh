@@ -12,6 +12,7 @@
 # Options de demarrer / redemarrer / surveiller (mémorisées dans ../donnees/run/options :
 # sans option, une commande reprend celles du dernier lancement) :
 #   --sans-bdd        moteur sans la base (lit ../donnees/referentiels.json) ; hors VLAN ou base en panne
+#   --sans-archive    le moteur n'écrit pas les tables *_NORTH (par défaut, il les écrit quand il lit la base)
 #   --seuil X         seuil de départ θ du moteur (part du plancher, 0-1)
 #   --marge W         marge W avant le départ au plus tard (heures projet)
 #   --confidentiel    le tableau de bord affiche les valeurs de l'Annexe 2 : à ne pas montrer au Contrôle
@@ -35,6 +36,7 @@ SERVICES="collecteur moteur tableau"
 
 # ---------------------------------------------------------------- Options
 SANS_BDD=0
+SANS_ARCHIVE=0
 CONFIDENTIEL=0
 PORT=10000
 HOTE=0.0.0.0
@@ -51,6 +53,7 @@ lire_options() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --sans-bdd) SANS_BDD=1 ;;
+            --sans-archive) SANS_ARCHIVE=1 ;;
             --confidentiel) CONFIDENTIEL=1 ;;
             --local) HOTE=127.0.0.1 ;;
             --tout) TOUT=1 ;;
@@ -85,6 +88,8 @@ commande_de() {
         moteur)
             cmd="python3 -u moteur.py --direct"
             [ "$SANS_BDD" -eq 1 ] || cmd="$cmd --bdd"
+            # Tables CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH (archivage.py)
+            [ "$SANS_BDD" -eq 1 ] || [ "$SANS_ARCHIVE" -eq 1 ] || cmd="$cmd --archiver"
             [ -z "$SEUIL" ] || cmd="$cmd --seuil $SEUIL"
             [ -z "$MARGE" ] || cmd="$cmd --marge $MARGE"
             echo "$cmd" ;;
@@ -176,6 +181,7 @@ adresse_tableau() {
 memoriser_options() {
     cat > "$RUN/options" <<FIN
 SANS_BDD=$SANS_BDD
+SANS_ARCHIVE=$SANS_ARCHIVE
 CONFIDENTIEL=$CONFIDENTIEL
 PORT=$PORT
 HOTE=$HOTE

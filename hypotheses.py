@@ -84,6 +84,9 @@ REGROUPER_ENTRE_LIEUX_DEP = False
 #: (gamme, arrêts intermédiaires max, allongement max), de la plus haute à la plus basse.
 GAMMES = [("haute", 0, 1.1), ("mediane", 1, 1.5), ("basse", 3, 2.5)]
 
+#: Coefficient de prix de chaque gamme (prix facturé, ``methode-contrat.md`` §3) : valeurs de départ, à négocier.
+COEF_PRIX_GAMME = {"haute": 1.15, "mediane": 1.00, "basse": 0.85}
+
 # ---------------------------------------------------------------- Politique (D15, D16, E17)
 #: W : marge gardée avant le départ au plus tard d'une tournée (D-DEPART).
 MARGE_DEPART_H = 1.0

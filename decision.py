@@ -171,7 +171,8 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
     _, _, _, id_tournee, immat, plan = min(candidats, key=lambda c: (c[0], c[1], c[2]))
     if id_tournee is None:
         etat["compteur"] += 1
-        id_tournee = "T%05d" % etat["compteur"]
+        # Le préfixe (date de démarrage du moteur) rend l'identifiant unique d'un lancement à l'autre (TRAJET_NORTH)
+        id_tournee = "%s%05d" % (etat.get("prefixe", "T"), etat["compteur"])
         etat["tournees"][id_tournee] = {"id": id_tournee, "camion": immat, "nature": demande["nature"],
                                         "demandes": [], "statut": "ouverte", "plan": plan}
         flotte[immat]["tournee"] = id_tournee

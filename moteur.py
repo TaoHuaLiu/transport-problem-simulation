@@ -6,7 +6,8 @@
 2. lit les nouvelles demandes ;
 3. décide chaque demande (table D-ACC, :mod:`decision`) ;
 4. décide le départ de chaque tournée ouverte (table D-DEPART, :mod:`planification`) ;
-5. écrit les événements dans le journal de traçabilité.
+5. écrit les événements dans le journal de traçabilité ;
+6. avec ``--archiver`` (mode direct), met à jour les tables ``*_NORTH`` de la base (:mod:`archivage`).
 
 Deux modes :
 
@@ -20,7 +21,7 @@ Utilisation :
 .. code-block:: bash
 
     python3 moteur.py --rejeu "../../6 - Data/Briefcase/demandes_2026-10-19.jsonl"   # local
-    python3 moteur.py --direct --bdd                                                    # VM
+    python3 moteur.py --direct --bdd --archiver                                         # VM
 """
 
 import argparse
@@ -30,6 +31,7 @@ import json
 import os
 import time
 
+import archivage
 import decision
 import flotte as module_flotte
 import hypotheses
@@ -121,7 +123,8 @@ def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.d
     :param journal: Journal de traçabilité.
     """
     for h_reception, id_demande, champs in nouvelles:
-        if id_demande in etat["demandes"]:
+        # Déjà vue, ou déjà décidée par un lancement précédent (archivée en base)
+        if id_demande in etat["demandes"] or id_demande in etat.get("deja_archivees", ()):
             continue
         demande = regles.preparer_demande(id_demande, champs, h_reception, ref)
         decision.traiter_demande(demande, etat, ref, maintenant, parametres, journal)
@@ -167,7 +170,9 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     print("Fiches camion : %s\nFlotte NORTH : %d camions\n%s" % (os.path.abspath(fiches), len(flotte), module_flotte.resume_flotte(flotte, ref)))
     print("Coûts : %s ; seuil de départ θ = %.2f ; marge W = %.1f h projet"
           % ("Annexe 2" if couts["source"] != "defaut" else "taux par défaut", parametres["seuil"], parametres["marge_h"]))
-    etat = {"flotte": flotte, "tournees": {}, "demandes": {}, "compteur": 0}
+    # Le préfixe des tournées (heure de démarrage) les rend uniques d'un lancement à l'autre (TRAJET_NORTH)
+    etat = {"flotte": flotte, "tournees": {}, "demandes": {}, "compteur": 0,
+            "prefixe": debut.strftime("T%y%m%d%H%M%S-"), "deja_archivees": set()}
     return etat, ref, parametres
 
 
@@ -211,6 +216,11 @@ def en_direct(arguments: argparse.Namespace) -> None:
     journal = tracabilite.ouvrir_journal(arguments.sortie, debut)
     lecteur = {"repertoire": arguments.demandes}
     dernier_rafraichissement = debut
+    archive = archivage.ouvrir() if arguments.archiver else None
+    if archive is not None:
+        # Avant la première lecture : reprise après arrêt (commandes déjà archivées) et flotte en base
+        archivage.synchroniser(archive, etat, ref, parametres["couts"], debut)
+        print("Archivage dans CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH : %d ligne(s) écrite(s)" % archive["ecrites"])
     print("Moteur en direct sur %s ; 'Ctrl+C' pour arrêter" % os.path.abspath(arguments.demandes))
     try:
         while True:
@@ -221,6 +231,8 @@ def en_direct(arguments: argparse.Namespace) -> None:
                 dernier_rafraichissement = maintenant
             nouvelles = lire_nouvelles_lignes(lecteur, maintenant)
             executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
+            if archive is not None:
+                archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
             if nouvelles:
                 kpi = tracabilite.calculer_kpi(etat)
                 print("[%s] %d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d"
@@ -229,6 +241,12 @@ def en_direct(arguments: argparse.Namespace) -> None:
             time.sleep(hypotheses.TICK_S)
     except KeyboardInterrupt:
         print("\nArrêt du moteur.\n" + tracabilite.resume_kpi(tracabilite.calculer_kpi(etat)))
+    finally:
+        if archive is not None:
+            archivage.synchroniser(archive, etat, ref, parametres["couts"], datetime.datetime.now())
+            archivage.fermer(archive)
+            print("Archivage : %d ligne(s) écrite(s), %d demande(s) non archivable(s) (données invalides, au journal seulement)"
+                  % (archive["ecrites"], len(archive["non_archivables"])))
 
 
 if __name__ == "__main__":
@@ -237,6 +255,8 @@ if __name__ == "__main__":
     mode.add_argument("--rejeu", help="fichier .jsonl ou .csv du collecteur à rejouer")
     mode.add_argument("--direct", action="store_true", help="lit en continu le CSV du jour du collecteur")
     parseur.add_argument("--bdd", action="store_true", help="lit le référentiel dans la base (VM)")
+    parseur.add_argument("--archiver", action="store_true",
+                         help="mode direct : écrit CAMION_NORTH, TRAJET_NORTH et ARCHIVAGE_COMMANDE_NORTH dans la base (VM)")
     parseur.add_argument("--referentiels", default=None, help="référentiel JSON (défaut : ../donnees/referentiels.json, sinon exemple)")
     parseur.add_argument("--fiches", default=None, help="dossier des fiches camion")
     parseur.add_argument("--demandes", default=REPERTOIRE_DEMANDES, help="dossier des CSV du collecteur (mode direct)")
@@ -244,6 +264,9 @@ if __name__ == "__main__":
     parseur.add_argument("--seuil", type=float, default=None, help="seuil de départ θ (part du plancher)")
     parseur.add_argument("--marge", type=float, default=None, help="marge W avant le départ au plus tard (h projet)")
     options = parseur.parse_args()
+    if options.archiver and options.rejeu:
+        # Un rejeu réécrirait les lignes du moteur en direct (mêmes identifiants de demandes)
+        parseur.error("--archiver ne s'utilise qu'avec --direct")
     if options.rejeu:
         rejouer(options)
     else:

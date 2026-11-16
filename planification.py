@@ -99,6 +99,51 @@ def vitesse_kmh(heures: float) -> float:
     return court + (long_ - court) * (heures - 5) / 2
 
 
+def cout_energie(ref: dict, camion: dict, route_h: float) -> float:
+    """Coût de l'énergie consommée sur un trajet (``couts.md``).
+
+    Consommation aux 100 km (``TRUCKS_CONSUMPTION``) × distance (durée ×
+    vitesse moyenne) × prix de l'énergie (:data:`hypotheses.PRIX_ENERGIE`).
+
+    :param ref: Référentiel.
+    :param camion: Camion (``PTAC``, ``ENERGIE``).
+    :param route_h: Temps de conduite pur, en heures projet.
+    :return: Coût en euros (0 si la consommation est inconnue).
+    """
+    conso = ref["consommation"].get(camion["PTAC"], {}).get(hypotheses.COLONNE_CONSOMMATION.get(camion["ENERGIE"], ""), 0) or 0
+    return conso / 100 * route_h * vitesse_kmh(route_h) * hypotheses.PRIX_ENERGIE.get(camion["ENERGIE"], 0)
+
+
+def prix_prestation(demande: dict, camion: dict, ref: dict, couts: dict, gamme: str):
+    """Prix facturé pour une demande partie (``methode-contrat.md`` §3).
+
+    Applique la règle R-GAM : la demande paie sa part d'un camion rempli au
+    seuil de rentabilité, sur le trajet direct ``LOC_DEP → LOC_ARR``,
+    multipliée par le coefficient de sa gamme
+    (:data:`hypotheses.COEF_PRIX_GAMME`) ::
+
+        prix = C_trajet(direct) × part du plancher / seuil × coefficient de gamme
+
+    ``C_trajet`` = taux horaires × (conduite directe, pauses comprises, plus
+    chargement et déchargement) + énergie du trajet direct.
+
+    :param demande: Demande préparée.
+    :param camion: Camion qui la transporte.
+    :param ref: Référentiel.
+    :param couts: Taux horaires et seuil (:func:`hypotheses.charger_confidentiel`).
+    :param gamme: Gamme de la demande.
+    :return: Prix en euros, arrondi au centime, ou ``None`` si le trajet, la capacité ou la gamme est inconnu.
+    :rtype: float or None
+    """
+    route = referentiels.duree(ref, demande["pk_dep"], demande["pk_arr"])
+    part = regles.equivalent_plancher([demande], camion["PTAC"], ref)
+    if route is None or not part or gamme not in hypotheses.COEF_PRIX_GAMME or not couts.get("seuil_rentabilite"):
+        return None
+    duree_h = conduire(route, {"jour": 0.0, "continue": 0.0}) + 2 * hypotheses.DUREE_CHARGEMENT_H
+    c_trajet = duree_h * (couts["taux_conducteur_h"] + couts["taux_vehicule_h"]) + cout_energie(ref, camion, route)
+    return round(c_trajet * part / couts["seuil_rentabilite"] * hypotheses.COEF_PRIX_GAMME[gamme], 2)
+
+
 def grouper(demandes: list, cle_lieu: str, cle_type: str) -> dict:
     """Regroupe des demandes par arrêt (lieu et type de lieu).
 
@@ -240,8 +285,7 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
             remplissage = regles.equivalent_plancher(a_bord, camion["PTAC"], ref) or 0.0
             plan["troncons"].append({"de": lieu, "a": cible, "debut": t, "fin": t + vers_delta(ecoule),
                                      "duree_h": route, "demandes": [d["id"] for d in a_bord], "remplissage": remplissage})
-            conso = ref["consommation"].get(camion["PTAC"], {}).get(hypotheses.COLONNE_CONSOMMATION.get(camion["ENERGIE"], ""), 0) or 0
-            energie += conso / 100 * route * vitesse_kmh(route) * hypotheses.PRIX_ENERGIE.get(camion["ENERGIE"], 0)
+            energie += cout_energie(ref, camion, route)
             t += vers_delta(ecoule)
         lieu, type_lieu = cible, type_cible
         if sens == "R":
