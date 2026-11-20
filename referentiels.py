@@ -32,8 +32,12 @@ import unicodedata
 
 import hypotheses
 
-#: Paramètres de connexion à la base du projet.
-BDD = {"host": "192.168.40.117", "port": 5432, "dbname": "UE_ENS_DCJC", "user": "dcjc", "password": "dcjc"}
+#: Paramètres de connexion à la base du projet. Les délais sont bornés (règle R-ROB-02) :
+#: sans ``connect_timeout``, un serveur muet bloque ``psycopg2.connect`` environ 2 min
+#: (le moteur ne décide plus rien et les demandes expirent) ; ``statement_timeout``
+#: (ms) borne chaque requête côté serveur.
+BDD = {"host": "192.168.40.117", "port": 5432, "dbname": "UE_ENS_DCJC", "user": "dcjc", "password": "dcjc",
+       "connect_timeout": 5, "options": "-c statement_timeout=10000"}
 
 #: Fichier JSON par défaut (copie de la base), hors du dossier de code.
 FICHIER_REFERENTIELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "donnees", "referentiels.json")
@@ -84,6 +88,7 @@ def pk_lieu(ref: dict, nom: str):
 def duree(ref: dict, a: int, b: int):
     """Durée de trajet entre deux lieux, en heures projet.
 
+    Sert aux règles R-DEL-01 (départ avant ``H_DEP``) et R-DUR-01 (durée de la commande).
     ``TRAVEL_TIME_MATRIX`` est triangulaire supérieure : on lit la ligne
     ``min(a, b)`` et la colonne ``max(a, b)``. Un trajet absent vaut
     :data:`hypotheses.DUREE_TRAJET_INCONNU_H` (question B7).
@@ -129,6 +134,8 @@ def attente_port_h(ref: dict, pk: int, delai_h: float) -> float:
 def capacite(ref: dict, ptac: str, type_pal: str):
     """Nombre maximal de palettes d'un type pour un PTAC (``TRUCKS_CAPACITY``).
 
+    Sert aux règles R-CAP-01 (plancher) et R-KPI-TR (surface du camion).
+
     :param ref: Référentiel.
     :type ref: dict
     :param ptac: PTAC du camion, par exemple ``"19t"``.
@@ -147,6 +154,8 @@ def capacite(ref: dict, ptac: str, type_pal: str):
 
 def usine_attache(ref: dict, reference: int):
     """Usine d'attache d'un camion d'après sa référence (``ASSIGNED_TRUCKS``).
+
+    Sert à la règle R-FLO-01 (camion rattaché à une usine NORTH).
 
     :param ref: Référentiel.
     :type ref: dict
@@ -261,8 +270,7 @@ def generer_exemple() -> dict:
 
     Reprend les valeurs données en exemple dans le sujet (p. 15 à 17) et
     **estime** les autres : trajets d'après la distance à vol d'oiseau
-    (0,5 h + 0,0185 h/km, calé sur les exemples du sujet), capacités 19 t et
-    32 t interpolées, attente de 30 min dans les ports sans exemple, plages
+    (0,5 h + 0,0185 h/km, calé sur les exemples du sujet), attente de 30 min dans les ports sans exemple, plages
     ``ASSIGNED_TRUCKS`` fictives pour 10 des 12 usines. À remplacer par
     ``--export`` dès qu'on a accès à la VM (question B6).
 
@@ -294,9 +302,9 @@ def generer_exemple() -> dict:
     ref["trajets"].update({(1, 1): 1.1, (1, 2): 3.29, (1, 3): 38.67, (1, 17): 18.6, (1, 18): 17.09,
                            (3, 3): 0.7, (3, 17): 16.51, (3, 18): 18.99, (10, 17): 25.75, (10, 18): 27.22})
 
-    # Capacités : 12 t, 26 t, 44 t du sujet p. 15 ; 19 t et 32 t interpolées
-    ref["capacite"] = {"12t": {"EPAL": 18, "EPAL (half)": 33, "ISO": 14}, "19t": {"EPAL": 20, "EPAL (half)": 37, "ISO": 15},
-                       "26t": {"EPAL": 22, "EPAL (half)": 41, "ISO": 17}, "32t": {"EPAL": 26, "EPAL (half)": 48, "ISO": 20},
+    # Capacités : table TRUCKS_CAPACITY complète relevée sur la VM (2026-11-16) ; 32t = 44t dans la base
+    ref["capacite"] = {"12t": {"EPAL": 18, "EPAL (half)": 33, "ISO": 14}, "19t": {"EPAL": 21, "EPAL (half)": 39, "ISO": 16},
+                       "26t": {"EPAL": 22, "EPAL (half)": 41, "ISO": 17}, "32t": {"EPAL": 33, "EPAL (half)": 63, "ISO": 26},
                        "44t": {"EPAL": 33, "EPAL (half)": 63, "ISO": 26}}
     # Consommations : table complète relevée sur la VM (3 - Contractualisation/consumption.md)
     colonnes = ["DIESEL (L)", "GASOLINE (L)", "LPG (kg)", "ELECTRIC (kWh)", "HYDROGEN (kg)"]
@@ -327,7 +335,6 @@ def generer_exemple() -> dict:
             else:
                 courant = fin + 1
     ref["remarques"] = ["Référentiel d'EXEMPLE : trajets estimés sauf 10 valeurs du sujet p. 16",
-                        "Capacités 19t et 32t interpolées ; 12t, 26t, 44t du sujet p. 15",
                         "Attente portuaire 30 min (minutes projet) sauf Le Havre, Rotterdam, Valence (sujet p. 17)",
                         "Plages ASSIGNED_TRUCKS fictives sauf Florence et Munich (sujet p. 15)"]
     construire_index(ref)

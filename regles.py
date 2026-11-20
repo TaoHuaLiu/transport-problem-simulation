@@ -2,7 +2,7 @@
 
 Fonctions pures, sans état : elles disent si une demande est à nous, si elle
 est exploitable, et si un camion peut la prendre. Les identifiants de règles
-renvoient au catalogue ``3 - Documentation/regles-acceptation.docx``.
+renvoient au catalogue ``3 - Documentation/processus.md`` (§2.5).
 
 Une demande préparée par :func:`preparer_demande` est un dictionnaire qui
 garde les champs de l'ERP et ajoute : ``id``, ``h_reception`` et ``h_dep``
@@ -26,6 +26,8 @@ CHAMPS_SPEC = {"PTAC": "PTAC", "ENR": "ENERGIE", "COL": "COULEUR"}
 
 def lire_h_dep(h_dep: str):
     """Lit ``H_DEP`` (``JJ/MM/AA hh:mm:ss``, heure réelle).
+
+    Sert à la règle R-VAL-01 : une ``H_DEP`` illisible rend la demande inexploitable.
 
     :param h_dep: Valeur reçue de l'ERP.
     :type h_dep: str
@@ -185,3 +187,51 @@ def equivalent_plancher(demandes: list, ptac: str, ref: dict):
     if len(types) > 1:
         total += (len(types) - 1) * 3 / referentiels.capacite(ref, ptac, "EPAL")
     return total
+
+
+def surface_camion(ptac: str, ref: dict):
+    """Surface au sol utile d'un camion, en m².
+
+    Applique la règle R-KPI-TR : la plus grande surface occupée par un camion
+    plein d'un seul type de palette, ``max(capacité(PTAC, type) × surface(type))``
+    (surfaces de :data:`hypotheses.SURFACE_PALETTE_M2`). Avec ``TRUCKS_CAPACITY``,
+    c'est toujours la capacité EPAL × 0,96 m².
+
+    :param ptac: PTAC du camion.
+    :type ptac: str
+    :param ref: Référentiel (``TRUCKS_CAPACITY``).
+    :type ref: dict
+    :return: Surface en m², ou ``None`` si aucune capacité n'est connue pour ce PTAC.
+    :rtype: float or None
+    """
+    surfaces = [referentiels.capacite(ref, ptac, type_pal) * surface
+                for type_pal, surface in hypotheses.SURFACE_PALETTE_M2.items()
+                if referentiels.capacite(ref, ptac, type_pal)]
+    return max(surfaces) if surfaces else None
+
+
+def taux_remplissage(demandes: list, ptac: str, ref: dict):
+    """Taux de remplissage d'un camion par la surface au sol des palettes.
+
+    Applique la règle R-KPI-TR : ``Σ QTE_PAL × surface(TYPE_PAL) / surface_camion(PTAC)``.
+    Ce taux sert à mesurer (KPI, seuil de départ θ, prix) ; l'admissibilité
+    du chargement reste :func:`equivalent_plancher` (R-CAP-01).
+
+    :param demandes: Demandes préparées, à bord en même temps.
+    :type demandes: list
+    :param ptac: PTAC du camion.
+    :type ptac: str
+    :param ref: Référentiel (``TRUCKS_CAPACITY``).
+    :type ref: dict
+    :return: Taux entre 0 et 1 (0 si aucune demande), ou ``None`` si un type de palette ou le PTAC est inconnu.
+    :rtype: float or None
+    """
+    surface = surface_camion(ptac, ref)
+    if not surface:
+        return None
+    total = 0.0
+    for demande in demandes:
+        if demande["TYPE_PAL"] not in hypotheses.SURFACE_PALETTE_M2:
+            return None
+        total += demande["qte"] * hypotheses.SURFACE_PALETTE_M2[demande["TYPE_PAL"]]
+    return total / surface

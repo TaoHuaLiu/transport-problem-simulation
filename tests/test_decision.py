@@ -301,5 +301,55 @@ class TestConduite(unittest.TestCase):
         self.assertAlmostEqual(planification.conduire(13.0, {"jour": 0.0, "continue": 0.0}), 13 + 2 * 0.75 + 11)
 
 
+class TestRemplissage(unittest.TestCase):
+    """R-KPI-TR : taux de remplissage par la surface au sol, référence EPAL."""
+
+    #: Valeurs de ``TRUCKS_CAPACITY`` (base de la VM).
+    REF = {"capacite": {"12t": {"EPAL": 18, "EPAL (half)": 33, "ISO": 14},
+                        "32t": {"EPAL": 33, "EPAL (half)": 63, "ISO": 26}}}
+
+    @staticmethod
+    def chargement(*lots: tuple) -> list:
+        """Demandes minimales ``(quantité, type de palette)`` pour le calcul du remplissage.
+
+        :param lots: Couples ``(QTE_PAL, TYPE_PAL)``.
+        :return: Demandes avec ``qte`` et ``TYPE_PAL``.
+        """
+        return [{"qte": qte, "TYPE_PAL": type_pal} for qte, type_pal in lots]
+
+    def test_surface_camion_epal(self) -> None:
+        """La surface d'un camion est celle d'un camion plein en EPAL (18 × 0,96 m²)."""
+        self.assertAlmostEqual(regles.surface_camion("12t", self.REF), 17.28)
+        self.assertAlmostEqual(regles.surface_camion("32t", self.REF), 31.68)
+
+    def test_plein_par_type(self) -> None:
+        """Plein en EPAL → 100 % ; ISO et EPALh restent sous 100 %."""
+        self.assertAlmostEqual(regles.taux_remplissage(self.chargement((18, "EPAL")), "12t", self.REF), 1.0)
+        self.assertAlmostEqual(regles.taux_remplissage(self.chargement((14, "ISO")), "12t", self.REF), 16.8 / 17.28)
+        self.assertAlmostEqual(regles.taux_remplissage(self.chargement((33, "EPALh")), "12t", self.REF), 15.84 / 17.28)
+
+    def test_chargement_mixte(self) -> None:
+        """Les surfaces s'additionnent : 10 EPAL + 4 ISO dans un 32t."""
+        attendu = (10 * 0.96 + 4 * 1.20) / 31.68
+        self.assertAlmostEqual(regles.taux_remplissage(self.chargement((10, "EPAL"), (4, "ISO")), "32t", self.REF), attendu)
+
+    def test_tournee_deux_lieux(self) -> None:
+        """C13 vrai : le TR est celui du départ du premier lieu (8 EPAL), le maximum suit le second chargement (16 EPAL)."""
+        ref = referentiel_test()
+        demandes = [demande_test(ref, "D1", loc_dep="Amsterdam", qte=8, h_dep_h=10.0),
+                    demande_test(ref, "D2", loc_dep="Anvers", qte=8, h_dep_h=20.0)]
+        plan = planification.evaluer_plan(ref, camion_test("F1"), demandes, T0, T0, COUTS)
+        self.assertTrue(plan["ok"], plan["motif"])
+        # Surface du 19 t de test : max(20 × 0,96 ; 37 × 0,48 ; 15 × 1,20) = 19,2 m²
+        self.assertAlmostEqual(plan["remplissage"], 8 * 0.96 / 19.2)
+        self.assertAlmostEqual(plan["remplissage_max"], 16 * 0.96 / 19.2)
+
+    def test_inconnu(self) -> None:
+        """PTAC ou type de palette inconnu → ``None`` ; aucune demande → 0."""
+        self.assertIsNone(regles.taux_remplissage(self.chargement((1, "EPAL")), "7t", self.REF))
+        self.assertIsNone(regles.taux_remplissage(self.chargement((1, "CHEP")), "12t", self.REF))
+        self.assertEqual(regles.taux_remplissage([], "12t", self.REF), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

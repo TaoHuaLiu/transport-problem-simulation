@@ -2,7 +2,8 @@
 
 L'ERP est un serveur UDP qui émet en broadcast sur le port 40040. Il ne stocke
 rien et ne renvoie pas les messages manqués : ce programme sauvegarde donc
-chaque message dès sa réception.
+chaque message dès sa réception (règle R-COL-01 : aucune demande reçue n'est
+perdue, même illisible).
 
 Deux fichiers sont écrits par jour *réel* dans le répertoire de sortie :
 
@@ -30,6 +31,9 @@ import datetime
 import json
 import os
 import socket
+import time
+
+import robustesse
 
 #: Port UDP sur lequel l'ERP émet les demandes de transport.
 PORT_ERP = 40040
@@ -69,6 +73,7 @@ def creer_client_udp(port: int) -> socket.socket:
 def decoder_message(texte: str) -> dict:
     """Transforme le texte reçu en dictionnaire ``{id_demande: {champs}}``.
 
+    Applique la règle R-COL-01 (aucune demande perdue à la réception).
     Le serveur envoie des simples quotes, refusées par JSON : on les remplace
     comme dans ``RSCR_ERP_CLIENT_UDP.py``. Si une valeur contient elle-même une
     apostrophe (``L'Aquila``), ce remplacement casse le JSON : on retente alors
@@ -180,7 +185,8 @@ def charger_ids_existants(chemin_csv: str) -> set[str]:
 def ecrire_brut(chemin_jsonl: str, h_reception: str, adresse: tuple[str, int], texte: str) -> None:
     """Ajoute le message brut au journal ``.jsonl``.
 
-    Appelée avant tout décodage : rien n'est perdu si le message est illisible.
+    Applique la règle R-COL-01 : appelée avant tout décodage, rien n'est
+    perdu si le message est illisible.
 
     :param chemin_jsonl: Chemin du journal du jour.
     :param h_reception: Heure de réception (``AAAA-MM-JJ hh:mm:ss``).
@@ -208,54 +214,92 @@ def ecrire_demandes(chemin_csv: str, lignes: list[dict]) -> None:
         ecrivain.writerows(lignes)
 
 
+def traiter_datagramme(data: bytes, adresse: tuple, maintenant: datetime.datetime, contexte: dict) -> int:
+    """Archive, décode et structure un datagramme de l'ERP.
+
+    Applique la règle R-COL-01 : le message brut est écrit (:func:`ecrire_brut`)
+    avant d'être décodé ; une demande déjà enregistrée le même jour réel n'est
+    pas réécrite. Change de fichiers quand le jour réel change.
+
+    :param data: Contenu du datagramme.
+    :param adresse: Couple (IP, port) de l'émetteur.
+    :param maintenant: Heure réelle de réception.
+    :param contexte: ``{"repertoire", "jour", "chemin_jsonl", "chemin_csv", "ids", "nb"}``, modifié sur place
+        (``ids`` à ``None`` : identifiants du CSV du jour à relire).
+    :return: Nombre de nouvelles demandes écrites dans le CSV.
+    """
+    h_reception = maintenant.strftime("%Y-%m-%d %H:%M:%S")
+    # Changement de jour réel : on passe à de nouveaux fichiers.
+    if maintenant.date() != contexte.get("jour"):
+        chemin_jsonl, chemin_csv = chemins_du_jour(contexte["repertoire"], maintenant.date())
+        contexte.update({"jour": maintenant.date(), "chemin_jsonl": chemin_jsonl, "chemin_csv": chemin_csv, "ids": None})
+
+    texte = data.decode("utf-8", errors="replace")
+    ecrire_brut(contexte["chemin_jsonl"], h_reception, adresse, texte)
+
+    # Après l'écriture du brut : un CSV du jour abîmé ne doit pas empêcher d'archiver le message (R-COL-01)
+    if contexte["ids"] is None:
+        try:
+            contexte["ids"] = charger_ids_existants(contexte["chemin_csv"])
+        except (OSError, ValueError, KeyError, csv.Error) as erreur:
+            print("[%s] ! CSV du jour illisible (%r) : doublons possibles avec un lancement précédent"
+                  % (h_reception, erreur), flush=True)
+            contexte["ids"] = set()
+
+    try:
+        message = decoder_message(texte)
+    except ValueError as erreur:
+        print("[%s] ! Message ignoré (%s), conservé dans %s"
+              % (h_reception, erreur, os.path.basename(contexte["chemin_jsonl"])), flush=True)
+        return 0
+
+    # Une demande déjà vue n'est pas réécrite.
+    lignes = []
+    for id_demande, demande in message.items():
+        if id_demande in contexte["ids"] or not isinstance(demande, dict):
+            continue
+        lignes.append(demande_vers_ligne(str(id_demande), demande, h_reception))
+    if lignes:
+        ecrire_demandes(contexte["chemin_csv"], lignes)
+        # Ajoutés seulement une fois écrits : après une erreur d'écriture, un renvoi éventuel serait réécrit
+        contexte["ids"].update(ligne["ID_DEMANDE"] for ligne in lignes)
+        contexte["nb"] = contexte.get("nb", 0) + len(lignes)
+    print("[%s] %d demande(s) reçue(s), %d nouvelle(s) - total session : %d"
+          % (h_reception, len(message), len(lignes), contexte.get("nb", 0)), flush=True)
+    return len(lignes)
+
+
 def collecter(port: int, repertoire: str) -> None:
-    """Reçoit, archive puis structure chaque message, jusqu'à ``Ctrl+C``.
+    """Reçoit, archive puis structure chaque message, jusqu'à ``Ctrl+C`` ou SIGTERM.
+
+    Applique la règle R-ROB-04 : une erreur sur un message (écriture
+    impossible, CSV du jour illisible…) ou sur la réception est signalée et
+    la collecte continue ; seul un arrêt demandé l'interrompt, car l'ERP ne
+    renvoie pas les messages perdus.
 
     :param port: Port UDP d'écoute.
     :param repertoire: Répertoire de sortie (créé s'il n'existe pas).
     """
     os.makedirs(repertoire, exist_ok=True)
     clientUDP = creer_client_udp(port)
-
-    jour_courant = None
-    ids_connus = set()
-    nb_demandes = 0
+    contexte = {"repertoire": repertoire, "jour": None, "ids": set(), "nb": 0}
+    messages = {}
 
     print("\nCollecte des demandes de transport sur le port %d -> %s" % (port, os.path.abspath(repertoire)))
-    print("'Ctrl+C' pour quitter le programme")
+    print("'Ctrl+C' pour quitter le programme", flush=True)
     while True:
-        data, adresse = clientUDP.recvfrom(TAILLE_MAX_DATAGRAMME)
-        maintenant = datetime.datetime.now()
-        h_reception = maintenant.strftime("%Y-%m-%d %H:%M:%S")
-
-        # Changement de jour réel : on passe à de nouveaux fichiers.
-        if maintenant.date() != jour_courant:
-            jour_courant = maintenant.date()
-            chemin_jsonl, chemin_csv = chemins_du_jour(repertoire, jour_courant)
-            ids_connus = charger_ids_existants(chemin_csv)
-
-        texte = data.decode("utf-8", errors="replace")
-        ecrire_brut(chemin_jsonl, h_reception, adresse, texte)
-
         try:
-            message = decoder_message(texte)
-        except ValueError as erreur:
-            print("[%s] ! Message ignoré (%s), conservé dans %s" % (h_reception, erreur, os.path.basename(chemin_jsonl)), flush=True)
+            data, adresse = clientUDP.recvfrom(TAILLE_MAX_DATAGRAMME)
+        except OSError as erreur:  # R-ROB-04 : erreur de socket passagère
+            robustesse.signaler(messages, "reception", datetime.datetime.now(), "réception en erreur (%s) : la collecte continue" % erreur)
+            time.sleep(1)
             continue
-
-        # Une demande déjà vue n'est pas réécrite.
-        lignes = []
-        for id_demande, demande in message.items():
-            if id_demande in ids_connus or not isinstance(demande, dict):
-                continue
-            lignes.append(demande_vers_ligne(id_demande, demande, h_reception))
-            ids_connus.add(id_demande)
-
-        if lignes:
-            ecrire_demandes(chemin_csv, lignes)
-            nb_demandes += len(lignes)
-        print("[%s] %d demande(s) reçue(s), %d nouvelle(s) - total session : %d"
-              % (h_reception, len(message), len(lignes), nb_demandes), flush=True)
+        maintenant = datetime.datetime.now()
+        try:
+            traiter_datagramme(data, adresse, maintenant, contexte)
+        except Exception as erreur:  # R-ROB-04 : la collecte ne s'arrête jamais sur un message
+            robustesse.signaler(messages, "message", maintenant, "message de %s en erreur (%r) : la collecte continue"
+                                % (adresse[0], erreur))
 
 
 if __name__ == "__main__":
@@ -263,6 +307,7 @@ if __name__ == "__main__":
     parseur.add_argument("--port", type=int, default=PORT_ERP, help="port UDP d'écoute (défaut : %d)" % PORT_ERP)
     parseur.add_argument("--sortie", default=REPERTOIRE_SORTIE, help="répertoire des fichiers produits")
     arguments = parseur.parse_args()
+    robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter --tout » envoie SIGTERM
     try:
         collecter(arguments.port, arguments.sortie)
     except KeyboardInterrupt:

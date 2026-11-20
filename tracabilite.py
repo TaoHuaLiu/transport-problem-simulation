@@ -56,7 +56,7 @@ def noter(journal: dict, maintenant: datetime.datetime, evenement: str, demande:
     :param troncon: Tronçon (événement ``TRONCON``) : lieux en ``PK_LOCATIONS``.
     :param motif: Motif de refus ``REF-…``.
     :param gamme: Gamme de la demande.
-    :param remplissage: Part du plancher occupée.
+    :param remplissage: Taux de remplissage (surface au sol, R-KPI-TR).
     :param detail: Texte libre.
     """
     ligne = {"H_EVENEMENT": maintenant.strftime(FORMAT_DATE), "EVENEMENT": evenement,
@@ -84,7 +84,8 @@ def calculer_kpi(etat: dict) -> dict:
 
     - TA (R-KPI-TA) = demandes NORTH parties à temps / demandes NORTH reçues ;
     - TR (R-KPI-TR) = moyenne, sur les tournées parties, du remplissage au
-      départ du premier lieu de chargement ;
+      départ du premier lieu de chargement, mesuré par la surface au sol des
+      palettes (:func:`regles.taux_remplissage`) ;
     - TR tronçons (information) = Σ remplissage × durée / Σ durée, tronçons à
       vide compris.
 
@@ -107,7 +108,7 @@ def calculer_kpi(etat: dict) -> dict:
     parties_t = [t for t in etat["tournees"].values() if t["statut"] == "partie"]
     troncons = [t for tournee in parties_t for t in tournee["plan"]["troncons"]]
     duree = sum(t["duree_h"] for t in troncons)
-    # Une tournée charge en un seul lieu (C13) : son remplissage au départ est celui du plan
+    # Le plan garde le remplissage au départ du premier lieu de chargement (R-KPI-TR), même si la tournée charge ailleurs ensuite
     remplissages = [t["plan"]["remplissage"] for t in parties_t]
     return {"recues": len(north), "parties": len(parties), "ta": len(parties) / len(north) if north else 0.0,
             "tr": sum(remplissages) / len(remplissages) if remplissages else 0.0,

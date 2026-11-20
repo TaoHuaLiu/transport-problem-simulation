@@ -33,6 +33,7 @@ import urllib.parse
 
 import audit
 import hypotheses
+import robustesse
 
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
 
@@ -277,6 +278,7 @@ def ecrire_instantane(options: argparse.Namespace, config: dict) -> dict:
 
 
 if __name__ == "__main__":
+    robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
     arguments = lire_parametres()
     configuration = preparer_config(arguments)
     if arguments.instantane:

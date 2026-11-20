@@ -27,6 +27,7 @@ Utilisation :
 import argparse
 import csv
 import datetime
+import io
 import json
 import os
 import time
@@ -38,6 +39,7 @@ import hypotheses
 import planification
 import referentiels
 import regles
+import robustesse
 import tracabilite
 from collecteur import decoder_message
 
@@ -80,19 +82,19 @@ def lire_rejeu(chemin: str) -> list:
     return sorted(demandes, key=lambda element: element[0])
 
 
-def lire_nouvelles_lignes(lecteur: dict, maintenant: datetime.datetime) -> list:
-    """Lit les demandes ajoutées au CSV du jour depuis la lecture précédente.
+def lire_suite(lecteur: dict, maintenant: datetime.datetime) -> list:
+    """Lit les lignes complètes ajoutées au fichier courant du lecteur depuis la lecture précédente.
 
-    Change de fichier quand le jour réel change (le collecteur fait de même).
+    Applique la règle R-ROB-01 : une ligne illisible (heure de réception ou
+    identifiant absent ou mal formé) est ignorée et signalée, sans arrêter le
+    moteur ; le collecteur garde de toute façon le message brut (R-COL-01).
 
-    :param lecteur: ``{"repertoire", "chemin", "position", "entete"}``, modifié sur place.
-    :param maintenant: Heure réelle.
+    :param lecteur: ``{"chemin", "position", "entete", "messages"}``, modifié sur place.
+    :param maintenant: Heure réelle (pour les messages d'erreur).
     :return: Liste de ``(h_reception, id_demande, champs)``.
     """
-    chemin = os.path.join(lecteur["repertoire"], "demandes_%s.csv" % maintenant.strftime("%Y-%m-%d"))
-    if chemin != lecteur.get("chemin"):
-        lecteur.update({"chemin": chemin, "position": 0, "entete": None})
-    if not os.path.exists(chemin):
+    chemin = lecteur.get("chemin")
+    if chemin is None or not os.path.exists(chemin):
         return []
     with open(chemin, "rb") as fichier:
         fichier.seek(lecteur["position"])
@@ -100,36 +102,111 @@ def lire_nouvelles_lignes(lecteur: dict, maintenant: datetime.datetime) -> list:
     # On ne garde que les lignes complètes ; la dernière peut être en cours d'écriture
     fin = contenu.rfind(b"\n") + 1
     lecteur["position"] += fin
+    texte = contenu[:fin].decode("utf-8", errors="replace")
     nouvelles = []
-    for ligne in csv.reader(contenu[:fin].decode("utf-8").splitlines(), delimiter=";"):
+    # io.StringIO(newline="") : le module csv relit correctement un champ entre guillemets qui contient un saut de ligne
+    for ligne in csv.reader(io.StringIO(texte, newline=""), delimiter=";"):
+        if not ligne:
+            continue
         if lecteur["entete"] is None:
             lecteur["entete"] = ligne
             continue
         champs = dict(zip(lecteur["entete"], ligne))
-        h_reception = datetime.datetime.strptime(champs["H_RECEPTION"], "%Y-%m-%d %H:%M:%S")
+        try:
+            h_reception = datetime.datetime.strptime(champs["H_RECEPTION"], "%Y-%m-%d %H:%M:%S")
+            if not champs["ID_DEMANDE"]:
+                raise ValueError("ID_DEMANDE vide")
+        except (KeyError, ValueError) as erreur:
+            lecteur["ignorees"] = lecteur.get("ignorees", 0) + 1
+            robustesse.signaler(lecteur.setdefault("messages", {}), "ligne", maintenant,
+                                "ligne illisible ignorée dans %s (%s)" % (os.path.basename(chemin), erreur))
+            continue
         nouvelles.append((h_reception, champs["ID_DEMANDE"], champs))
     return nouvelles
 
 
-def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.datetime,
-                  parametres: dict, journal: dict) -> None:
-    """Exécute un tick du moteur : décisions sur les demandes, puis départs.
+def lire_nouvelles_lignes(lecteur: dict, maintenant: datetime.datetime) -> list:
+    """Lit les demandes ajoutées au CSV du jour depuis la lecture précédente.
 
+    Change de fichier quand le jour réel change (le collecteur fait de même),
+    après avoir lu la fin du fichier de la veille : une demande écrite juste
+    avant minuit n'est pas perdue.
+
+    :param lecteur: ``{"repertoire", "chemin", "position", "entete", "messages"}``, modifié sur place.
+    :param maintenant: Heure réelle.
+    :return: Liste de ``(h_reception, id_demande, champs)``.
+    """
+    chemin = os.path.join(lecteur["repertoire"], "demandes_%s.csv" % maintenant.strftime("%Y-%m-%d"))
+    nouvelles = []
+    if chemin != lecteur.get("chemin"):
+        nouvelles += lire_suite(lecteur, maintenant)
+        lecteur.update({"chemin": chemin, "position": 0, "entete": None})
+    return nouvelles + lire_suite(lecteur, maintenant)
+
+
+def decider_demande(id_demande: str, champs: dict, h_reception: datetime.datetime, etat: dict, ref: dict,
+                    maintenant: datetime.datetime, parametres: dict, journal: dict) -> None:
+    """Décide une demande (table D-ACC) sans que son erreur arrête le moteur.
+
+    Applique la règle R-ROB-01 : si la préparation ou la décision lève une
+    exception, la demande est refusée avec le motif ``REF-DONNEES`` (ou
+    ignorée si elle n'est pas dans le périmètre NORTH) et l'erreur est
+    signalée ; les demandes suivantes sont traitées normalement. Une demande
+    déjà acceptée avant l'erreur reste acceptée.
+
+    :param id_demande: Identifiant de la demande.
+    :param champs: Champs envoyés par l'ERP.
+    :param h_reception: Heure de réception (réelle).
     :param etat: État du moteur, modifié sur place.
     :param ref: Référentiel.
-    :param nouvelles: Demandes reçues depuis le tick précédent, ``(h_reception, id, champs)``.
     :param maintenant: Heure réelle (ou simulée en rejeu).
     :param parametres: ``couts``, ``seuil``, ``marge_h``.
     :param journal: Journal de traçabilité.
     """
-    for h_reception, id_demande, champs in nouvelles:
-        # Déjà vue, ou déjà décidée par un lancement précédent (archivée en base)
-        if id_demande in etat["demandes"] or id_demande in etat.get("deja_archivees", ()):
-            continue
+    try:
         demande = regles.preparer_demande(id_demande, champs, h_reception, ref)
         decision.traiter_demande(demande, etat, ref, maintenant, parametres, journal)
+        return
+    except Exception as erreur:  # R-ROB-01 : une demande en erreur ne doit pas arrêter le moteur
+        robustesse.signaler(etat.setdefault("messages", {}), "demande", maintenant,
+                            "demande %s en erreur (%r) : refusée REF-DONNEES" % (id_demande, erreur))
+    demande = etat["demandes"].get(id_demande)
+    if demande is None:
+        demande = dict(champs)
+        demande.update({"id": id_demande, "h_reception": h_reception, "etat": "RECUE", "motif": ""})
+        etat["demandes"][id_demande] = demande
+    if demande.get("etat") not in ("RECUE", None):
+        return
+    try:
+        north = regles.est_demande_north(demande)
+    except Exception:  # périmètre indécidable : on la compte comme refusée, c'est le choix prudent pour le TA
+        north = True
+    if not north:
+        demande["etat"] = "IGNOREE"
+        return
+    try:
+        decision.refuser(demande, "REF-DONNEES", maintenant, journal)
+    except Exception:  # journal inaccessible : l'état reste juste, l'événement manque
+        demande.update({"etat": "REFUSEE", "motif": "REF-DONNEES"})
 
-    for tournee in [t for t in etat["tournees"].values() if t["statut"] == "ouverte"]:
+
+def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime,
+                    parametres: dict, journal: dict) -> None:
+    """Décide le départ d'une tournée ouverte (table D-DEPART) sans que son erreur arrête le moteur.
+
+    Si D-DEPART répond « refuser » (ligne 3), les demandes à bord sont
+    refusées avec le motif ``REF-RENTABILITE`` (R-RENT-01). Applique la règle
+    R-ROB-01 : une exception est signalée et la tournée reste ouverte ; elle
+    est réexaminée au tick suivant.
+
+    :param tournee: Tournée ouverte.
+    :param etat: État du moteur, modifié sur place.
+    :param ref: Référentiel.
+    :param maintenant: Heure réelle (ou simulée en rejeu).
+    :param parametres: ``couts``, ``seuil``, ``marge_h``.
+    :param journal: Journal de traçabilité.
+    """
+    try:
         choix = planification.decider_depart(tournee, etat, ref, maintenant, parametres)
         if choix == "partir":
             planification.faire_partir(tournee, etat, ref, maintenant, parametres["couts"], journal)
@@ -139,6 +216,77 @@ def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.d
                 decision.refuser(etat["demandes"][id_demande], "REF-RENTABILITE", maintenant, journal)
             tournee["statut"] = "annulee"
             etat["flotte"][tournee["camion"]]["tournee"] = None
+    except Exception as erreur:  # R-ROB-01 : la tournée sera réexaminée au tick suivant
+        robustesse.signaler(etat.setdefault("messages", {}), "tournee", maintenant,
+                            "tournée %s en erreur (%r) : nouvel essai au prochain tick" % (tournee.get("id"), erreur))
+
+
+def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.datetime,
+                  parametres: dict, journal: dict) -> None:
+    """Exécute un tick du moteur : décisions sur les demandes, puis départs.
+
+    Enchaîne la table D-ACC (:func:`decider_demande`) pour chaque nouvelle
+    demande, puis la table D-DEPART (:func:`decider_tournee`) pour chaque
+    tournée ouverte. Chaque demande et chaque tournée est protégée : une
+    erreur sur l'une n'empêche pas de traiter les autres (R-ROB-01).
+
+    :param etat: État du moteur, modifié sur place.
+    :param ref: Référentiel.
+    :param nouvelles: Demandes reçues depuis le tick précédent, ``(h_reception, id, champs)``.
+    :param maintenant: Heure réelle (ou simulée en rejeu).
+    :param parametres: ``couts``, ``seuil`` (θ, taux entre 0 et 1), ``marge_h`` (W, heures projet).
+    :param journal: Journal de traçabilité.
+    """
+    for h_reception, id_demande, champs in nouvelles:
+        # Déjà vue, ou déjà décidée par un lancement précédent (archivée en base)
+        if id_demande in etat["demandes"] or id_demande in etat.get("deja_archivees", ()):
+            continue
+        decider_demande(id_demande, champs, h_reception, etat, ref, maintenant, parametres, journal)
+
+    for tournee in [t for t in etat["tournees"].values() if t["statut"] == "ouverte"]:
+        decider_tournee(tournee, etat, ref, maintenant, parametres, journal)
+
+
+def rafraichir_referentiel(ref: dict, messages: dict, maintenant: datetime.datetime) -> dict:
+    """Relit le référentiel dans la base, ou garde le précédent si elle ne répond pas.
+
+    Applique la règle R-ROB-02 : une base injoignable ou lente (délais bornés
+    par :data:`referentiels.BDD`) n'arrête pas le moteur ; il garde le dernier
+    référentiel lu et réessaie à la minute suivante.
+
+    :param ref: Référentiel courant.
+    :param messages: Messages d'erreur déjà affichés (:func:`robustesse.signaler`).
+    :param maintenant: Heure réelle.
+    :return: Nouveau référentiel, ou ``ref`` en cas d'erreur.
+    """
+    try:
+        return referentiels.charger_depuis_bdd()
+    except Exception as erreur:  # R-ROB-02 : base en panne, on garde le référentiel précédent
+        robustesse.signaler(messages, "referentiel", maintenant, "base injoignable (%s) : référentiel lu à %s gardé"
+                            % (str(erreur).strip() or type(erreur).__name__, ref.get("lu_a", "?")))
+        return ref
+
+
+def charger_bdd_ou_copie(copie: str = None) -> dict:
+    """Charge le référentiel depuis la base, ou depuis sa copie JSON si la base ne répond pas au démarrage.
+
+    Applique la règle R-ROB-02 : ``nord.sh demarrer`` écrit la copie
+    ``../donnees/referentiels.json`` à chaque lancement réussi ; le moteur
+    repart dessus et revient à la base au premier rafraîchissement réussi.
+
+    :param copie: Copie JSON (défaut : :data:`referentiels.FICHIER_REFERENTIELS`).
+    :return: Référentiel.
+    :raises Exception: L'erreur de la base, s'il n'y a pas de copie.
+    """
+    copie = copie or referentiels.FICHIER_REFERENTIELS
+    try:
+        return referentiels.charger_depuis_bdd()
+    except Exception as erreur:
+        if not os.path.exists(copie):
+            raise
+        print("! base injoignable au démarrage (%s) : copie %s, remplacée dès que la base répond"
+              % (str(erreur).strip() or type(erreur).__name__, os.path.abspath(copie)), flush=True)
+        return referentiels.charger_depuis_json(copie)
 
 
 def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
@@ -149,7 +297,7 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     :return: ``(etat, ref, parametres)``.
     """
     if arguments.bdd:
-        ref = referentiels.charger_depuis_bdd()
+        ref = charger_bdd_ou_copie(arguments.referentiels)
     else:
         chemin = arguments.referentiels
         if chemin is None:
@@ -162,7 +310,7 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     usines = [referentiels.pk_lieu(ref, nom) for nom in hypotheses.USINES_NORTH]
     flotte = module_flotte.charger_flotte(fiches, ref, usines, debut)
     couts = hypotheses.charger_confidentiel()
-    parametres = {"couts": couts, "seuil": arguments.seuil if arguments.seuil is not None else couts["seuil_rentabilite"],
+    parametres = {"couts": couts, "seuil": arguments.seuil if arguments.seuil is not None else hypotheses.SEUIL_DEPART_DEFAUT,
                   "marge_h": arguments.marge if arguments.marge is not None else hypotheses.MARGE_DEPART_H}
     print("Référentiel : %s" % ref["source"])
     for remarque in ref.get("remarques", []):
@@ -172,7 +320,7 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
           % ("Annexe 2" if couts["source"] != "defaut" else "taux par défaut", parametres["seuil"], parametres["marge_h"]))
     # Le préfixe des tournées (heure de démarrage) les rend uniques d'un lancement à l'autre (TRAJET_NORTH)
     etat = {"flotte": flotte, "tournees": {}, "demandes": {}, "compteur": 0,
-            "prefixe": debut.strftime("T%y%m%d%H%M%S-"), "deja_archivees": set()}
+            "prefixe": debut.strftime("T%y%m%d%H%M%S-"), "deja_archivees": set(), "messages": {}}
     return etat, ref, parametres
 
 
@@ -187,6 +335,8 @@ def rejouer(arguments: argparse.Namespace) -> dict:
     :return: Indicateurs (:func:`tracabilite.calculer_kpi`).
     """
     demandes = lire_rejeu(arguments.rejeu)
+    if not demandes:
+        raise SystemExit("Aucune demande lisible dans %s" % arguments.rejeu)
     horloge = demandes[0][0]
     etat, ref, parametres = preparer(arguments, horloge)
     journal = tracabilite.ouvrir_journal(arguments.sortie, horloge, "_rejeu")
@@ -207,46 +357,62 @@ def rejouer(arguments: argparse.Namespace) -> dict:
 
 
 def en_direct(arguments: argparse.Namespace) -> None:
-    """Fait tourner le moteur en direct sur le CSV du collecteur, jusqu'à ``Ctrl+C``.
+    """Fait tourner le moteur en direct sur le CSV du collecteur, jusqu'à ``Ctrl+C`` ou SIGTERM.
+
+    Applique les règles R-ROB-01 à R-ROB-03 : une erreur pendant un tick est
+    signalée et le moteur passe au tick suivant ; la base est réessayée une
+    fois par minute ; à l'arrêt, la dernière synchronisation des tables
+    ``*_NORTH`` est faite. Un tick plus long que :data:`hypotheses.TICK_S`
+    est signalé (le moteur prend du retard sur l'ERP).
 
     :param arguments: Options de la ligne de commande.
     """
     debut = datetime.datetime.now()
     etat, ref, parametres = preparer(arguments, debut)
+    messages = etat["messages"]
     journal = tracabilite.ouvrir_journal(arguments.sortie, debut)
-    lecteur = {"repertoire": arguments.demandes}
+    lecteur = {"repertoire": arguments.demandes, "messages": messages}
     dernier_rafraichissement = debut
     archive = archivage.ouvrir() if arguments.archiver else None
     if archive is not None:
         # Avant la première lecture : reprise après arrêt (commandes déjà archivées) et flotte en base
         archivage.synchroniser(archive, etat, ref, parametres["couts"], debut)
         print("Archivage dans CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH : %d ligne(s) écrite(s)" % archive["ecrites"])
-    print("Moteur en direct sur %s ; 'Ctrl+C' pour arrêter" % os.path.abspath(arguments.demandes))
+    print("Moteur en direct sur %s ; 'Ctrl+C' pour arrêter" % os.path.abspath(arguments.demandes), flush=True)
     try:
         while True:
+            debut_tick = time.monotonic()
             maintenant = datetime.datetime.now()
-            # TRAVEL_TIME_MATRIX et PORTS_AVAILABILITY changent toutes les heures projet (1 min réelle)
-            if arguments.bdd and maintenant - dernier_rafraichissement >= datetime.timedelta(minutes=1):
-                ref = referentiels.charger_depuis_bdd()
-                dernier_rafraichissement = maintenant
-            nouvelles = lire_nouvelles_lignes(lecteur, maintenant)
-            executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
-            if archive is not None:
-                archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
-            if nouvelles:
-                kpi = tracabilite.calculer_kpi(etat)
-                print("[%s] %d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d"
-                      % (maintenant.strftime("%H:%M:%S"), len(nouvelles), 100 * kpi["ta"], 100 * kpi["tr"],
-                         sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte")), flush=True)
-            time.sleep(hypotheses.TICK_S)
+            try:
+                # TRAVEL_TIME_MATRIX et PORTS_AVAILABILITY changent toutes les heures projet (1 min réelle)
+                if arguments.bdd and maintenant - dernier_rafraichissement >= datetime.timedelta(minutes=1):
+                    dernier_rafraichissement = maintenant  # même en échec : un seul essai par minute
+                    ref = rafraichir_referentiel(ref, messages, maintenant)
+                nouvelles = lire_nouvelles_lignes(lecteur, maintenant)
+                executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
+                if archive is not None:
+                    archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
+                if nouvelles:
+                    kpi = tracabilite.calculer_kpi(etat)
+                    print("[%s] %d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d"
+                          % (maintenant.strftime("%H:%M:%S"), len(nouvelles), 100 * kpi["ta"], 100 * kpi["tr"],
+                             sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte")), flush=True)
+            except Exception as erreur:  # R-ROB-01 : dernier filet, le moteur passe au tick suivant
+                robustesse.signaler(messages, "tick", maintenant, "tick en erreur (%r) : le moteur continue" % erreur)
+            duree = time.monotonic() - debut_tick
+            if duree > hypotheses.TICK_S:
+                robustesse.signaler(messages, "lenteur", maintenant, "tick de %.1f s (> %d s) : le moteur prend du retard"
+                                    % (duree, hypotheses.TICK_S))
+            time.sleep(max(0.0, hypotheses.TICK_S - duree))
     except KeyboardInterrupt:
-        print("\nArrêt du moteur.\n" + tracabilite.resume_kpi(tracabilite.calculer_kpi(etat)))
+        print("\nArrêt du moteur (%d incident(s) signalé(s), %d ligne(s) illisible(s) ignorée(s)).\n%s"
+              % (messages.get("nb", 0), lecteur.get("ignorees", 0), tracabilite.resume_kpi(tracabilite.calculer_kpi(etat))))
     finally:
         if archive is not None:
             archivage.synchroniser(archive, etat, ref, parametres["couts"], datetime.datetime.now())
             archivage.fermer(archive)
             print("Archivage : %d ligne(s) écrite(s), %d demande(s) non archivable(s) (données invalides, au journal seulement)"
-                  % (archive["ecrites"], len(archive["non_archivables"])))
+                  % (archive["ecrites"], len(archive["non_archivables"])), flush=True)
 
 
 if __name__ == "__main__":
@@ -257,13 +423,15 @@ if __name__ == "__main__":
     parseur.add_argument("--bdd", action="store_true", help="lit le référentiel dans la base (VM)")
     parseur.add_argument("--archiver", action="store_true",
                          help="mode direct : écrit CAMION_NORTH, TRAJET_NORTH et ARCHIVAGE_COMMANDE_NORTH dans la base (VM)")
-    parseur.add_argument("--referentiels", default=None, help="référentiel JSON (défaut : ../donnees/referentiels.json, sinon exemple)")
+    parseur.add_argument("--referentiels", default=None, help="référentiel JSON (défaut : ../donnees/referentiels.json, sinon exemple) ; "
+                              "avec --bdd, copie de secours si la base ne répond pas au démarrage")
     parseur.add_argument("--fiches", default=None, help="dossier des fiches camion")
     parseur.add_argument("--demandes", default=REPERTOIRE_DEMANDES, help="dossier des CSV du collecteur (mode direct)")
     parseur.add_argument("--sortie", default=REPERTOIRE_SORTIE, help="dossier des journaux")
-    parseur.add_argument("--seuil", type=float, default=None, help="seuil de départ θ (part du plancher)")
+    parseur.add_argument("--seuil", type=float, default=None, help="seuil de départ θ (taux de remplissage, 0-1)")
     parseur.add_argument("--marge", type=float, default=None, help="marge W avant le départ au plus tard (h projet)")
     options = parseur.parse_args()
+    robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
     if options.archiver and options.rejeu:
         # Un rejeu réécrirait les lignes du moteur en direct (mêmes identifiants de demandes)
         parseur.error("--archiver ne s'utilise qu'avec --direct")

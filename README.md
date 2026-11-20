@@ -13,36 +13,42 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 
 | Fichier | Rôle | Règles appliquées |
 |---|---|---|
-| `collecteur.py` | Reçoit les messages UDP de l'ERP, les sauvegarde (JSONL brut + CSV) | — |
+| `collecteur.py` | Reçoit les messages UDP de l'ERP, les sauvegarde (JSONL brut + CSV) | R-COL-01, R-ROB-03/04 |
+| `robustesse.py` | Garde-fous communs : SIGTERM traité comme `Ctrl+C`, erreurs répétées affichées une fois par minute | R-ROB-01/02/03 |
 | `simulateur_erp.py` | Imite l'ERP en local, pour tester hors du VLAN de l'ENSIBS | — |
 | `schema_bdd.py` | Affiche le schéma de la base `UE_ENS_DCJC` (lecture seule) | — |
 | `hypotheses.py` | Toutes les valeurs que le sujet ne fixe pas, avec leur question ouverte (A1–E18) ; lecture des données confidentielles (Annexe 2) | — |
-| `referentiels.py` | Tables de la base (copie JSON par `--export`) ou référentiel d'exemple (`--exemple`) ; durées, attente au port, capacités | R-VAL-01, R-DEL-01 |
-| `regles.py` | Contraintes dures : périmètre, validité, SPEC, frigo, plancher | R-PER-01/02, R-VAL-01, R-SPEC-01/02, R-FRA-01/02, R-CAP-01 |
+| `referentiels.py` | Tables de la base (copie JSON par `--export`) ou référentiel d'exemple (`--exemple`) ; durées, attente au port, capacités | R-VAL-01, R-DEL-01, R-CAP-01, R-FLO-01 |
+| `regles.py` | Contraintes dures : périmètre, validité, SPEC, frigo, plancher ; taux de remplissage par surface | R-PER-01/02, R-VAL-01, R-SPEC-01/02, R-FRA-01/02, R-CAP-01, R-KPI-TR |
 | `flotte.py` | Fiches camion → flotte NORTH (position, disponibilité, conduite) | R-FLO-01 |
-| `planification.py` | Plan d'une tournée (chargements puis livraisons), pauses, gamme, coût ; table D-DEPART | R-DEL-01, R-CON-01, R-GAM, R-SPEC-02 |
+| `planification.py` | Plan d'une tournée (chargements puis livraisons), pauses, gamme, coût, prix ; table D-DEPART | D-DEPART, R-RENT-01, R-DEL-01, R-CON-01, R-CAP-01, R-DUR-01, R-GAM, R-SPEC-02, R-OPT-01/03 |
 | `decision.py` | Table D-ACC : ignorer, refuser ou accepter dans le meilleur plan | D-ACC, R-OPT-01/02/03 |
-| `tracabilite.py` | Journal CSV des événements ; calcul de TA et TR | R-KPI-TA, R-KPI-TR |
+| `tracabilite.py` | Journal CSV des événements ; calcul de TA et TR (surface au sol) | R-KPI-TA, R-KPI-TR |
 | `archivage.py` | Écrit l'état du moteur dans `CAMION_NORTH`, `TRAJET_NORTH`, `ARCHIVAGE_COMMANDE_NORTH` (`../3 - Documentation/tables-nord.sql`) ; `--etat` pour compter les lignes | R-SPEC-02, R-DEL-01, R-GAM, R-KPI-TR |
-| `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct | — |
+| `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct ; enchaîne D-ACC puis D-DEPART, chaque demande et chaque tournée protégée | R-ROB-01/02/03 |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
 | `nord.sh` | Lancement sur la VM : démarrer, arrêter, état, surveillance des trois processus | — |
 | `tableau_bord.html`, `static/Chart_min.js` | Page du tableau de bord et Chart.js 2.5 (copie locale, licence MIT) | — |
-| `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART | — |
+| `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART ; taux de remplissage par surface | — |
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
+| `tests/test_robustesse.py` | Garde-fous d'exploitation : erreurs sur une demande, une tournée, la base, le CSV, le collecteur ; SIGTERM | R-ROB-01 à 04 |
 | `tests/test_archivage.py` | Lignes et contraintes des tables `*_NORTH`, statuts des trajets dans le temps, prix, écritures (base simulée), reprise après arrêt | — |
 
-Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/regles-acceptation.docx` ; chaque docstring cite la règle qu'elle applique.
+Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/processus.md` §2.5 ; chaque docstring cite la règle qu'elle applique, et `../3 - Documentation/tracabilite.md` relie chaque règle à sa fonction et à son test.
 
 ## Documentation
 
+Documentation en cinq couches (`../3 - Documentation/standard-documentation.md`) ; les fichiers Markdown et les deux pages web suivent le code (état au 17/11/2026).
+
 | Document | Contenu |
 |---|---|
-| [Architecture du moteur NORTH](https://claude.ai/artifact/EjLcKZ13a82uCpUaLsTpMp) | Modules et dépendances, boucle du moteur, tables D-ACC et D-DEPART, calcul d'un plan de tournée, état en mémoire, hypothèses A1–E18 et écarts connus |
-| [Pile documentaire NORTH](https://claude.ai/artifact/WwhHYhgT4Jkip186zLZKF9) | Les cinq couches du standard de documentation : processus et RACI, règles métier, glossaire et modèle du domaine, matrice de traçabilité (règle → fonction → test → preuve), code |
-| `../3 - Documentation/regles-acceptation.docx` | Catalogue des règles `R-…` et motifs `REF-…` (sa matrice de traçabilité date d'avant le codage : celle de la pile documentaire suit le code) |
 | `../3 - Documentation/standard-documentation.md` | Standard de documentation de l'équipe |
+| `../3 - Documentation/processus.md` | Couches 1 à 3 : correspondance avec le pseudo-BPMN du sujet (p. 24) et RACI ; tables D-ACC et D-DEPART, machines à états, catalogue des règles `R-…` et des motifs `REF-…` ; glossaire et diagramme de classes |
+| `../3 - Documentation/tracabilite.md` | Couche 4 : exigence → règle → fonction → test → preuve → état ; test de chaque ligne des tables de décision |
+| `../3 - Documentation/tables-nord.sql`, `schema.md`, `schema-bdd.md` | Nos tables `*_NORTH` ; schéma des tables fournies |
+| [Architecture du moteur NORTH](https://claude.ai/artifact/EjLcKZ13a82uCpUaLsTpMp) | Modules et dépendances, boucle du moteur, logigrammes D-ACC et D-DEPART, calcul d'un plan, état en mémoire, hypothèses A1–E18 |
+| [Pile documentaire NORTH](https://claude.ai/artifact/WwhHYhgT4Jkip186zLZKF9) | Les cinq couches du standard, suivies sur une demande d'exemple |
 
 ## Données hors du dossier de code
 
@@ -55,7 +61,7 @@ Le code lit et écrit dans `../donnees/` (hors git) :
 | `../donnees/annexe2_confidentiel.json` | Taux horaires et seuil de rentabilité (Annexe 2, **confidentiel, à ne pas publier**) | à créer à la main |
 | `../donnees/moteur/evenements_*.csv` | Journal du moteur | `moteur.py` |
 
-Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul le classement des plans compte) et le seuil θ de `hypotheses.SEUIL_DEPART_DEFAUT`. Sans `referentiels.json`, il génère un référentiel d'exemple dans `_build/` (valeurs du sujet + estimations, signalées au démarrage).
+Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul le classement des plans compte). Le seuil de départ θ et la marge W ne dépendent pas de ce fichier : par défaut θ = 0,85 (`hypotheses.SEUIL_DEPART_DEFAUT`, comparé au remplissage au départ du premier lieu de chargement) et W = 0,25 h projet (`hypotheses.MARGE_DEPART_H`), valeurs du balayage du 2026-11-16 (`../../_build/rejeu-c13/`) ; `--seuil` et `--marge` les remplacent. Une tournée peut charger dans plusieurs lieux (`hypotheses.REGROUPER_ENTRE_LIEUX_DEP`) : tous les chargements, puis toutes les livraisons. Sans `referentiels.json`, il génère un référentiel d'exemple dans `_build/` (valeurs du sujet + estimations, signalées au démarrage).
 
 ## Sur la VM ENSIBS
 
@@ -84,6 +90,23 @@ python3 archivage.py --etat                                        # lignes par 
 python3 tableau_bord.py --hote 0.0.0.0                             # tableau de bord : http://IP_VM:10000/
 ```
 
+### Garde-fous d'exploitation (R-ROB-01 à R-ROB-04)
+
+Un moteur relancé perd son état en mémoire : ses commandes acceptées et pas encore parties passent expirées (REF-DELAI), ce qui fait baisser le TA. Un collecteur arrêté perd les messages de l'ERP pour toujours. Les services ne s'arrêtent donc que sur demande :
+
+| Panne | Comportement | Où le voir |
+|---|---|---|
+| Exception sur une demande | Refusée REF-DONNEES (ignorée si hors NORTH) ; les suivantes sont décidées | `moteur.log`, journal |
+| Exception sur une tournée | Reste ouverte, réexaminée au tick suivant | `moteur.log` |
+| Ligne illisible dans le CSV du jour | Ignorée et comptée | `moteur.log`, résumé à l'arrêt |
+| Base injoignable ou lente | Délais bornés (connexion 5 s, requête 10 s, `referentiels.BDD`) ; dernier référentiel gardé, nouvel essai chaque minute ; tables `*_NORTH` rattrapées au retour de la base | `moteur.log` (« base injoignable ») |
+| Base injoignable au démarrage | Le moteur part sur `../donnees/referentiels.json` (écrit par `nord.sh demarrer`, ou `--referentiels`) | première ligne de `moteur.log` |
+| Tick plus long que 5 s | Signalé (« le moteur prend du retard ») | `moteur.log` |
+| Erreur d'écriture ou de socket du collecteur | Signalée, la collecte continue ; le brut est écrit avant toute lecture du CSV | `collecteur.log` |
+| `nord.sh arreter` (SIGTERM) | Arrêt propre : dernière synchronisation des tables `*_NORTH`, résumé | fin de `moteur.log` |
+
+Une même erreur n'est affichée qu'une fois par minute ; toutes sont comptées dans le résumé à l'arrêt. `tests/test_robustesse.py` vérifie chacun de ces comportements, et `paquet_vm.sh` refuse d'emballer si un test échoue.
+
 Le collecteur doit tourner sans interruption : l'ERP ne renvoie pas les messages manqués. Le relancer le même jour ne crée pas de doublons (identifiants déjà présents dans le CSV ignorés). Fiches camion lues dans `/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion/`.
 
 ## En local
@@ -101,6 +124,59 @@ Pour tester le collecteur sans le VLAN, dans deux terminaux :
 python3 collecteur.py --sortie _build/test   # terminal 1
 python3 simulateur_erp.py                    # terminal 2 : 1 à 3 demandes toutes les 1 à 3 s vers 127.0.0.1:40040
 ```
+
+## Calcul des indicateurs (KPI)
+
+Indicateurs de l'audit, calculés deux fois : par le moteur (`tracabilite.calculer_kpi`, sur son état) et par `audit.py` (sur le journal et les fichiers du collecteur seulement, comme le Contrôle). Formules détaillées : `../../3 - Contractualisation/methode-contrat.md` §1 et §3.
+
+### Taux d'acceptation (TA, R-KPI-TA)
+
+```
+TA = demandes NORTH parties à temps / demandes NORTH reçues
+```
+
+- **Reçues** : demandes dont l'usine de départ (export) ou d'arrivée (import) est Amsterdam, Düsseldorf ou Manchester, reçues dans la fenêtre d'audit.
+- **Parties** : statut final `PARTIE`, départ contrôlé avant `H_DEP` (pour un import portuaire, `H_DEP` porte sur le départ du camion vers le port).
+- Une demande acquittée puis refusée ou expirée compte comme **refusée**. Une demande encore sans décision compte au dénominateur seulement.
+- `audit.py` donne aussi `ta_decidees` (sans les demandes en attente) et le TA par usine et par sens.
+
+### Taux de remplissage (TR, R-KPI-TR)
+
+Le TR d'une tournée se mesure à son départ du **premier lieu de chargement** (le retour des camions n'est pas géré) ; le TR de la fenêtre est la moyenne sur les tournées parties. Une tournée qui charge ensuite dans un autre lieu garde le TR de son premier départ (`plan["remplissage"]`) ; le remplissage le plus haut de la tournée est gardé à part (`plan["remplissage_max"]`, information).
+
+Méthode par surface au sol :
+
+```
+S_palette  : EPAL 1,20 × 0,80 = 0,96 m² ; EPALh 0,80 × 0,60 = 0,48 m² ; ISO 1,20 × 1,00 = 1,20 m²
+S_camion   = max sur les types (capacité TRUCKS_CAPACITY(PTAC, type) × S_palette)
+           = capacité EPAL × 0,96 m² pour tous les PTAC de la table
+TR tournée = Σ (QTE_PAL × S_palette) des demandes chargées / S_camion
+```
+
+| PTAC | S_camion | TR camion plein en EPAL | en ISO | en EPALh |
+|---|---|---|---|---|
+| 12t | 18 × 0,96 = 17,28 m² | 100 % | 14 × 1,20 → 97,2 % | 33 × 0,48 → 91,7 % |
+| 19t | 21 × 0,96 = 20,16 m² | 100 % | 16 × 1,20 → 95,2 % | 39 × 0,48 → 92,9 % |
+| 26t | 22 × 0,96 = 21,12 m² | 100 % | 17 × 1,20 → 96,6 % | 41 × 0,48 → 93,2 % |
+| 32t, 44t | 33 × 0,96 = 31,68 m² | 100 % | 26 × 1,20 → 98,5 % | 63 × 0,48 → 95,5 % |
+
+- La surface de référence est celle du type qui occupe le plus de plancher (EPAL). Prendre la capacité EPALh × 0,48 m² donnerait une surface plus petite que celle d'un camion plein en EPAL ou en ISO, donc des TR au-dessus de 100 % (jusqu'à 109 % pour un 12t plein en EPAL).
+- Le sujet ne donne pas les dimensions des palettes : celles d'EPALh supposent une demi-palette 800 × 600 (hypothèse à faire valider par le Contrôle).
+- Le TR ne sert qu'à mesurer. L'admissibilité d'un chargement reste la règle R-CAP-01 (`regles.equivalent_plancher`) : Σ QTE_PAL / capacité(PTAC, type) ≤ 1, plus une rangée perdue par type de palette en plus. Le contrôle par surface laisserait passer 36 EPALh dans un 12t, alors que la table en autorise 33.
+- **Dans le code** : `regles.surface_camion` et `regles.taux_remplissage` (surfaces dans `hypotheses.SURFACE_PALETTE_M2`). Le plan de tournée (`planification.evaluer_plan`) s'en sert pour le remplissage de chaque tronçon et au départ ; ce taux est écrit dans la colonne `REMPLISSAGE` du journal, que `audit.py` relit, et dans `TRAJET_NORTH.TAUX_REMPL`. Le seuil de départ θ (D-DEPART) et le prix facturé (part de surface de la demande / seuil) utilisent la même mesure.
+- `tr_troncons` (information) : Σ remplissage × durée / Σ durée sur tous les tronçons, trajets à vide compris.
+
+### Gammes de prix (R-GAM)
+
+Chaque demande partie reçoit la gamme la plus haute dont les deux limites sont respectées (`hypotheses.GAMMES`) :
+
+| Gamme | Arrêts entre chargement et livraison | Allongement (durée réelle / trajet direct) |
+|---|---|---|
+| haute | 0 | ≤ 1,1 |
+| médiane | ≤ 1 | ≤ 1,5 |
+| basse | ≤ 3 | ≤ 2,5 |
+
+Au-delà, la demande est hors contrat (pas de plan). Une SPEC non respectée fait descendre la demande d'une gamme (R-SPEC-02). Indicateur suivi : part de gamme haute = demandes en gamme haute / demandes parties.
 
 ## Tableau de bord d'audit
 

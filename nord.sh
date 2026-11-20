@@ -13,7 +13,7 @@
 # sans option, une commande reprend celles du dernier lancement) :
 #   --sans-bdd        moteur sans la base (lit ../donnees/referentiels.json) ; hors VLAN ou base en panne
 #   --sans-archive    le moteur n'écrit pas les tables *_NORTH (par défaut, il les écrit quand il lit la base)
-#   --seuil X         seuil de départ θ du moteur (part du plancher, 0-1)
+#   --seuil X         seuil de départ θ du moteur (taux de remplissage, 0-1)
 #   --marge W         marge W avant le départ au plus tard (heures projet)
 #   --confidentiel    le tableau de bord affiche les valeurs de l'Annexe 2 : à ne pas montrer au Contrôle
 #   --port N          port du tableau de bord (défaut 10000)
@@ -165,7 +165,7 @@ verifier() {
         echo "  ! ../donnees/referentiels.json absent : le moteur utilisera un référentiel d'exemple"
     fi
     [ -f "$DONNEES/annexe2_confidentiel.json" ] || \
-        echo "  ! ../donnees/annexe2_confidentiel.json absent : coûts fictifs et seuil θ par défaut"
+        echo "  ! ../donnees/annexe2_confidentiel.json absent : coûts et prix fictifs (θ et W gardent leurs valeurs par défaut)"
 }
 
 adresse_tableau() {

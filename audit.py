@@ -489,7 +489,9 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
 
     Applique R-KPI-TA (TA = demandes NORTH parties / demandes NORTH reçues
     dans la fenêtre) et R-KPI-TR (TR = moyenne du remplissage des tournées au
-    départ du premier lieu de chargement, tournées parties dans la fenêtre).
+    départ du premier lieu de chargement, tournées parties dans la fenêtre ;
+    le remplissage est lu dans la colonne ``REMPLISSAGE`` du journal, surface
+    au sol des palettes / surface du camion).
     Une demande reçue dans la fenêtre et partie après sa fin compte comme partie.
 
     :param sources: Sources lues par :func:`charger_sources`.

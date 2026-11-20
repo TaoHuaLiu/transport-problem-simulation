@@ -102,6 +102,7 @@ def vitesse_kmh(heures: float) -> float:
 def cout_energie(ref: dict, camion: dict, route_h: float) -> float:
     """Coût de l'énergie consommée sur un trajet (``couts.md``).
 
+    Sert à la règle R-OPT-01 (choisir le plan le moins coûteux).
     Consommation aux 100 km (``TRUCKS_CONSUMPTION``) × distance (durée ×
     vitesse moyenne) × prix de l'énergie (:data:`hypotheses.PRIX_ENERGIE`).
 
@@ -122,7 +123,10 @@ def prix_prestation(demande: dict, camion: dict, ref: dict, couts: dict, gamme: 
     multipliée par le coefficient de sa gamme
     (:data:`hypotheses.COEF_PRIX_GAMME`) ::
 
-        prix = C_trajet(direct) × part du plancher / seuil × coefficient de gamme
+        prix = C_trajet(direct) × part de surface / seuil × coefficient de gamme
+
+    La part de surface est le taux de remplissage de la demande seule
+    (R-KPI-TR, :func:`regles.taux_remplissage`), comme le seuil.
 
     ``C_trajet`` = taux horaires × (conduite directe, pauses comprises, plus
     chargement et déchargement) + énergie du trajet direct.
@@ -136,7 +140,7 @@ def prix_prestation(demande: dict, camion: dict, ref: dict, couts: dict, gamme: 
     :rtype: float or None
     """
     route = referentiels.duree(ref, demande["pk_dep"], demande["pk_arr"])
-    part = regles.equivalent_plancher([demande], camion["PTAC"], ref)
+    part = regles.taux_remplissage([demande], camion["PTAC"], ref)
     if route is None or not part or gamme not in hypotheses.COEF_PRIX_GAMME or not couts.get("seuil_rentabilite"):
         return None
     duree_h = conduire(route, {"jour": 0.0, "continue": 0.0}) + 2 * hypotheses.DUREE_CHARGEMENT_H
@@ -164,6 +168,9 @@ def grouper(demandes: list, cle_lieu: str, cle_type: str) -> dict:
 def ordonner_arrets(ref: dict, demandes: list) -> list:
     """Ordonne les arrêts d'une tournée : chargements puis livraisons.
 
+    Applique la règle R-OPT-03 (regrouper les demandes compatibles dans une
+    même tournée, hypothèse C13) ; le détour qui en résulte est borné par les
+    gammes (R-OPT-04, :func:`attribuer_gamme`).
     Chargements dans l'ordre de la plus proche ``H_DEP`` ; livraisons au plus
     proche voisin depuis le dernier chargement.
 
@@ -242,8 +249,12 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
     son lieu de départ chargé — trajet, chargement — et, pour un import, le
     camion quitte l'usine à vide vers le port, voir :func:`est_import_port`), R-CON-01
     (pauses et repos, voir :func:`conduire`), R-CAP-01 (plancher ≤ 1 sur
-    chaque tronçon), R-GAM (une demande hors gamme basse est interdite) et
+    chaque tronçon), R-KPI-TR (remplissage par la surface au sol,
+    :func:`regles.taux_remplissage`), R-GAM (une demande hors gamme basse est interdite) et
     R-SPEC-02 (une SPEC non tenue abaisse la gamme, :func:`declasser_gamme`).
+    La durée totale estimée (R-DUR-01 : trajets, pauses, attentes au port,
+    chargements) fixe le coût du plan, qui sert à départager les plans (R-OPT-01).
+    Les durées sont en heures projet, les dates en heure réelle.
 
     :param ref: Référentiel.
     :param camion: Camion qui fait la tournée.
@@ -255,10 +266,11 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
     :return: Plan : ``ok``, ``motif`` (``None``, ``"DELAI"``, ``"TRAJET"``, ``"CAPACITE"``, ``"GAMME"``),
         ``marge_h``, ``debut``, ``fin``, ``troncons``, ``suivi`` (par demande : ``depart`` du
         lieu de chargement, ``depart_controle`` comparé à ``H_DEP``…), ``cout``,
-        ``remplissage``, ``lieu_fin``, ``conduite_jour``.
+        ``remplissage`` (au départ du premier lieu de chargement, R-KPI-TR), ``remplissage_max``
+        (le plus haut sur la tournée), ``lieu_fin``, ``conduite_jour``.
     """
     plan = {"ok": False, "motif": None, "marge_h": math.inf, "debut": debut, "fin": debut, "troncons": [],
-            "suivi": {d["id"]: {} for d in demandes}, "cout": math.inf, "remplissage": 0.0,
+            "suivi": {d["id"]: {} for d in demandes}, "cout": math.inf, "remplissage": 0.0, "remplissage_max": 0.0,
             "lieu_fin": camion["position"], "conduite_jour": camion["conduite_jour"]}
     # Un camion arrêté au moins le temps du repos quotidien repart reposé
     repos = vers_heures(debut - camion["libre_a"]) >= hypotheses.REPOS_QUOTIDIEN_H
@@ -268,6 +280,7 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
     # resté au port d'Amsterdam paie donc le trajet intra-ville vers l'usine (estimation prudente).
     t, lieu, type_lieu = debut, camion["position"], "USINE"
     a_bord, energie, arrets = [], 0.0, ordonner_arrets(ref, demandes)
+    plancher_max = 0.0
     etapes = arrets + ([("R", camion["usine"], "USINE", [])] if hypotheses.RETOUR_A_L_USINE else [])
     for numero, (sens, cible, type_cible, groupe) in enumerate(etapes):
         # Instant où le camion se met en route vers cette étape (départ à vide vers le port pour un import)
@@ -282,7 +295,8 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
                 return plan
         if route > 0:
             ecoule = conduire(route, conduite, regles_conducteur)
-            remplissage = regles.equivalent_plancher(a_bord, camion["PTAC"], ref) or 0.0
+            remplissage = regles.taux_remplissage(a_bord, camion["PTAC"], ref) or 0.0
+            plancher_max = max(plancher_max, regles.equivalent_plancher(a_bord, camion["PTAC"], ref) or 0.0)
             plan["troncons"].append({"de": lieu, "a": cible, "debut": t, "fin": t + vers_delta(ecoule),
                                      "duree_h": route, "demandes": [d["id"] for d in a_bord], "remplissage": remplissage})
             energie += cout_energie(ref, camion, route)
@@ -305,9 +319,14 @@ def evaluer_plan(ref: dict, camion: dict, demandes: list, debut: datetime.dateti
                 a_bord.remove(demande)
                 plan["suivi"][demande["id"]].update({"arrivee": t, "arret_l": numero})
 
+    # Remplissage (R-KPI-TR, surface) pour mesurer ; plancher (R-CAP-01) pour l'admissibilité
+    plancher_total = regles.equivalent_plancher(demandes, camion["PTAC"], ref)
     plan.update({"fin": t, "lieu_fin": lieu, "conduite_jour": conduite["jour"],
-                 "remplissage": max([tr["remplissage"] for tr in plan["troncons"]] + [regles.equivalent_plancher(demandes, camion["PTAC"], ref) or 0.0])})
-    if regles.equivalent_plancher(demandes, camion["PTAC"], ref) is None or plan["remplissage"] > 1 + 1e-9:
+                 # R-KPI-TR : chargement du premier lieu seulement ; le maximum suit les chargements suivants
+                 "remplissage": regles.taux_remplissage(arrets[0][3], camion["PTAC"], ref) or 0.0 if arrets else 0.0,
+                 "remplissage_max": max([tr["remplissage"] for tr in plan["troncons"]] + [regles.taux_remplissage(demandes, camion["PTAC"], ref) or 0.0])})
+    if plancher_total is None or regles.taux_remplissage(demandes, camion["PTAC"], ref) is None \
+            or max(plancher_max, plancher_total) > 1 + 1e-9:
         plan["motif"] = "CAPACITE"
         return plan
     if plan["marge_h"] < 0:
@@ -361,7 +380,9 @@ def evaluer_avec_motif(ref: dict, camion: dict, demandes: list, debut: datetime.
 def decider_depart(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime, parametres: dict) -> str:
     """Décide si une tournée ouverte part maintenant.
 
-    Implémente la table D-DEPART (première ligne qui correspond) :
+    Implémente la table D-DEPART (première ligne qui correspond) et applique
+    la règle R-RENT-01 (ne partir qu'à partir du seuil de remplissage, sauf à
+    l'heure limite) :
 
     1. remplissage prévu ≥ seuil θ → ``"partir"`` ;
     2. sous le seuil, heure limite pas atteinte → ``"attendre"`` ;
@@ -369,20 +390,22 @@ def decider_depart(tournee: dict, etat: dict, ref: dict, maintenant: datetime.da
        selon :data:`hypotheses.SOUS_SEUIL` (motif REF-RENTABILITE).
 
     L'heure limite est le départ au plus tard (marge du plan) moins la marge W.
-    Le seuil vient de l'Annexe 2 (confidentielle) ou de :data:`hypotheses.SEUIL_DEPART_DEFAUT`.
+    Le seuil vient de l'option ``--seuil`` ou de :data:`hypotheses.SEUIL_DEPART_DEFAUT` ; il est
+    comparé au remplissage choisi par :data:`hypotheses.SEUIL_MESURE`.
 
     :param tournee: Tournée ouverte.
     :param etat: État du moteur (``flotte``, ``demandes``).
     :param ref: Référentiel.
     :param maintenant: Heure réelle courante.
-    :param parametres: ``seuil``, ``marge_h``, ``couts``.
+    :param parametres: ``seuil`` (θ, taux entre 0 et 1), ``marge_h`` (W, heures projet), ``couts``.
     :return: ``"partir"``, ``"attendre"`` ou ``"refuser"``.
     """
     camion = etat["flotte"][tournee["camion"]]
     demandes = [etat["demandes"][i] for i in tournee["demandes"]]
     plan = evaluer_plan(ref, camion, demandes, max(maintenant, camion["libre_a"]), maintenant, parametres["couts"])
     tournee["plan"] = plan
-    if plan["ok"] and plan["remplissage"] >= parametres["seuil"]:
+    mesure = plan["remplissage_max"] if hypotheses.SEUIL_MESURE == "maximum" else plan["remplissage"]
+    if plan["ok"] and mesure >= parametres["seuil"]:
         return "partir"
     if plan["ok"] and plan["marge_h"] > parametres["marge_h"]:
         return "attendre"
@@ -392,10 +415,13 @@ def decider_depart(tournee: dict, etat: dict, ref: dict, maintenant: datetime.da
 def faire_partir(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime, couts: dict, journal: dict) -> None:
     """Fait partir une tournée et écrit son départ et ses tronçons.
 
-    Les demandes qui ne peuvent plus partir à temps (``H_DEP`` dépassée au
-    départ contrôlé par R-DEL-01) sont retirées et passent « expirées » : elles comptent comme
-    refusées dans le taux d'acceptation (règle R-DEL-01). Le camion est
-    ensuite libre à la fin de la tournée, à son dernier lieu.
+    Applique la règle R-DEL-01 : les demandes qui ne peuvent plus partir à
+    temps (``H_DEP`` dépassée au départ contrôlé) sont retirées et passent
+    « expirées » (événement ``EXPIRATION``, motif ``REF-DELAI``) ; elles
+    comptent comme refusées dans le taux d'acceptation (R-KPI-TA). Les autres
+    passent « parties » (événements ``DEPART``, ``TRONCON``, ``PARTIE``).
+    Le camion est ensuite libre à la fin de la tournée, à son dernier lieu
+    (hypothèse C10).
 
     :param tournee: Tournée à faire partir.
     :param etat: État du moteur.

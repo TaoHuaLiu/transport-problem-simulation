@@ -2,7 +2,7 @@
 
 Toutes les valeurs que le sujet ne fixe pas sont réunies ici. Chacune renvoie
 à une question ouverte de la page d'architecture (identifiants A1 à E18) ou à
-une règle du catalogue (``3 - Documentation/regles-acceptation.docx``) : quand
+une règle du catalogue (``3 - Documentation/processus.md``, §2.5) : quand
 la réponse arrive, on ne modifie que ce fichier.
 
 Unités : sauf mention contraire, les durées sont en **heures projet**
@@ -38,7 +38,8 @@ DECLASSEMENT_SPEC = "un_cran"
 PTAC_SPEC_MINIMUM = False
 
 #: Une clé SPEC inconnue (autre que PTAC, ENR, COL) ne peut pas être vérifiée :
-#: ``True`` la traite comme non respectée (refus REF-SPEC).
+#: ``True`` la traite comme non respectée (gamme abaissée, R-SPEC-02 ; refus REF-SPEC
+#: seulement si :data:`SPEC_BLOQUANTE`).
 CLES_SPEC_INCONNUES_BLOQUANTES = True
 
 #: R-FRA-02 : produits secs dans un camion frigorifique.
@@ -77,8 +78,17 @@ VITESSE_TRAJET_LONG_KMH = 74.9    # trajets > 7 h
 #: (C9, au démarrage chaque camion est libre à son usine : :func:`flotte.charger_flotte`.)
 RETOUR_A_L_USINE = False
 
-#: C13 : une tournée peut-elle charger dans deux lieux différents ?
-REGROUPER_ENTRE_LIEUX_DEP = False
+#: C13 : une tournée peut-elle charger dans deux lieux différents ? Oui depuis le 2026-11-16 :
+#: tous les chargements, puis toutes les livraisons (:func:`planification.ordonner_arrets`).
+#: Le TR reste mesuré au départ du premier lieu de chargement (R-KPI-TR).
+REGROUPER_ENTRE_LIEUX_DEP = True
+
+# ---------------------------------------------------------------- Taux de remplissage (R-KPI-TR)
+#: Surface au sol de chaque type de palette, en m² (README « Calcul des indicateurs »).
+#: Le sujet ne donne pas les dimensions : EPAL 1,20 × 0,80 et ISO 1,20 × 1,00 sont
+#: les normes ; EPALh est supposée être une demi-palette 0,80 × 0,60 (à faire valider).
+#: Surface d'un camion = max sur les types (capacité × surface), soit capacité EPAL × 0,96.
+SURFACE_PALETTE_M2 = {"EPAL": 0.96, "EPALh": 0.48, "ISO": 1.20}
 
 # ---------------------------------------------------------------- Gammes (methode-contrat.md §3)
 #: (gamme, arrêts intermédiaires max, allongement max), de la plus haute à la plus basse.
@@ -88,13 +98,23 @@ GAMMES = [("haute", 0, 1.1), ("mediane", 1, 1.5), ("basse", 3, 2.5)]
 COEF_PRIX_GAMME = {"haute": 1.15, "mediane": 1.00, "basse": 0.85}
 
 # ---------------------------------------------------------------- Politique (D15, D16, E17)
-#: W : marge gardée avant le départ au plus tard d'une tournée (D-DEPART).
-MARGE_DEPART_H = 1.0
+#: W : marge gardée avant le départ au plus tard d'une tournée (D-DEPART), heures projet.
+#: Valeur retenue par le balayage θ × W du 2026-11-16 (``_build/rejeu-c13/``) : 0,25 h projet
+#: = 15 s réelles = 3 ticks ; 0,1 h fait à peine mieux en rejeu mais ne laisse qu'un tick sur la VM.
+MARGE_DEPART_H = 0.25
 
-#: θ par défaut, si le fichier confidentiel est absent. À régler par rejeu.
-SEUIL_DEPART_DEFAUT = 0.5
+#: θ : seuil de départ de la règle R-RENT-01 (taux de remplissage, R-KPI-TR), sauf option ``--seuil`` du moteur.
+#: Valeur retenue par le balayage θ × W du 2026-11-16 ; ne dépend plus du seuil de rentabilité.
+SEUIL_DEPART_DEFAUT = 0.85
 
-#: D-DEPART ligne 3 : sous le seuil à l'heure limite, ``"partir"`` ou ``"refuser"``.
+#: Remplissage comparé à θ : ``"premier_depart"`` (celui du KPI, au départ du premier lieu
+#: de chargement) ou ``"maximum"`` (le plus haut sur la tournée, après le dernier chargement).
+SEUIL_MESURE = "premier_depart"
+
+#: Seuil de rentabilité utilisé pour le prix si le fichier confidentiel est absent.
+SEUIL_RENTABILITE_DEFAUT = 0.5
+
+#: D-DEPART ligne 3 : sous le seuil à l'heure limite, ``"partir"`` ou ``"refuser"`` (motif REF-RENTABILITE).
 SOUS_SEUIL = "partir"
 
 #: E17 : durée d'un tick du moteur, en secondes réelles.
@@ -119,16 +139,16 @@ def charger_confidentiel(chemin: str = FICHIER_CONFIDENTIEL) -> dict:
 
     Le fichier attendu contient les clés ``taux_conducteur_h``,
     ``taux_vehicule_h`` (euros par heure projet) et ``seuil_rentabilite``
-    (part du plancher, entre 0 et 1). S'il est absent, les coûts sont
+    (taux de remplissage R-KPI-TR, entre 0 et 1). S'il est absent, les coûts sont
     calculés avec un taux horaire total de 1 (0,5 + 0,5 : seul le classement
     des plans compte)
-    et le seuil vaut :data:`SEUIL_DEPART_DEFAUT`.
+    et le seuil vaut :data:`SEUIL_RENTABILITE_DEFAUT`.
 
     :param chemin: Chemin du fichier JSON.
     :return: Dictionnaire avec les trois clés, et ``source`` (chemin ou ``"defaut"``).
     """
     valeurs = {"taux_conducteur_h": 0.5, "taux_vehicule_h": 0.5,
-               "seuil_rentabilite": SEUIL_DEPART_DEFAUT, "source": "defaut"}
+               "seuil_rentabilite": SEUIL_RENTABILITE_DEFAUT, "source": "defaut"}
     if os.path.exists(chemin):
         with open(chemin, encoding="utf-8") as fichier:
             valeurs.update(json.load(fichier))

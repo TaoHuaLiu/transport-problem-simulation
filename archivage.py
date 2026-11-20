@@ -63,7 +63,7 @@ LIBELLES_MOTIFS = {
 #: Justification écrite par :func:`reprendre` pour les commandes laissées acceptées par un moteur arrêté.
 JUSTI_REDEMARRAGE = "REF-DELAI : moteur redémarré avant le départ"
 
-#: Délai minimal entre deux messages d'erreur de la base dans la console.
+#: Délai minimal (temps réel) entre deux messages d'erreur de la base dans la console.
 DELAI_MESSAGES = datetime.timedelta(minutes=1)
 
 
@@ -139,7 +139,7 @@ def ligne_trajet(tournee: dict, etat: dict, maintenant: datetime.datetime) -> tu
     """Ligne ``TRAJET_NORTH`` d'une tournée.
 
     Le taux de remplissage est celui du plan (R-KPI-TR : remplissage au départ
-    du lieu de chargement), en pour cent ; il suit la tournée pendant qu'elle
+    du lieu de chargement, par la surface au sol des palettes), en pour cent ; il suit la tournée pendant qu'elle
     se remplit.
 
     :param tournee: Tournée du moteur.
@@ -337,7 +337,7 @@ def reprendre(archive: dict) -> set:
     """Reprend après un arrêt du moteur (question E18).
 
     L'état du lancement précédent est perdu : ses commandes encore
-    acceptées passent expirées (:data:`JUSTI_REDEMARRAGE`) et ses tournées en
+    acceptées passent expirées (motif ``REF-DELAI``, :data:`JUSTI_REDEMARRAGE`) et ses tournées en
     constitution passent annulées. Les commandes déjà archivées sont
     protégées : le moteur ne les redécide pas et ne les réécrit pas (sinon,
     relire le CSV du jour referait des refus REF-DONNEES sur des demandes passées).

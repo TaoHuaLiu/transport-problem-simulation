@@ -21,6 +21,10 @@ import tracabilite
 def refuser(demande: dict, motif: str, maintenant: datetime.datetime, journal: dict) -> str:
     """Refuse une demande et écrit le refus avec son motif.
 
+    Écrit l'événement ``REFUS`` avec le motif reçu : ``REF-DONNEES``,
+    ``REF-SPEC``, ``REF-FRIGO``, ``REF-CAMION``, ``REF-DELAI`` ou
+    ``REF-CONDUCTEUR`` (table D-ACC), ``REF-RENTABILITE`` (table D-DEPART).
+
     :param demande: Demande préparée.
     :param motif: Motif ``REF-…``.
     :param maintenant: Heure réelle.
@@ -37,8 +41,9 @@ def compatible(tournee: dict, demande: dict, etat: dict, ref: dict) -> bool:
 
     Applique les règles R-FRA-01 (même nature, jamais frais et sec ensemble),
     R-SPEC-01 (le camion de la tournée respecte la SPEC de la nouvelle
-    demande, seulement si :data:`hypotheses.SPEC_BLOQUANTE`), R-CAP-01 (le plancher reste ≤ 1) et l'hypothèse C13 (même lieu
-    de chargement si :data:`hypotheses.REGROUPER_ENTRE_LIEUX_DEP` est faux).
+    demande, seulement si :data:`hypotheses.SPEC_BLOQUANTE`), R-CAP-01 (le plancher reste ≤ 1), R-OPT-03
+    (regrouper les demandes compatibles) et l'hypothèse C13 (même lieu
+    de chargement seulement si :data:`hypotheses.REGROUPER_ENTRE_LIEUX_DEP` est faux).
     Les délais sont vérifiés ensuite par le plan.
 
     :param tournee: Tournée ouverte.
