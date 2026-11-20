@@ -28,11 +28,12 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct ; enchaîne D-ACC puis D-DEPART, chaque demande et chaque tournée protégée | R-ROB-01/02/03 |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
-| `nord.sh` | Lancement sur la VM : démarrer, arrêter, état, surveillance des trois processus | — |
+| `nord.sh` | Lancement sur la VM : démarrer, arrêter, état, surveillance des trois processus ; `audit` = production | R-ROB-05 |
 | `tableau_bord.html`, `static/Chart_min.js` | Page du tableau de bord et Chart.js 2.5 (copie locale, licence MIT) | — |
 | `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART ; taux de remplissage par surface | — |
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
 | `tests/test_robustesse.py` | Garde-fous d'exploitation : erreurs sur une demande, une tournée, la base, le CSV, le collecteur ; SIGTERM | R-ROB-01 à 04 |
+| `tests/test_mode_audit.py` | Mode audit : démarrage sur la base seulement, fiches de la VM et Annexe 2 obligatoires, options interdites (moteur et `nord.sh`) | R-ROB-05 |
 | `tests/test_archivage.py` | Lignes et contraintes des tables `*_NORTH`, statuts des trajets dans le temps, prix, écritures (base simulée), reprise après arrêt | — |
 
 Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/processus.md` §2.5 ; chaque docstring cite la règle qu'elle applique, et `../3 - Documentation/tracabilite.md` relie chaque règle à sa fonction et à son test.
@@ -68,6 +69,7 @@ Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul l
 `nord.sh` lance et surveille la chaîne (collecteur, moteur `--direct --bdd --archiver`, tableau de bord sur le VLAN) :
 
 ```bash
+sh nord.sh audit                          # PRODUCTION pour l'audit (dans tmux) : vérifie base, fiches VM, Annexe 2, puis lance et surveille
 sh nord.sh demarrer                       # collecteur + copie du référentiel + moteur + tableau de bord (http://IP_VM:10000/)
 sh nord.sh demarrer --seuil 0.85 --marge 0.5   # politique θ / W du balayage (sinon valeurs de hypotheses.py)
 sh nord.sh etat                           # processus, dernières lignes des logs, nombre de demandes et d'événements
@@ -90,7 +92,17 @@ python3 archivage.py --etat                                        # lignes par 
 python3 tableau_bord.py --hote 0.0.0.0                             # tableau de bord : http://IP_VM:10000/
 ```
 
-### Garde-fous d'exploitation (R-ROB-01 à R-ROB-04)
+### Mode audit (production, R-ROB-05)
+
+Pour l'audit, lancer `sh nord.sh audit` dans `tmux` ou `screen` (options permises : `--seuil`, `--marge`, `--port`). Le script :
+
+1. refuse de démarrer, sans rien arrêter, si la base ne répond pas, si `/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion/` manque ou si `../donnees/annexe2_confidentiel.json` est absent (`paquet_vm.sh --confidentiel`) ;
+2. relance moteur et tableau de bord en mode audit (le collecteur continue s'il tourne) : `moteur.py --audit` = `--direct --bdd --archiver`, sans copie JSON, sans fiches locales, sans coûts fictifs ; tableau de bord sur `0.0.0.0`, jamais `--confidentiel` ;
+3. surveille et relance toutes les 30 s ce qui s'arrête (un moteur refusé faute de base est relancé dès qu'elle répond).
+
+`--sans-bdd`, `--sans-archive`, `--confidentiel` et `--local` sont refusés. `sh nord.sh etat` affiche « mode : AUDIT ». Après l'audit, `demarrer` ou `redemarrer` avec des options sortent du mode audit (avertissement).
+
+### Garde-fous d'exploitation (R-ROB-01 à R-ROB-05)
 
 Un moteur relancé perd son état en mémoire : ses commandes acceptées et pas encore parties passent expirées (REF-DELAI), ce qui fait baisser le TA. Un collecteur arrêté perd les messages de l'ERP pour toujours. Les services ne s'arrêtent donc que sur demande :
 

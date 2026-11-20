@@ -22,6 +22,12 @@ Utilisation :
 
     python3 moteur.py --rejeu "../../6 - Data/Briefcase/demandes_2026-10-19.jsonl"   # local
     python3 moteur.py --direct --bdd --archiver                                         # VM
+    python3 moteur.py --audit                                                           # VM, audit (production)
+
+Le mode **audit** (règle R-ROB-05) est le mode de production : direct, base,
+archivage, fiches camion de la VM et Annexe 2 obligatoires. Il refuse de
+démarrer plutôt que de partir sur une copie JSON, un référentiel d'exemple,
+les fiches locales ou des coûts fictifs.
 """
 
 import argparse
@@ -289,6 +295,27 @@ def charger_bdd_ou_copie(copie: str = None) -> dict:
         return referentiels.charger_depuis_json(copie)
 
 
+class ErreurAudit(Exception):
+    """Une condition du mode audit (R-ROB-05) n'est pas remplie : le moteur ne démarre pas."""
+
+
+def verifier_conditions_audit(fiches: str, couts: dict) -> None:
+    """Vérifie les conditions de démarrage du mode audit, hors base (lue juste avant).
+
+    Applique la règle R-ROB-05 : en production, les fiches camion sont celles
+    de la VM et les coûts ceux de l'Annexe 2 (le prix ``COUT_PREST`` n'est
+    écrit qu'avec eux).
+
+    :param fiches: Dossier des fiches camion retenu.
+    :param couts: Coûts lus par :func:`hypotheses.charger_confidentiel`.
+    :raises ErreurAudit: Si une condition manque.
+    """
+    if os.path.realpath(fiches) != os.path.realpath(module_flotte.REPERTOIRE_FICHES_VM) or not os.path.isdir(fiches):
+        raise ErreurAudit("mode audit : fiches camion de la VM introuvables (%s)" % module_flotte.REPERTOIRE_FICHES_VM)
+    if couts["source"] == "defaut":
+        raise ErreurAudit("mode audit : %s absent (coûts et prix de l'Annexe 2 obligatoires)" % hypotheses.FICHIER_CONFIDENTIEL)
+
+
 def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     """Charge le référentiel, la flotte et les paramètres de politique.
 
@@ -296,7 +323,14 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     :param debut: Heure réelle (ou simulée) de démarrage.
     :return: ``(etat, ref, parametres)``.
     """
-    if arguments.bdd:
+    audit = getattr(arguments, "audit", False)
+    if audit:
+        # R-ROB-05 : la base, sans copie de secours ; si elle ne répond pas, nord.sh réessaie toutes les 30 s
+        try:
+            ref = referentiels.charger_depuis_bdd()
+        except Exception as erreur:
+            raise ErreurAudit("mode audit : base injoignable au démarrage (%s)" % (str(erreur).strip() or type(erreur).__name__))
+    elif arguments.bdd:
         ref = charger_bdd_ou_copie(arguments.referentiels)
     else:
         chemin = arguments.referentiels
@@ -306,12 +340,21 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
                 chemin = os.path.join(DOSSIER, "_build", "referentiels_exemple.json")
                 referentiels.sauver_json(referentiels.generer_exemple(), chemin)
         ref = referentiels.charger_depuis_json(chemin)
-    fiches = arguments.fiches or (module_flotte.REPERTOIRE_FICHES_VM if os.path.isdir(module_flotte.REPERTOIRE_FICHES_VM) else REPERTOIRE_FICHES_LOCAL)
+    if audit:
+        fiches = module_flotte.REPERTOIRE_FICHES_VM
+    else:
+        fiches = arguments.fiches or (module_flotte.REPERTOIRE_FICHES_VM if os.path.isdir(module_flotte.REPERTOIRE_FICHES_VM) else REPERTOIRE_FICHES_LOCAL)
+    couts = hypotheses.charger_confidentiel()
+    if audit:
+        verifier_conditions_audit(fiches, couts)
     usines = [referentiels.pk_lieu(ref, nom) for nom in hypotheses.USINES_NORTH]
     flotte = module_flotte.charger_flotte(fiches, ref, usines, debut)
-    couts = hypotheses.charger_confidentiel()
+    if audit and not flotte:
+        raise ErreurAudit("mode audit : aucun camion NORTH exploitable dans %s" % fiches)
     parametres = {"couts": couts, "seuil": arguments.seuil if arguments.seuil is not None else hypotheses.SEUIL_DEPART_DEFAUT,
                   "marge_h": arguments.marge if arguments.marge is not None else hypotheses.MARGE_DEPART_H}
+    if audit:
+        print("== MODE AUDIT (production) : base, archivage, fiches de la VM, Annexe 2 ==")
     print("Référentiel : %s" % ref["source"])
     for remarque in ref.get("remarques", []):
         print("  ! %s" % remarque)
@@ -420,6 +463,9 @@ if __name__ == "__main__":
     mode = parseur.add_mutually_exclusive_group(required=True)
     mode.add_argument("--rejeu", help="fichier .jsonl ou .csv du collecteur à rejouer")
     mode.add_argument("--direct", action="store_true", help="lit en continu le CSV du jour du collecteur")
+    mode.add_argument("--audit", action="store_true",
+                      help="production (audit) : --direct --bdd --archiver, sans copie de secours ni fiches locales ; "
+                           "Annexe 2 et fiches de la VM obligatoires")
     parseur.add_argument("--bdd", action="store_true", help="lit le référentiel dans la base (VM)")
     parseur.add_argument("--archiver", action="store_true",
                          help="mode direct : écrit CAMION_NORTH, TRAJET_NORTH et ARCHIVAGE_COMMANDE_NORTH dans la base (VM)")
@@ -432,10 +478,18 @@ if __name__ == "__main__":
     parseur.add_argument("--marge", type=float, default=None, help="marge W avant le départ au plus tard (h projet)")
     options = parseur.parse_args()
     robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
+    if options.audit:
+        # R-ROB-05 : le mode audit impose la base et l'archivage, et ignore les sources de remplacement
+        if options.referentiels or options.fiches:
+            parseur.error("--audit lit la base et les fiches de la VM : --referentiels et --fiches sont interdits")
+        options.direct = options.bdd = options.archiver = True
     if options.archiver and options.rejeu:
         # Un rejeu réécrirait les lignes du moteur en direct (mêmes identifiants de demandes)
         parseur.error("--archiver ne s'utilise qu'avec --direct")
-    if options.rejeu:
-        rejouer(options)
-    else:
-        en_direct(options)
+    try:
+        if options.rejeu:
+            rejouer(options)
+        else:
+            en_direct(options)
+    except ErreurAudit as erreur:
+        raise SystemExit("! %s : le moteur ne démarre pas" % erreur)

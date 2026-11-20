@@ -8,6 +8,15 @@
 #   sh nord.sh etat                 processus, dernières lignes des journaux, adresse du tableau de bord
 #   sh nord.sh surveiller [options] relance toutes les 30 s ce qui s'est arrêté (Ctrl+C pour quitter)
 #   sh nord.sh journaux             suit les fichiers de log (Ctrl+C pour quitter)
+#   sh nord.sh audit [--seuil X] [--marge W] [--port N]
+#                                   PRODUCTION pour l'audit (règle R-ROB-05) : vérifie la base, les fiches
+#                                   de la VM et l'Annexe 2, relance moteur et tableau de bord en mode audit
+#                                   (base et archivage obligatoires, pas de copie de secours, tableau de
+#                                   bord sans données confidentielles, visible du VLAN), puis surveille
+#                                   comme « surveiller ». À lancer dans tmux ou screen.
+#
+# Après « audit », etat / surveiller / redemarrer sans option restent en mode audit ;
+# demarrer ou redemarrer AVEC des options en sortent (message d'avertissement).
 #
 # Options de demarrer / redemarrer / surveiller (mémorisées dans ../donnees/run/options :
 # sans option, une commande reprend celles du dernier lancement) :
@@ -35,6 +44,7 @@ LOGS="$DONNEES/logs"
 SERVICES="collecteur moteur tableau"
 
 # ---------------------------------------------------------------- Options
+MODE=normal
 SANS_BDD=0
 SANS_ARCHIVE=0
 CONFIDENTIEL=0
@@ -50,6 +60,9 @@ lire_options() {
         . "$RUN/options"
         return 0
     fi
+    if [ -f "$RUN/options" ] && grep -q '^MODE=audit$' "$RUN/options"; then
+        echo "  ! options données : sortie du mode audit (sh nord.sh audit pour y revenir)" >&2
+    fi
     while [ $# -gt 0 ]; do
         case "$1" in
             --sans-bdd) SANS_BDD=1 ;;
@@ -64,6 +77,24 @@ lire_options() {
         esac
         shift
     done
+}
+
+# Mode audit (R-ROB-05) : options du dernier lancement ignorées, seules --seuil, --marge et --port acceptées
+lire_options_audit() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port) PORT=$2; shift ;;
+            --seuil) SEUIL=$2; shift ;;
+            --marge) MARGE=$2; shift ;;
+            *) echo "Option interdite en mode audit : $1 (base, archivage et tableau de bord public imposés)" >&2; exit 2 ;;
+        esac
+        shift
+    done
+    MODE=audit
+    SANS_BDD=0
+    SANS_ARCHIVE=0
+    CONFIDENTIEL=0
+    HOTE=0.0.0.0
 }
 
 # ---------------------------------------------------------------- Processus
@@ -86,6 +117,13 @@ commande_de() {
         collecteur)
             echo "python3 -u collecteur.py" ;;
         moteur)
+            if [ "$MODE" = "audit" ]; then
+                cmd="python3 -u moteur.py --audit"
+                [ -z "$SEUIL" ] || cmd="$cmd --seuil $SEUIL"
+                [ -z "$MARGE" ] || cmd="$cmd --marge $MARGE"
+                echo "$cmd"
+                return
+            fi
             cmd="python3 -u moteur.py --direct"
             [ "$SANS_BDD" -eq 1 ] || cmd="$cmd --bdd"
             # Tables CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH (archivage.py)
@@ -156,9 +194,15 @@ verifier() {
     python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || {
         echo "Python 3.10 ou plus récent requis ($(python3 --version 2>&1))" >&2; exit 1; }
     if [ "$SANS_BDD" -eq 0 ] && ! python3 -c 'import psycopg2' 2>/dev/null; then
-        echo "psycopg2 absent : relancer avec --sans-bdd (référentiel ../donnees/referentiels.json)" >&2
+        if [ "$MODE" = "audit" ]; then
+            echo "psycopg2 absent : mode audit impossible (la base est obligatoire)" >&2
+        else
+            echo "psycopg2 absent : relancer avec --sans-bdd (référentiel ../donnees/referentiels.json)" >&2
+        fi
         exit 1
     fi
+    # En mode audit, ces cas sont bloquants et vérifiés par verifier_audit
+    [ "$MODE" = "audit" ] && return 0
     [ -d /mnt/tp4010/DuCapteurJusquauCloud/FichesCamion ] || \
         echo "  ! fiches camion de la VM introuvables : le moteur prendra ../../6 - Data/camions/ s'il existe"
     if [ "$SANS_BDD" -eq 1 ] && [ ! -f "$DONNEES/referentiels.json" ]; then
@@ -166,6 +210,37 @@ verifier() {
     fi
     [ -f "$DONNEES/annexe2_confidentiel.json" ] || \
         echo "  ! ../donnees/annexe2_confidentiel.json absent : coûts et prix fictifs (θ et W gardent leurs valeurs par défaut)"
+}
+
+# Conditions bloquantes du mode audit : base joignable, fiches de la VM, Annexe 2
+verifier_audit() {
+    erreurs=0
+    if ! (cd "$DEV" && python3 - >> "$LOGS/audit.log" 2>&1 <<'FIN'
+import psycopg2, referentiels
+connexion = psycopg2.connect(**referentiels.BDD)
+curseur = connexion.cursor()
+curseur.execute('SELECT COUNT(*) FROM "LOCATIONS_NAMES"')
+print("base joignable : %d lieux" % curseur.fetchone()[0])
+connexion.close()
+FIN
+    ); then
+        echo "  ! base $(cd "$DEV" && python3 -c 'import referentiels; print(referentiels.BDD["host"])') injoignable (détail : $LOGS/audit.log)" >&2
+        erreurs=1
+    fi
+    if [ ! -d /mnt/tp4010/DuCapteurJusquauCloud/FichesCamion ]; then
+        echo "  ! fiches camion de la VM introuvables (/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion)" >&2
+        erreurs=1
+    fi
+    if [ ! -f "$DONNEES/annexe2_confidentiel.json" ]; then
+        echo "  ! ../donnees/annexe2_confidentiel.json absent (paquet_vm.sh --confidentiel)" >&2
+        erreurs=1
+    fi
+    [ -f "$DONNEES/cibles_contrat.json" ] || \
+        echo "  ! ../donnees/cibles_contrat.json absent : le tableau de bord affichera les cibles par défaut"
+    if [ "$erreurs" -ne 0 ]; then
+        echo "Mode audit refusé : corriger ce qui précède (rien n'a été arrêté ni lancé)." >&2
+        exit 1
+    fi
 }
 
 adresse_tableau() {
@@ -180,6 +255,7 @@ adresse_tableau() {
 # ---------------------------------------------------------------- Commandes
 memoriser_options() {
     cat > "$RUN/options" <<FIN
+MODE=$MODE
 SANS_BDD=$SANS_BDD
 SANS_ARCHIVE=$SANS_ARCHIVE
 CONFIDENTIEL=$CONFIDENTIEL
@@ -222,6 +298,11 @@ arreter() {
 
 etat() {
     echo "== État de la chaîne NORTH ($(date '+%Y-%m-%d %H:%M:%S'))"
+    if [ "$MODE" = "audit" ]; then
+        echo "  mode : AUDIT (production : base, archivage, fiches de la VM, Annexe 2)"
+    else
+        echo "  mode : normal$([ "$SANS_BDD" -eq 1 ] && echo ', sans base')"
+    fi
     for service in $SERVICES; do
         if pid=$(pid_de "$service"); then
             duree=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
@@ -245,8 +326,7 @@ etat() {
     pid_de tableau >/dev/null && echo "  tableau de bord : $(adresse_tableau)"
 }
 
-surveiller() {
-    demarrer
+boucle_surveillance() {
     echo "== Surveillance : relance toutes les 30 s ce qui s'est arrêté (Ctrl+C pour quitter, les services continuent)"
     while true; do
         sleep 30
@@ -259,6 +339,31 @@ surveiller() {
     done
 }
 
+surveiller() {
+    demarrer
+    boucle_surveillance
+}
+
+audit() {
+    verifier
+    verifier_audit
+    memoriser_options
+    echo "== AUDIT : démarrage de la chaîne NORTH en production ($(date '+%H:%M:%S'))"
+    echo "   options : seuil θ ${SEUIL:-défaut}, marge W ${MARGE:-défaut}, port $PORT"
+    # Moteur et tableau de bord relancés en mode audit ; le collecteur continue s'il tourne déjà
+    arreter_service tableau
+    arreter_service moteur
+    lancer collecteur || exit 1
+    if (cd "$DEV" && python3 referentiels.py --export >> "$LOGS/referentiels.log" 2>&1); then
+        echo "  + référentiel copié dans ../donnees/referentiels.json (archive ; le mode audit ne s'en sert pas)"
+    fi
+    # Si le moteur refuse de démarrer (base tombée entre-temps), la surveillance réessaie toutes les 30 s
+    lancer moteur || echo "  ! moteur pas encore lancé : nouvel essai toutes les 30 s" >&2
+    lancer tableau || exit 1
+    echo "== Tableau de bord : $(adresse_tableau)"
+    boucle_surveillance
+}
+
 mkdir -p "$RUN" "$LOGS"
 action=${1:-aide}
 [ $# -gt 0 ] && shift
@@ -266,8 +371,13 @@ if [ "$action" = "arreter" ]; then
     for arg in "$@"; do [ "$arg" = "--tout" ] && TOUT=1; done
     set --
 fi
-lire_options "$@"
+if [ "$action" = "audit" ]; then
+    lire_options_audit "$@"
+else
+    lire_options "$@"
+fi
 case "$action" in
+    audit) audit ;;
     demarrer) demarrer ;;
     arreter) arreter ;;
     redemarrer) arreter; demarrer ;;
