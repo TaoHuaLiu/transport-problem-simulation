@@ -221,4 +221,6 @@ __marimo__/
 
 # Projet NORTH : sorties locales et données hors dépôt (confidentielles)
 _build/
-donnees/
+donnees/*
+!donnees/annexe2_confidentiel.json
+!donnees/cibles_contrat.json
