@@ -7,7 +7,9 @@
 3. décide chaque demande (table D-ACC, :mod:`decision`) ;
 4. décide le départ de chaque tournée ouverte (table D-DEPART, :mod:`planification`) ;
 5. écrit les événements dans le journal de traçabilité ;
-6. avec ``--archiver`` (mode direct), met à jour les tables ``*_NORTH`` de la base (:mod:`archivage`).
+6. avec ``--archiver`` (mode direct), met à jour les tables ``*_NORTH`` de la base (:mod:`archivage`) ;
+7. avec ``--controle`` (mode direct), remplit les tables de traçabilité du Contrôle
+   ``TRACABILITE_COMMANDE`` et ``TRACABILITE_TRAJET`` (:mod:`tracabilite_controle`).
 
 Deux modes :
 
@@ -21,11 +23,11 @@ Utilisation :
 .. code-block:: bash
 
     python3 moteur.py --rejeu "../../6 - Data/Briefcase/demandes_2026-10-19.jsonl"   # local
-    python3 moteur.py --direct --bdd --archiver                                         # VM
+    python3 moteur.py --direct --bdd --archiver --controle                              # VM
     python3 moteur.py --audit                                                           # VM, audit (production)
 
 Le mode **audit** (règle R-ROB-05) est le mode de production : direct, base,
-archivage, fiches camion de la VM et Annexe 2 obligatoires. Il refuse de
+archivage, tables du Contrôle, fiches camion de la VM et Annexe 2 obligatoires. Il refuse de
 démarrer plutôt que de partir sur une copie JSON, un référentiel d'exemple,
 les fiches locales ou des coûts fictifs.
 """
@@ -47,6 +49,7 @@ import referentiels
 import regles
 import robustesse
 import tracabilite
+import tracabilite_controle
 from collecteur import decoder_message
 
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
@@ -421,6 +424,12 @@ def en_direct(arguments: argparse.Namespace) -> None:
         # Avant la première lecture : reprise après arrêt (commandes déjà archivées) et flotte en base
         archivage.synchroniser(archive, etat, ref, parametres["couts"], debut)
         print("Archivage dans CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH : %d ligne(s) écrite(s)" % archive["ecrites"])
+    controle = tracabilite_controle.ouvrir() if getattr(arguments, "controle", False) else None
+    if controle is not None:
+        # Avant la première lecture : nos commandes déjà dans les tables du Contrôle sont protégées (R-CTL-01)
+        tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], debut)
+        print("Traçabilité Contrôle (TRACABILITE_COMMANDE, TRACABILITE_TRAJET, ID_ENTRE %s) active"
+              % hypotheses.ID_ENTREPRISE, flush=True)
     print("Moteur en direct sur %s ; 'Ctrl+C' pour arrêter" % os.path.abspath(arguments.demandes), flush=True)
     try:
         while True:
@@ -435,6 +444,8 @@ def en_direct(arguments: argparse.Namespace) -> None:
                 executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
                 if archive is not None:
                     archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
+                if controle is not None:
+                    tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], maintenant)
                 if nouvelles:
                     kpi = tracabilite.calculer_kpi(etat)
                     print("[%s] %d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d"
@@ -456,6 +467,11 @@ def en_direct(arguments: argparse.Namespace) -> None:
             archivage.fermer(archive)
             print("Archivage : %d ligne(s) écrite(s), %d demande(s) non archivable(s) (données invalides, au journal seulement)"
                   % (archive["ecrites"], len(archive["non_archivables"])), flush=True)
+        if controle is not None:
+            tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], datetime.datetime.now())
+            tracabilite_controle.fermer(controle)
+            print("Traçabilité Contrôle : %d ligne(s) écrite(s), %d commande(s) non écrivable(s) (quantité ou H_DEP illisible)"
+                  % (controle["ecrites"], len(controle["non_ecrivables"])), flush=True)
 
 
 if __name__ == "__main__":
@@ -464,11 +480,13 @@ if __name__ == "__main__":
     mode.add_argument("--rejeu", help="fichier .jsonl ou .csv du collecteur à rejouer")
     mode.add_argument("--direct", action="store_true", help="lit en continu le CSV du jour du collecteur")
     mode.add_argument("--audit", action="store_true",
-                      help="production (audit) : --direct --bdd --archiver, sans copie de secours ni fiches locales ; "
+                      help="production (audit) : --direct --bdd --archiver --controle, sans copie de secours ni fiches locales ; "
                            "Annexe 2 et fiches de la VM obligatoires")
     parseur.add_argument("--bdd", action="store_true", help="lit le référentiel dans la base (VM)")
     parseur.add_argument("--archiver", action="store_true",
                          help="mode direct : écrit CAMION_NORTH, TRAJET_NORTH et ARCHIVAGE_COMMANDE_NORTH dans la base (VM)")
+    parseur.add_argument("--controle", action="store_true",
+                         help="mode direct : remplit TRACABILITE_COMMANDE et TRACABILITE_TRAJET (tables du Contrôle, VM)")
     parseur.add_argument("--referentiels", default=None, help="référentiel JSON (défaut : ../donnees/referentiels.json, sinon exemple) ; "
                               "avec --bdd, copie de secours si la base ne répond pas au démarrage")
     parseur.add_argument("--fiches", default=None, help="dossier des fiches camion")
@@ -482,10 +500,10 @@ if __name__ == "__main__":
         # R-ROB-05 : le mode audit impose la base et l'archivage, et ignore les sources de remplacement
         if options.referentiels or options.fiches:
             parseur.error("--audit lit la base et les fiches de la VM : --referentiels et --fiches sont interdits")
-        options.direct = options.bdd = options.archiver = True
-    if options.archiver and options.rejeu:
+        options.direct = options.bdd = options.archiver = options.controle = True
+    if (options.archiver or options.controle) and options.rejeu:
         # Un rejeu réécrirait les lignes du moteur en direct (mêmes identifiants de demandes)
-        parseur.error("--archiver ne s'utilise qu'avec --direct")
+        parseur.error("--archiver et --controle ne s'utilisent qu'avec --direct")
     try:
         if options.rejeu:
             rejouer(options)

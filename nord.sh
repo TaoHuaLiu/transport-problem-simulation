@@ -10,8 +10,9 @@
 #   sh nord.sh journaux             suit les fichiers de log (Ctrl+C pour quitter)
 #   sh nord.sh audit [--seuil X] [--marge W] [--port N]
 #                                   PRODUCTION pour l'audit (règle R-ROB-05) : vérifie la base, les fiches
-#                                   de la VM et l'Annexe 2, relance moteur et tableau de bord en mode audit
-#                                   (base et archivage obligatoires, pas de copie de secours, tableau de
+#                                   de la VM et l'Annexe 2 (et signale si les tables du Contrôle manquent),
+#                                   relance moteur et tableau de bord en mode audit
+#                                   (base, archivage et tables du Contrôle obligatoires, pas de copie de secours, tableau de
 #                                   bord sans données confidentielles, visible du VLAN), puis surveille
 #                                   comme « surveiller ». À lancer dans tmux ou screen.
 #
@@ -22,6 +23,8 @@
 # sans option, une commande reprend celles du dernier lancement) :
 #   --sans-bdd        moteur sans la base (lit ../donnees/referentiels.json) ; hors VLAN ou base en panne
 #   --sans-archive    le moteur n'écrit pas les tables *_NORTH (par défaut, il les écrit quand il lit la base)
+#   --sans-controle   le moteur n'écrit pas TRACABILITE_COMMANDE / TRACABILITE_TRAJET (tables du Contrôle ;
+#                     par défaut, il les remplit pour nos commandes quand il lit la base)
 #   --seuil X         seuil de départ θ du moteur (taux de remplissage, 0-1)
 #   --marge W         marge W avant le départ au plus tard (heures projet)
 #   --confidentiel    le tableau de bord affiche les valeurs de l'Annexe 2 : à ne pas montrer au Contrôle
@@ -47,6 +50,7 @@ SERVICES="collecteur moteur tableau"
 MODE=normal
 SANS_BDD=0
 SANS_ARCHIVE=0
+SANS_CONTROLE=0
 CONFIDENTIEL=0
 PORT=10000
 HOTE=0.0.0.0
@@ -67,6 +71,7 @@ lire_options() {
         case "$1" in
             --sans-bdd) SANS_BDD=1 ;;
             --sans-archive) SANS_ARCHIVE=1 ;;
+            --sans-controle) SANS_CONTROLE=1 ;;
             --confidentiel) CONFIDENTIEL=1 ;;
             --local) HOTE=127.0.0.1 ;;
             --tout) TOUT=1 ;;
@@ -86,13 +91,14 @@ lire_options_audit() {
             --port) PORT=$2; shift ;;
             --seuil) SEUIL=$2; shift ;;
             --marge) MARGE=$2; shift ;;
-            *) echo "Option interdite en mode audit : $1 (base, archivage et tableau de bord public imposés)" >&2; exit 2 ;;
+            *) echo "Option interdite en mode audit : $1 (base, archivage, tables du Contrôle et tableau de bord public imposés)" >&2; exit 2 ;;
         esac
         shift
     done
     MODE=audit
     SANS_BDD=0
     SANS_ARCHIVE=0
+    SANS_CONTROLE=0
     CONFIDENTIEL=0
     HOTE=0.0.0.0
 }
@@ -128,6 +134,8 @@ commande_de() {
             [ "$SANS_BDD" -eq 1 ] || cmd="$cmd --bdd"
             # Tables CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH (archivage.py)
             [ "$SANS_BDD" -eq 1 ] || [ "$SANS_ARCHIVE" -eq 1 ] || cmd="$cmd --archiver"
+            # Tables de traçabilité du Contrôle (tracabilite_controle.py)
+            [ "$SANS_BDD" -eq 1 ] || [ "$SANS_CONTROLE" -eq 1 ] || cmd="$cmd --controle"
             [ -z "$SEUIL" ] || cmd="$cmd --seuil $SEUIL"
             [ -z "$MARGE" ] || cmd="$cmd --marge $MARGE"
             echo "$cmd" ;;
@@ -237,6 +245,11 @@ FIN
     fi
     [ -f "$DONNEES/cibles_contrat.json" ] || \
         echo "  ! ../donnees/cibles_contrat.json absent : le tableau de bord affichera les cibles par défaut"
+    # Tables du Contrôle : non bloquant (créées par la DSI) ; le moteur réessaie chaque tick tant qu'elles manquent
+    if [ "$erreurs" -eq 0 ] && ! (cd "$DEV" && python3 tracabilite_controle.py --verifier >> "$LOGS/audit.log" 2>&1); then
+        echo "  ! tables TRACABILITE_COMMANDE / TRACABILITE_TRAJET absentes ou non conformes (détail : $LOGS/audit.log) :"
+        echo "    le moteur démarre quand même et les remplira dès qu'elles seront correctes"
+    fi
     if [ "$erreurs" -ne 0 ]; then
         echo "Mode audit refusé : corriger ce qui précède (rien n'a été arrêté ni lancé)." >&2
         exit 1
@@ -258,6 +271,7 @@ memoriser_options() {
 MODE=$MODE
 SANS_BDD=$SANS_BDD
 SANS_ARCHIVE=$SANS_ARCHIVE
+SANS_CONTROLE=$SANS_CONTROLE
 CONFIDENTIEL=$CONFIDENTIEL
 PORT=$PORT
 HOTE=$HOTE

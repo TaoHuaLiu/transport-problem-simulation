@@ -31,6 +31,7 @@ import referentiels  # noqa: E402
 import regles  # noqa: E402
 import robustesse  # noqa: E402
 import tracabilite  # noqa: E402
+import tracabilite_controle  # noqa: E402
 from test_decision import COUTS, T0, camion_test, referentiel_test  # noqa: E402
 
 DOSSIER_CODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -176,6 +177,45 @@ class TestBaseIndisponible(MoteurTest):
         with mock.patch.object(referentiels, "charger_depuis_bdd", side_effect=OSError("connexion refusée")):
             with self.assertRaises(OSError):
                 moteur.charger_bdd_ou_copie(os.path.join(self.dossier.name, "absent.json"))
+
+    def test_tables_du_controle_base_injoignable(self) -> None:
+        """Tables du Contrôle : base injoignable ou table absente, la synchronisation ne lève jamais d'erreur."""
+        def injoignable() -> object:
+            """Connexion simulée qui échoue.
+
+            :return: Jamais.
+            :raises OSError: Toujours.
+            """
+            raise OSError("connexion refusée")
+
+        class TableAbsente:
+            """Connexion simulée dont chaque requête échoue (table pas encore créée)."""
+
+            def cursor(self) -> "TableAbsente":
+                """Renvoie la connexion elle-même.
+
+                :return: La connexion.
+                """
+                return self
+
+            def execute(self, *args: object) -> None:
+                """Échoue comme PostgreSQL sur une table absente.
+
+                :param args: Requête et paramètres (ignorés).
+                :raises RuntimeError: Toujours.
+                """
+                raise RuntimeError('relation "TRACABILITE_COMMANDE" does not exist')
+
+            def rollback(self) -> None:
+                """Ne fait rien."""
+
+            def close(self) -> None:
+                """Ne fait rien."""
+
+        for connecter in (injoignable, TableAbsente):
+            lien = tracabilite_controle.nouveau_lien(connecter, (ValueError,))
+            self.assertEqual(tracabilite_controle.synchroniser(lien, self.etat, self.ref, COUTS, T0), 0)
+            self.assertIsNone(lien["connexion"])
 
     def test_delais_de_connexion_bornes(self) -> None:
         """Connexion et requêtes ont un délai maximal (un serveur muet bloquerait le moteur 2 min)."""

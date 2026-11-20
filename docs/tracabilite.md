@@ -6,7 +6,7 @@ Toute nouvelle règle ou fonction met ce fichier à jour dans le même changemen
 
 *Confidentialité : ce document est lisible par le groupe Contrôle. Aucun chiffre de l'Annexe 2 n'y figure.*
 
-Tests : `python3 -m unittest discover -s tests` depuis `1 - DEV/` (85 tests) ; « doctest » : `python3 -m doctest collecteur.py referentiels.py`. « indirect » : la fonction est exercée par les tests d'une autre règle, sans test qui lui soit propre.
+Tests : `python3 -m unittest discover -s tests` depuis `1 - DEV/` (110 tests) ; « doctest » : `python3 -m doctest collecteur.py referentiels.py`. « indirect » : la fonction est exercée par les tests d'une autre règle, sans test qui lui soit propre.
 
 ## Exigence → règle → fonction → test → preuve
 
@@ -18,6 +18,7 @@ Tests : `python3 -m unittest discover -s tests` depuis `1 - DEV/` (85 tests) ; �
 | Base indisponible sans arrêt du moteur | Exploitation | R-ROB-02 | `moteur.rafraichir_referentiel()`, `charger_bdd_ou_copie()` ; `referentiels.BDD` (délais) ; `archivage.synchroniser()` | `test_robustesse.TestBaseIndisponible` (4 tests) ; `test_archivage` (reprise sur erreur) | `donnees/logs/moteur.log` (« base injoignable ») | Codé, testé |
 | Arrêt propre sur SIGTERM | Exploitation | R-ROB-03 | `robustesse.arreter_sur_sigterm()` (moteur, collecteur, tableau de bord) | `test_robustesse.TestArretPropre` | Fin de `moteur.log` : résumé et « Archivage : n ligne(s) écrite(s) » | Codé, testé |
 | L'audit tourne toujours sur la base (production) | Audit de 2 h (sujet) | R-ROB-05 | `moteur.preparer()`, `verifier_conditions_audit()`, option `--audit` ; `nord.sh audit` (`lire_options_audit`, `verifier_audit`) | `test_mode_audit` (8 tests) | Première ligne de `moteur.log` : « MODE AUDIT (production) » ; `sh nord.sh etat` : « mode : AUDIT » | Codé, testé |
+| Tables de traçabilité du Contrôle remplies pour nos commandes | Sujet (seul canal entre groupes) ; spécification du Contrôle | R-CTL-01, D-JUSTIF | `tracabilite_controle.ligne_commande()`, `ligne_trajet()`, `code_justif()`, `synchroniser()`, `reprendre()` ; `moteur.py --controle` (imposé par `--audit`) ; `decision.traiter_demande()` (`capacite_seule`) | `test_tracabilite_controle` (23 tests) ; `test_robustesse.TestBaseIndisponible.test_tables_du_controle_base_injoignable` ; rejeu du 2026-10-19 sur une base PostgreSQL locale | `TRACABILITE_COMMANDE` (`ID_ENTRE` = notre code) et `TRACABILITE_TRAJET` ; `python3 tracabilite_controle.py --etat` ; `--verifier` pour le schéma | Codé, testé ; pas encore lancé sur la VM ; valeurs de A1 à confirmer avec le Contrôle |
 | Périmètre NORTH (base du TA) | Sujet p. 20 ; contrat (TA) | R-PER-01, R-PER-02 | `regles.est_demande_north()` ; recalcul indépendant `audit.usine_north()` | `TestDACC.test_ligne_1_hors_perimetre` ; `test_audit.TestPerimetre` | Journal : demandes acquittées ou refusées ; `/api/statuts.csv` | Codé, testé |
 | Demandes exploitables | Sujet p. 11 | R-VAL-01 | `regles.valider_demande()`, `lire_h_dep()`, `referentiels.pk_lieu()` | `TestDACC.test_ligne_2_donnees_invalides` | Motif REF-DONNEES au journal | Codé, testé |
 | Camion exploitable | Sujet p. 13–15 | R-FLO-01 | `flotte.charger_flotte()`, `referentiels.usine_attache()` | indirect | `CAMION_NORTH` ; IMMAT de la tournée ; motif REF-CAMION | Codé, test à écrire |
@@ -39,14 +40,13 @@ Tests : `python3 -m unittest discover -s tests` depuis `1 - DEV/` (85 tests) ; �
 | Traçabilité des décisions | Sujet p. 17, 22 | — | `tracabilite.noter()` ; `planification.faire_partir()` | `TestDDEPART.test_depart_ecrit_les_troncons` | Journal `evenements_*.csv` | Codé, testé |
 | Trajets et commandes consultables en base | Sujet p. 19 (tables propres) | — | `archivage.synchroniser()`, `ligne_camion()`, `ligne_trajet()`, `ligne_commande()`, `statut_trajet()`, `reprendre()` | `test_archivage` (`TestLignes`, `TestSynchronisation`) | Tables `CAMION_NORTH`, `TRAJET_NORTH`, `ARCHIVAGE_COMMANDE_NORTH` (`tables-nord.sql`) ; `python3 archivage.py --etat` | Codé, testé |
 | Contrôles d'audit (demandes sans décision, acquittées en retard, hors périmètre…) | Contrat (professionnalisme) | R-KPI-TA, R-PER-01/02, R-DEL-01 | `audit._controles()` | `test_audit.TestCalcul.test_controles` | Tableau de bord, bloc Contrôles | Codé, testé |
-| Écriture dans la table traçabilité partagée | Sujet p. 17, 22 | — | à coder | — | — | En attente du schéma du Contrôle (A1) |
 | Reprise de l'état après un arrêt du moteur | — (question E18) | — | `archivage.reprendre()` (base seulement) | `TestSynchronisation.test_reprise_apres_arret` | Commandes EXPIREE « moteur redémarré avant le départ » | Partiel : positions des camions et tournées ouvertes perdues |
 | Limiter le détour | Note d'équipe | R-OPT-04 | par les seuils de gamme (`attribuer_gamme()`) | — | GAMME | Partiel |
 | Retour chargé ; commande plus rentable ; cabotage | Note d'équipe ; Annexe 1 | R-OPT-05, R-ARB-01, R-CAB-01 | — | — | — | Non codées |
 
 ## Lignes des tables de décision → tests
 
-Le standard demande au moins un test par ligne de table de décision (`tests/test_decision.py`).
+Le standard demande au moins un test par ligne de table de décision (`tests/test_decision.py`, `tests/test_tracabilite_controle.py`).
 
 | Table | Ligne | Test |
 |---|---|---|
@@ -62,6 +62,12 @@ Le standard demande au moins un test par ligne de table de décision (`tests/tes
 | D-DEPART | 1 | `TestDDEPART.test_ligne_1_seuil_atteint` |
 | D-DEPART | 2 | `TestDDEPART.test_ligne_2_attendre` |
 | D-DEPART | 3 | `TestDDEPART.test_ligne_3_heure_limite` |
+| D-JUSTIF | 1 | `TestDJustif.test_ligne_1_donnees` |
+| D-JUSTIF | 2 | `TestDJustif.test_ligne_2_specificites` |
+| D-JUSTIF | 3 | `TestDJustif.test_ligne_3_capacite`, `test_trop_de_palettes_dans_le_moteur` |
+| D-JUSTIF | 4 | `TestDJustif.test_ligne_4_moyen`, `test_frais_sans_frigo_dans_le_moteur` |
+| D-JUSTIF | 5 | `TestDJustif.test_ligne_5_delai` |
+| D-JUSTIF | 6 | `TestDJustif.test_ligne_6_remplissage` |
 
 ## Fonctions sans règle métier
 

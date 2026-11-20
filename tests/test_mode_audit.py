@@ -138,6 +138,12 @@ class TestLigneDeCommande(unittest.TestCase):
             self.assertEqual(resultat.returncode, 2, option)
             self.assertIn("interdits", resultat.stderr)
 
+    def test_audit_impose_base_archivage_et_controle(self) -> None:
+        """``--audit`` impose ``--bdd``, ``--archiver`` et ``--controle`` (tables du Contrôle remplies)."""
+        with open(os.path.join(DOSSIER_CODE, "moteur.py"), encoding="utf-8") as fichier:
+            principal = fichier.read().split('if __name__ == "__main__":')[-1]
+        self.assertIn("options.direct = options.bdd = options.archiver = options.controle = True", principal)
+
     def test_nord_sh_refuse_les_options_degradees(self) -> None:
         """``nord.sh audit`` refuse les options qui retirent la base, l'archivage ou exposent l'Annexe 2."""
         with tempfile.TemporaryDirectory() as dossier:
@@ -145,7 +151,7 @@ class TestLigneDeCommande(unittest.TestCase):
             dev = os.path.join(dossier, "DEV")
             os.makedirs(dev)
             shutil.copy(os.path.join(DOSSIER_CODE, "nord.sh"), dev)
-            for option in ("--sans-bdd", "--sans-archive", "--confidentiel", "--local"):
+            for option in ("--sans-bdd", "--sans-archive", "--sans-controle", "--confidentiel", "--local"):
                 resultat = self.lancer(["sh", "nord.sh", "audit", option], dev)
                 self.assertEqual(resultat.returncode, 2, option)
                 self.assertIn("interdite en mode audit", resultat.stderr)

@@ -171,6 +171,8 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
             echecs.append(plan["motif"])
 
     if not candidats:
+        # Pour le code JUSTIF_REFUS (D-JUSTIF) : des camions compatibles étaient libres, mais aucun n'avait la place
+        demande["capacite_seule"] = bool(echecs) and all(echec == "CAPACITE" for echec in echecs)
         return refuser(demande, motif_sans_candidat(demande, echecs), maintenant, journal)
 
     _, _, _, id_tournee, immat, plan = min(candidats, key=lambda c: (c[0], c[1], c[2]))

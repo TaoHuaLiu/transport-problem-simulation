@@ -25,6 +25,7 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `decision.py` | Table D-ACC : ignorer, refuser ou accepter dans le meilleur plan | D-ACC, R-OPT-01/02/03 |
 | `tracabilite.py` | Journal CSV des événements ; calcul de TA et TR (surface au sol) | R-KPI-TA, R-KPI-TR |
 | `archivage.py` | Écrit l'état du moteur dans `CAMION_NORTH`, `TRAJET_NORTH`, `ARCHIVAGE_COMMANDE_NORTH` (`../3 - Documentation/tables-nord.sql`) ; `--etat` pour compter les lignes | R-SPEC-02, R-DEL-01, R-GAM, R-KPI-TR |
+| `tracabilite_controle.py` | Remplit les tables du Contrôle `TRACABILITE_COMMANDE` et `TRACABILITE_TRAJET` pour nos commandes (code de refus D-JUSTIF dans `JUSTIF_REFUS`) ; `--verifier` (schéma) et `--etat` (nos lignes), en lecture seule | R-CTL-01, D-JUSTIF, R-ROB-02 |
 | `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct ; enchaîne D-ACC puis D-DEPART, chaque demande et chaque tournée protégée | R-ROB-01/02/03 |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
@@ -34,6 +35,7 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
 | `tests/test_robustesse.py` | Garde-fous d'exploitation : erreurs sur une demande, une tournée, la base, le CSV, le collecteur ; SIGTERM | R-ROB-01 à 04 |
 | `tests/test_mode_audit.py` | Mode audit : démarrage sur la base seulement, fiches de la VM et Annexe 2 obligatoires, options interdites (moteur et `nord.sh`) | R-ROB-05 |
+| `tests/test_tracabilite_controle.py` | Un test par ligne de D-JUSTIF ; lignes des deux tables du Contrôle ; écriture limitée à nos lignes, reprise après arrêt (base simulée) ; schéma | R-CTL-01, D-JUSTIF |
 | `tests/test_archivage.py` | Lignes et contraintes des tables `*_NORTH`, statuts des trajets dans le temps, prix, écritures (base simulée), reprise après arrêt | — |
 
 Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Documentation/processus.md` §2.5 ; chaque docstring cite la règle qu'elle applique, et `../3 - Documentation/tracabilite.md` relie chaque règle à sa fonction et à son test.
@@ -79,7 +81,7 @@ sh nord.sh arreter [--tout]               # --tout arrête aussi le collecteur
 sh nord.sh journaux                       # suit les logs
 ```
 
-Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si la base est indisponible ; le moteur n'écrit alors pas les tables `*_NORTH`), `--sans-archive` (lit la base sans écrire les tables `*_NORTH`), `--confidentiel` (valeurs de l'Annexe 2 dans le tableau de bord : usage interne), `--port N`, `--local` (tableau de bord sur `127.0.0.1` seulement). Les options du dernier lancement sont mémorisées dans `../donnees/run/options` : `etat`, `redemarrer` et `surveiller` sans option les reprennent. PID dans `../donnees/run/`, logs dans `../donnees/logs/`. Relancer le moteur ouvre un nouveau journal (l'état n'est pas repris, question E18) : le tableau de bord lit le plus récent.
+Autres options : `--sans-controle` (n'écrit pas les tables du Contrôle ; par défaut, le moteur les remplit dès qu'il lit la base), `--sans-bdd` (référentiel `../donnees/referentiels.json`, si la base est indisponible ; le moteur n'écrit alors pas les tables `*_NORTH`), `--sans-archive` (lit la base sans écrire les tables `*_NORTH`), `--confidentiel` (valeurs de l'Annexe 2 dans le tableau de bord : usage interne), `--port N`, `--local` (tableau de bord sur `127.0.0.1` seulement). Les options du dernier lancement sont mémorisées dans `../donnees/run/options` : `etat`, `redemarrer` et `surveiller` sans option les reprennent. PID dans `../donnees/run/`, logs dans `../donnees/logs/`. Relancer le moteur ouvre un nouveau journal (l'état n'est pas repris, question E18) : le tableau de bord lit le plus récent.
 
 À la main, sans le script :
 
@@ -87,7 +89,9 @@ Autres options : `--sans-bdd` (référentiel `../donnees/referentiels.json`, si 
 mkdir -p ../donnees
 nohup python3 collecteur.py >> ../donnees/collecteur.log 2>&1 &   # en continu
 python3 referentiels.py --export                                   # copie la base dans ../donnees/referentiels.json
-python3 moteur.py --direct --bdd --archiver                        # lit le CSV du jour, rafraîchit la base chaque minute réelle, écrit les tables *_NORTH
+python3 moteur.py --direct --bdd --archiver --controle                     # lit le CSV du jour, rafraîchit la base chaque minute réelle, écrit les tables *_NORTH
+python3 tracabilite_controle.py --verifier                         # tables du Contrôle présentes et conformes à leur spécification ?
+python3 tracabilite_controle.py --etat                             # nos lignes par statut et code de refus (lecture seule)
 python3 archivage.py --etat                                        # lignes par statut dans les tables *_NORTH (lecture seule)
 python3 tableau_bord.py --hote 0.0.0.0                             # tableau de bord : http://IP_VM:10000/
 ```
@@ -236,6 +240,15 @@ Une paire de fichiers par jour **réel** :
 | `SPEC_AUTRES` | Clefs inconnues de `SPEC`, au format `CLEF=valeur` |
 
 Les noms de villes sont recopiés tels qu'envoyés (sans accents dans l'échantillon du 2026-10-19) ; le moteur les normalise quand même avant la jointure avec `LOCATIONS_NAMES`. Volume attendu : environ 2 500 demandes par heure réelle.
+
+## Tables de traçabilité du Contrôle (R-CTL-01, D-JUSTIF)
+
+`tracabilite_controle.py`, séparé de l'archivage, remplit les deux tables spécifiées par le Contrôle, pour nos commandes seulement (`moteur.py --controle`, imposé en mode audit) :
+
+- `TRACABILITE_COMMANDE` : une ligne par commande NORTH décidée, tenue à jour (`ACCEPTEE` → `PARTIE`, `REFUSEE`, `EXPIREE`) ; lieux en nom (comme l'ERP), `SPEC` en JSON, `ID_ENTRE` = `hypotheses.ID_ENTREPRISE`, `H_DEP_R` au départ, `JUSTIF_REFUS` = code 1 à 8 du Contrôle d'après la table D-JUSTIF (`processus.md` §2.7) ;
+- `TRACABILITE_TRAJET` : une ligne par commande partie : immatriculation, `TYPE_CAMI` (`FRIGORIFIQUE`/`SEC`), `CAPA_CAMI` (PTAC), `COUT_PRESTA` (prix facturé, avec l'Annexe 2 seulement), SPEC tenues, `TAUX_REMPLI` du trajet (en %).
+
+Chaque ligne est écrite par un `UPDATE` limité à notre ligne (et à notre `ID_ENTRE`), puis un `INSERT` s'il n'y avait rien : les tables n'ont pas besoin de contrainte d'unicité, et une ligne d'un autre groupe n'est jamais modifiée. Après un redémarrage, nos commandes laissées acceptées passent `EXPIREE` (code 4) et nos lignes existantes ne sont pas réécrites. Base en panne ou tables absentes : le moteur continue et réessaie à chaque tick. Les valeurs non fixées par la spécification (`ID_ENTRE`, libellés de `STATUT` et `TYPE_CAMI`, `CAPA_CAMI` = PTAC, `TAUX_REMPLI` en %) sont dans `hypotheses.py` (question A1) : à confirmer avec le Contrôle.
 
 ## Tables `*_NORTH` (archivage)
 

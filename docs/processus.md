@@ -18,7 +18,7 @@ Le schéma de référence est le pseudo-BPMN du sujet, p. 24 ; il n'est pas rede
 | Calcul du prix du trajet | tâche | R-DUR-01, R-GAM, R-SPEC-02 | `planification.py` (`attribuer_gamme`, `prix_prestation`) | codé, testé ; prix écrit seulement avec les taux de l'Annexe 2 |
 | « Prix acceptable par Garden Food ? » | passerelle exclusive | D-PRIX | — | non couvert (question A2 : aucun prix n'est envoyé avant l'acquittement) |
 | Planification, ordonnancement des transports | tâche | D-DEPART, R-RENT-01, R-OPT-01 à 04, R-DEL-01, R-CON-01 | `planification.py`, `decision.py` | codé, testé |
-| Demande de transport acquittée | événement de fin | journal ; tables `*_NORTH` ; table traçabilité partagée | `tracabilite.py`, `archivage.py` | journal et tables `*_NORTH` codés ; table partagée en attente de son schéma (A1) |
+| Demande de transport acquittée | événement de fin | journal ; tables `*_NORTH` ; tables du Contrôle `TRACABILITE_COMMANDE` / `TRACABILITE_TRAJET` (R-CTL-01, D-JUSTIF) | `tracabilite.py`, `archivage.py`, `tracabilite_controle.py` | codés, testés ; tables du Contrôle testées sur une base PostgreSQL locale, pas encore sur la VM ; valeurs à confirmer avec le Contrôle (A1) |
 | Suivi des indicateurs (hors schéma) | — | R-KPI-TA, R-KPI-TR, R-GAM | `audit.py`, `tableau_bord.py` | codé, testé |
 | Exploitation de la chaîne sur la VM (hors schéma) | — | R-ROB-01 à R-ROB-05 | `nord.sh` (`audit` = production), `robustesse.py`, `moteur.py`, `collecteur.py` | codé, testé ; mode audit pas encore lancé sur la VM |
 
@@ -36,6 +36,7 @@ R réalise · A répond du résultat (un seul par ligne) · C consulté avant ·
 | Regrouper les demandes et faire partir les camions (D-DEPART) | R, A | | | |
 | Proposer les formules et cibles des indicateurs | R | A | C | |
 | Spécifier la table traçabilité | C | R, A | I | C |
+| Remplir les tables de traçabilité pour nos commandes (R-CTL-01) | R, A | I | | |
 | Créer la table traçabilité et nos tables `*_NORTH` dans la base | I | C | R, A | I |
 | Écrire acquittements, refus, trajets et commandes | R, A | I | | |
 | Calculer les indicateurs d'audit (TR, TA, gammes) | C | R, A | I | |
@@ -131,6 +132,7 @@ stateDiagram-v2
 | R-ROB-03 | À l'arrêt demandé (`Ctrl+C` ou SIGTERM envoyé par `nord.sh`), chaque service s'arrête proprement : dernière synchronisation des tables `*_NORTH`, résumé des indicateurs. | Exploitation | — | Décision d'équipe du 20/11/2026 | `nord.sh arreter` → lignes `*_NORTH` à jour. |
 | R-ROB-04 | Le collecteur ne s'arrête que sur demande : une erreur de réception ou d'écriture est signalée et la collecte continue ; le message brut est écrit avant toute lecture du CSV du jour. | Sujet p. 12 (pas de renvoi des messages) ; R-COL-01 | — | Décision d'équipe du 20/11/2026 | CSV du jour abîmé → message brut gardé, demande écrite. |
 | R-ROB-05 | Mode audit (production, `nord.sh audit`) : le moteur lit toujours la base, écrit les tables `*_NORTH` et utilise les fiches de la VM et l'Annexe 2 ; il refuse de démarrer sans elles, sans copie JSON ni référentiel d'exemple (`nord.sh` réessaie toutes les 30 s). En cours d'audit, une panne de la base garde le dernier référentiel lu (R-ROB-02). Le tableau de bord est public sur le VLAN, sans données confidentielles. | Exploitation ; audit de 2 h (sujet) | — | Décision d'équipe du 20/11/2026 | Base injoignable au lancement → « Mode audit refusé », rien n'est arrêté. |
+| R-CTL-01 | Les tables de traçabilité du Contrôle reçoivent nos commandes seulement : une ligne `TRACABILITE_COMMANDE` par commande NORTH décidée (statut tenu à jour, `ID_ENTRE` = notre code, code de refus D-JUSTIF), une ligne `TRACABILITE_TRAJET` par commande partie (camion, type, capacité, prix, SPEC tenues, remplissage). Aucune ligne d'un autre groupe n'est modifiée ; après un redémarrage, nos commandes laissées acceptées passent expirées (code 4). | Sujet (table traçabilité, seul canal entre groupes) ; spécification du Contrôle | — | Spécification du Contrôle ; valeurs à confirmer (A1) | `D-EX-0421` refusée REF-DELAI → `STATUT` REFUSEE, `JUSTIF_REFUS` 4. |
 | R-PER-01 | Un export est à nous s'il part d'une de nos usines (Amsterdam, Dusseldorf, Manchester). | Sujet p. 20 | — | Sujet | `D-EX-0421` part de l'usine de Dusseldorf → à nous. |
 | R-PER-02 | Un import est à nous s'il va d'un port vers une de nos usines. Amsterdam est usine et port : on décide sur `TYPE_DEP` et `TYPE_ARR`, jamais sur `LOC_DEP` seul. | Décision d'équipe (question A3) | — | Proposition | Import Anvers PORT → Manchester USINE : à nous. |
 | R-VAL-01 | La demande est exploitable : lieux connus, `QTE_PAL` > 0, types connus, `H_DEP` lisible et pas déjà dépassée. | Sujet p. 11 | REF-DONNEES | Proposition | Ville inconnue de `LOCATIONS_NAMES` → refus. |
@@ -159,15 +161,32 @@ Hypothèse de planification **H-PLA-01** : un camion réutilisé après une tour
 
 ### 2.6 Motifs de refus
 
-| Motif | Signification | Règle | Écrit par |
+Le code `JUSTIF_REFUS` est celui des tables du Contrôle (§2.7).
+
+| Motif | Signification | Règle | Écrit par | Code `JUSTIF_REFUS` |
+|---|---|---|---|---|
+| REF-DONNEES | Demande inexploitable (dont `H_DEP` déjà dépassée à la lecture) ; ou demande dont le traitement a levé une erreur | R-VAL-01, R-ROB-01 | `decision.traiter_demande()`, `moteur.decider_demande()` | 7 |
+| REF-SPEC | Aucun camion ne respecte la SPEC ; plus émis depuis le 21/10/2026 | R-SPEC-01 | `decision.traiter_demande()` si `SPEC_BLOQUANTE` | 2 |
+| REF-FRIGO | Aucun frigo dans la flotte, ou aucun frigo libre avec la place | R-FRA-01 | `decision.traiter_demande()` | 3 ou 8 (D-JUSTIF) |
+| REF-CAMION | Aucun camion sec libre, exploitable et avec la place | R-FLO-01, R-CAP-01, R-FRA-02 | `decision.traiter_demande()` | 3 ou 8 (D-JUSTIF) |
+| REF-DELAI | Aucun plan ne part à temps ; ou demande acceptée retirée au départ (expirée) | R-DEL-01 | `decision.traiter_demande()`, `planification.faire_partir()`, `archivage.reprendre()` | 4 |
+| REF-CONDUCTEUR | Le plan ne tient que sans pauses ni repos | R-CON-01 | `decision.traiter_demande()` | 4 |
+| REF-RENTABILITE | Tournée sous le seuil à l'heure limite, option « refuser » | R-RENT-01 | `moteur.decider_tournee()` | 6 |
+
+### 2.7 Table D-JUSTIF : code de refus pour les tables du Contrôle
+
+Le Contrôle a fixé huit codes de refus (colonne `TRACABILITE_COMMANDE.JUSTIF_REFUS`). Chaque demande refusée ou expirée reçoit le code de la première ligne qui correspond ; une demande acceptée ou partie n'en a pas. Codé par `tracabilite_controle.code_justif()`, un test par ligne (`tests/test_tracabilite_controle.py`, `TestDJustif`).
+
+| Ligne | Motif du moteur | Condition | Code du Contrôle |
 |---|---|---|---|
-| REF-DONNEES | Demande inexploitable (dont `H_DEP` déjà dépassée à la lecture) ; ou demande dont le traitement a levé une erreur | R-VAL-01, R-ROB-01 | `decision.traiter_demande()`, `moteur.decider_demande()` |
-| REF-SPEC | Aucun camion ne respecte la SPEC ; plus émis depuis le 21/10/2026 | R-SPEC-01 | `decision.traiter_demande()` si `SPEC_BLOQUANTE` |
-| REF-FRIGO | Aucun frigo dans la flotte, ou aucun frigo libre avec la place | R-FRA-01 | `decision.traiter_demande()` |
-| REF-CAMION | Aucun camion sec libre, exploitable et avec la place | R-FLO-01, R-CAP-01, R-FRA-02 | `decision.traiter_demande()` |
-| REF-DELAI | Aucun plan ne part à temps ; ou demande acceptée retirée au départ (expirée) | R-DEL-01 | `decision.traiter_demande()`, `planification.faire_partir()`, `archivage.reprendre()` |
-| REF-CONDUCTEUR | Le plan ne tient que sans pauses ni repos | R-CON-01 | `decision.traiter_demande()` |
-| REF-RENTABILITE | Tournée sous le seuil à l'heure limite, option « refuser » | R-RENT-01 | `moteur.decider_tournee()` |
+| 1 | REF-DONNEES | — | 7 DONNEES |
+| 2 | REF-SPEC | — | 2 SPECIFICITES |
+| 3 | REF-CAMION, REF-FRIGO | des camions compatibles étaient libres, aucun n'avait la place (`capacite_seule`) | 3 CAPACITE |
+| 4 | REF-CAMION, REF-FRIGO | aucun camion compatible libre (aucun frigo pour du frais, aucun sec pour du sec) | 8 MOYEN |
+| 5 | REF-DELAI (refus, expiration, redémarrage), REF-CONDUCTEUR | — | 4 DELAI |
+| 6 | REF-RENTABILITE | tournée sous le seuil θ à l'heure limite | 6 REMPLISSAGE |
+
+Jamais produits : 1 GEOGRAPHIE (nous n'écrivons que nos commandes, R-CTL-01) et 5 PRIX (D-PRIX non couverte, question A2). Un motif inconnu donne 7 ; un test vérifie que chaque motif `REF-…` du moteur a sa ligne.
 
 ## 3. Glossaire et modèle du domaine
 
@@ -192,6 +211,8 @@ Hypothèse de planification **H-PLA-01** : un camion réutilisé après une tour
 | Prix de la prestation | Prix facturé pour une demande partie (`methode-contrat.md` §3). | `planification.prix_prestation()`, `COUT_PREST` |
 | Journal | Fichier `evenements_*.csv` : une ligne par ACQUITTEMENT, REFUS, DEPART, TRONCON, PARTIE, EXPIRATION. Source de référence. | `tracabilite.noter()` |
 | Archivage | Reflet du journal dans nos tables `CAMION_NORTH`, `TRAJET_NORTH`, `ARCHIVAGE_COMMANDE_NORTH`. | `archivage.synchroniser()` |
+| Tables de traçabilité du Contrôle | `TRACABILITE_COMMANDE` et `TRACABILITE_TRAJET`, spécifiées par le Contrôle, partagées entre groupes ; nous y écrivons nos commandes seulement (R-CTL-01). | `tracabilite_controle.synchroniser()` |
+| Code de refus (`JUSTIF_REFUS`) | Code 1 à 8 du Contrôle, déduit de notre motif `REF-…` (D-JUSTIF). | `tracabilite_controle.code_justif()` |
 | Fenêtre d'audit | Période sur laquelle les indicateurs sont calculés (2 h réelles le jour de l'audit). | `audit.calculer()` |
 | Mode audit | Lancement de production pour l'audit : base, archivage, fiches de la VM et Annexe 2 obligatoires, aucune source de remplacement (R-ROB-05). | `nord.sh audit`, `moteur.py --audit` |
 | Incident | Erreur rattrapée par un garde-fou (R-ROB-01 à 04) : signalée dans le log une fois par minute au plus, comptée dans le résumé à l'arrêt. | `robustesse.signaler()`, `etat["messages"]` |
