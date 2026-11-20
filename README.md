@@ -40,7 +40,7 @@ Les identifiants `R-…`, `D-…` et `REF-…` renvoient au catalogue `../3 - Do
 
 ## Documentation
 
-Documentation en cinq couches (`../3 - Documentation/standard-documentation.md`) ; les fichiers Markdown et les deux pages web suivent le code (état au 17/11/2026).
+Documentation en cinq couches (`../3 - Documentation/standard-documentation.md`) ; les fichiers Markdown et les deux pages web suivent le code (état au 20/11/2026). Sur le dépôt GitHub, `processus.md` et `tracabilite.md` sont copiés dans `docs/`.
 
 | Document | Contenu |
 |---|---|
