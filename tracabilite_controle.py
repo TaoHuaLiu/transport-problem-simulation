@@ -5,14 +5,16 @@ Le Contrôle a spécifié deux tables partagées, créées dans la base
 (sujet). Ce module les remplit pour **nos commandes seulement** (périmètre
 NORTH, règle R-CTL-01) :
 
-- ``TRACABILITE_COMMANDE`` : une ligne par commande NORTH décidée
-  (acceptée, partie, refusée ou expirée), clé ``ID_COMMANDE``, notre code
-  ``ID_ENTRE`` (:data:`hypotheses.ID_ENTREPRISE`) ; ``JUSTIF_REFUS`` porte le
-  code de refus du Contrôle (table D-JUSTIF, :func:`code_justif`) ;
+- ``TRACABILITE_COMMANDE`` : une ligne par commande NORTH décidée, clé
+  ``ID_COMMANDE`` ; ``ID_ENTRE`` = ``N1``, ``N2``… (lettre de la zone puis
+  numéro de la commande chez nous, :func:`id_entre`) ; ``STATUT`` ``ACCEPTEE``
+  ou ``REFUSEE`` (:data:`STATUTS_CONTROLE`) ; ``H_DEP_R`` = heure réelle de
+  départ ; ``JUSTIF_REFUS`` = code de refus du Contrôle (table D-JUSTIF,
+  :func:`code_justif`) ;
 - ``TRACABILITE_TRAJET`` : une ligne par commande partie : camion, type,
   capacité, prix de la prestation, SPEC tenues, remplissage du trajet.
 
-Il est séparé de :mod:`archivage` (nos propres tables ``*_NORTH``) : autre
+Il est séparé de :mod:`archivage` (nos propres tables ``LOG_NORTH_*``) : autre
 connexion, autres règles. Le moteur l'appelle à chaque tick avec l'option
 ``--controle`` (imposée en mode audit) ; comme l'archivage, il n'envoie que
 les lignes modifiées et ne lève jamais d'erreur (règle R-ROB-02) : base
@@ -21,7 +23,8 @@ partent à la connexion suivante.
 
 Les tables n'ont pas forcément de contrainte d'unicité exploitable (pas de
 clé déclarée sur ``TRACABILITE_TRAJET``) : chaque ligne est écrite par un
-``UPDATE`` limité à notre ligne, suivi d'un ``INSERT`` si rien n'a été mis à jour.
+``UPDATE`` limité à notre ligne (même ``ID_COMMANDE`` et même ``ID_ENTRE``),
+suivi d'un ``INSERT`` si rien n'a été mis à jour.
 Aucune ligne d'un autre groupe n'est lue pour être modifiée ni supprimée.
 
 Utilisation, sur la VM (lecture seule) :
@@ -35,14 +38,19 @@ Utilisation, sur la VM (lecture seule) :
 import argparse
 import datetime
 import json
+import logging
 import sys
+import time
 
 import archivage
 import hypotheses
+import journalisation
 import planification
 import referentiels
 import regles
 import robustesse
+
+JOURNAL = journalisation.journal("controle")
 
 TABLE_COMMANDE = "TRACABILITE_COMMANDE"
 TABLE_TRAJET = "TRACABILITE_TRAJET"
@@ -91,6 +99,7 @@ CODES_REFUS = {
 #: REF-FRIGO, qui dépendent de la cause, voir :func:`code_justif`).
 MOTIF_VERS_CODE = {
     "REF-DONNEES": 7,
+    "REF-EXPIREE": 4,
     "REF-SPEC": 2,
     "REF-DELAI": 4,
     "REF-CONDUCTEUR": 4,
@@ -100,8 +109,13 @@ MOTIF_VERS_CODE = {
 #: Motifs « pas de camion » : CAPACITE si des camions compatibles étaient libres sans avoir la place, MOYEN sinon.
 MOTIFS_SANS_CAMION = ("REF-CAMION", "REF-FRIGO")
 
-#: Statuts finals : une ligne écrite avec ce statut ne change plus.
-STATUTS_FINAUX = ("PARTIE", "REFUSEE", "EXPIREE")
+#: Spécification du Contrôle : ``STATUT`` vaut ``ACCEPTEE`` ou ``REFUSEE``. État du moteur → statut écrit :
+#: une demande partie reste acceptée (``H_DEP_R`` renseignée) ; une acceptée expirée avant son départ
+#: devient refusée (code 4 DELAI), comme pour le TA.
+STATUTS_CONTROLE = {"ACCEPTEE": "ACCEPTEE", "PARTIE": "ACCEPTEE", "REFUSEE": "REFUSEE", "EXPIREE": "REFUSEE"}
+
+#: Motif de nos ``ID_ENTRE`` (``N1``, ``N2``…), pour les requêtes ``~`` de PostgreSQL.
+MOTIF_ID_ENTRE = hypotheses.MOTIF_ID_ENTRE
 
 
 # ---------------------------------------------------------------- Lignes (fonctions pures)
@@ -116,7 +130,8 @@ def code_justif(demande: dict):
     3. REF-CAMION ou REF-FRIGO, des camions compatibles libres mais aucun
        avec la place (``capacite_seule``) → 3 CAPACITE ;
     4. REF-CAMION ou REF-FRIGO, aucun camion compatible libre → 8 MOYEN ;
-    5. REF-DELAI (refus, expiration, redémarrage) et REF-CONDUCTEUR → 4 DELAI ;
+    5. REF-DELAI (refus, expiration, redémarrage), REF-EXPIREE (échéance
+       déjà passée à la lecture, R-VAL-02) et REF-CONDUCTEUR → 4 DELAI ;
     6. REF-RENTABILITE (tournée sous le seuil θ à l'heure limite) → 6 REMPLISSAGE.
 
     Les codes 1 GEOGRAPHIE (nous n'écrivons que nos commandes) et 5 PRIX
@@ -158,22 +173,64 @@ def spec_tenue(demande: dict, camion: dict) -> dict:
     return {cle: cle not in ecarts for cle in demande.get("spec", {})}
 
 
-def ligne_commande(demande: dict):
+def id_entre(lien: dict, id_demande: str) -> str:
+    """``ID_ENTRE`` d'une commande : ``N`` puis son numéro chez nous (spécification du Contrôle).
+
+    Une commande garde le numéro qu'elle a reçu ; une nouvelle commande prend
+    le numéro suivant le plus grand déjà attribué (y compris par un lancement
+    précédent, lu par :func:`reprendre`). Ne modifie pas le lien : le numéro
+    n'est réservé que par :func:`attribuer_id_entre`.
+
+    :param lien: Lien (``numeros``, ``dernier_numero``).
+    :param id_demande: Identifiant de la commande.
+    :return: Par exemple ``"N12"``.
+    """
+    return lien["numeros"].get(id_demande) or "%s%d" % (hypotheses.PREFIXE_ENTREPRISE, lien["dernier_numero"] + 1)
+
+
+def attribuer_id_entre(lien: dict, id_demande: str, valeur: str) -> None:
+    """Réserve l'``ID_ENTRE`` d'une commande (numéros 1, 2, 3… sans doublon).
+
+    :param lien: Lien.
+    :param id_demande: Identifiant de la commande.
+    :param valeur: Valeur donnée par :func:`id_entre`.
+    """
+    if id_demande not in lien["numeros"]:
+        lien["numeros"][id_demande] = valeur
+        lien["dernier_numero"] = max(lien["dernier_numero"], int(valeur[len(hypotheses.PREFIXE_ENTREPRISE):]))
+
+
+def ligne_finale(ligne: tuple) -> bool:
+    """Dit si une ligne ``TRACABILITE_COMMANDE`` ne changera plus.
+
+    Refusée, ou acceptée avec son heure réelle de départ : le moteur ne la
+    recalcule plus.
+
+    :param ligne: Tuple dans l'ordre de :data:`COLONNES`.
+    :return: ``True`` si la ligne est définitive.
+    """
+    valeurs = dict(zip(COLONNES[TABLE_COMMANDE], ligne))
+    return valeurs["STATUT"] == "REFUSEE" or valeurs["H_DEP_R"] is not None
+
+
+def ligne_commande(demande: dict, identifiant_entreprise: str):
     """Ligne ``TRACABILITE_COMMANDE`` d'une demande NORTH décidée.
 
     Applique la règle R-CTL-01 : champs de l'ERP tels que reçus (lieux en
     nom, comme le flux), ``SPEC`` en JSON (``{"PTAC": "19t"}``, ``{}`` si
-    vide), ``ID_ENTRE`` = :data:`hypotheses.ID_ENTREPRISE`, ``H_DEP_R`` =
-    départ comparé à ``H_DEP`` (R-DEL-01) une fois la demande partie,
-    ``STATUT`` du moteur, ``JUSTIF_REFUS`` = code D-JUSTIF.
+    vide), ``ID_ENTRE`` = ``N`` + numéro de la commande (:func:`id_entre`),
+    ``H_DEP_R`` = heure réelle de départ, celle comparée à ``H_DEP``
+    (R-DEL-01), une fois la demande partie, ``STATUT`` ``ACCEPTEE`` ou
+    ``REFUSEE`` (:data:`STATUTS_CONTROLE`), ``JUSTIF_REFUS`` = code D-JUSTIF.
 
     :param demande: Demande du moteur.
+    :param identifiant_entreprise: ``ID_ENTRE`` de la commande (:func:`id_entre`).
     :return: Tuple dans l'ordre de :data:`COLONNES`, ou ``None`` si la demande n'est pas décidée
         ou si une colonne obligatoire manque (quantité ou ``H_DEP`` illisible, identifiant trop long).
     :rtype: tuple or None
     """
-    statut = archivage.statut_commande(demande)
-    if statut is None or demande.get("qte") is None or demande.get("h_dep") is None:
+    etat_moteur = archivage.statut_commande(demande)
+    if etat_moteur is None or demande.get("qte") is None or demande.get("h_dep") is None:
         return None
     if len(str(demande["id"])) > LONGUEURS[TABLE_COMMANDE]["ID_COMMANDE"]:
         return None
@@ -183,15 +240,30 @@ def ligne_commande(demande: dict):
             _texte(t, "TYPE_DEP", demande.get("TYPE_DEP")), _texte(t, "TYPE_ARR", demande.get("TYPE_ARR")),
             _texte(t, "TYPE_MAT", demande.get("TYPE_MAT")), int(demande["qte"]), _texte(t, "TYPE_PAL", demande.get("TYPE_PAL")),
             demande["h_dep"], json.dumps(demande.get("spec") or {}, ensure_ascii=False),
-            _texte(t, "ID_ENTRE", hypotheses.ID_ENTREPRISE),
-            demande.get("h_depart") if statut == "PARTIE" else None, statut, code_justif(demande))
+            _texte(t, "ID_ENTRE", identifiant_entreprise),
+            demande.get("h_depart") if etat_moteur == "PARTIE" else None, STATUTS_CONTROLE[etat_moteur],
+            code_justif(demande))
+
+
+def capacite_controle(ptac: str) -> str:
+    """Valeur ``CAPA_CAMI`` d'un camion : son PTAC au format ``19t``, sans espace.
+
+    Applique la règle R-CTL-01 (format « xx t » de la spécification du
+    Contrôle, écrit sans espace : décision d'équipe du 24/11/2026). Les fiches
+    donnent déjà ``19t`` ; un espace éventuel est retiré.
+
+    :param ptac: PTAC de la fiche camion (``"19t"``).
+    :return: PTAC sans espace.
+    """
+    return str(ptac).replace(" ", "")
 
 
 def ligne_trajet(demande: dict, etat: dict, ref: dict, couts: dict):
     """Ligne ``TRACABILITE_TRAJET`` d'une demande partie.
 
     Applique la règle R-CTL-01 : le camion de la tournée, son type
-    (:data:`hypotheses.TYPES_CAMION`), sa capacité (PTAC de la fiche), le prix
+    (:data:`hypotheses.TYPES_CAMION`), sa capacité (PTAC de la fiche au format
+    ``19t``, sans espace : format confirmé par l'équipe le 24/11/2026), le prix
     facturé (:func:`planification.prix_prestation`, R-GAM), les SPEC tenues
     (vide si la clé n'est pas demandée) et le remplissage du trajet au départ
     du premier lieu de chargement (R-KPI-TR).
@@ -219,7 +291,7 @@ def ligne_trajet(demande: dict, etat: dict, ref: dict, couts: dict):
     t = TABLE_TRAJET
     return (_texte(t, "IMMAT_CAMI", camion["IMMAT"]), str(demande["id"]),
             _texte(t, "TYPE_CAMI", hypotheses.TYPES_CAMION[bool(camion["frigo"])]),
-            _texte(t, "CAPA_CAMI", camion["PTAC"]), float(prix),
+            _texte(t, "CAPA_CAMI", capacite_controle(camion["PTAC"])), float(prix),
             spec.get("PTAC"), spec.get("ENR"), spec.get("COL"), taux)
 
 
@@ -227,7 +299,8 @@ def lignes_modifiees(lien: dict, etat: dict, ref: dict, couts: dict) -> dict:
     """Lignes à écrire : celles qui diffèrent de ce qui a déjà été écrit.
 
     Les demandes hors périmètre (ignorées) ne sont jamais écrites (R-CTL-01).
-    Une commande déjà écrite avec un statut final n'est plus recalculée ;
+    Une commande écrivable reçoit son ``ID_ENTRE`` (:func:`id_entre`) la
+    première fois. Une commande déjà écrite définitive (:func:`ligne_finale`) n'est plus recalculée ;
     une ligne de trajet n'est écrite qu'une fois. Les commandes d'un
     lancement précédent (:func:`reprendre`) ne sont jamais réécrites.
 
@@ -238,16 +311,21 @@ def lignes_modifiees(lien: dict, etat: dict, ref: dict, couts: dict) -> dict:
     :return: ``{table: [tuples]}`` pour chacune des :data:`TABLES`.
     """
     cache, rejetees = lien["cache"], lien["rejetees"]
-    indice_statut = COLONNES[TABLE_COMMANDE].index("STATUT")
     candidates = {table: [] for table in TABLES}
     for demande in etat["demandes"].values():
         id_demande = str(demande["id"])
         if demande.get("etat") in ("IGNOREE", "RECUE", None) or id_demande in lien["proteges"]:
             continue
         ancienne = cache[TABLE_COMMANDE].get(id_demande)
-        if ancienne is None or ancienne[indice_statut] not in STATUTS_FINAUX:
-            ligne = ligne_commande(demande)
+        if ancienne is None or not ligne_finale(ancienne):
+            valeur = id_entre(lien, id_demande)
+            ligne = ligne_commande(demande, valeur)
+            if ligne is not None:
+                attribuer_id_entre(lien, id_demande, valeur)
             if ligne is None:
+                if id_demande not in lien["non_ecrivables"]:
+                    JOURNAL.warning("traçabilité Contrôle : commande %s non écrivable (quantité ou H_DEP illisible)",
+                                    id_demande)
                 lien["non_ecrivables"].add(id_demande)
             else:
                 candidates[TABLE_COMMANDE].append(ligne)
@@ -267,8 +345,8 @@ def requetes(table: str) -> tuple:
     """Requêtes de mise à jour puis d'insertion d'une ligne.
 
     La mise à jour est limitée à la ligne de la commande ; dans
-    ``TRACABILITE_COMMANDE``, aussi à notre ``ID_ENTRE`` : une ligne d'un
-    autre groupe n'est jamais modifiée (son insertion échoue sur la clé).
+    ``TRACABILITE_COMMANDE``, aussi à l'``ID_ENTRE`` de notre ligne (``N…``) :
+    une ligne d'un autre groupe n'est jamais modifiée (son insertion échoue sur la clé).
 
     :param table: Une des :data:`TABLES`.
     :return: ``(update, insert)`` avec des paramètres ``%s`` ; ``update`` prend les colonnes hors clé, puis la clé
@@ -320,11 +398,13 @@ def nouveau_lien(connecter: object, erreurs_ligne: tuple) -> dict:
     :type connecter: callable
     :param erreurs_ligne: Exceptions dues au contenu d'une ligne (clé, contrainte, type) plutôt qu'à la connexion.
     :return: Lien : ``connecter``, ``connexion``, ``erreurs_ligne``, ``cache``, ``rejetees``, ``proteges``,
-        ``non_ecrivables``, ``repris``, ``ecrites``, ``messages``.
+        ``non_ecrivables``, ``numeros`` (``ID_ENTRE`` attribués), ``dernier_numero``, ``repris``, ``ecrites``,
+        ``messages``, ``sante`` (:func:`robustesse.nouvel_etat_bdd`).
     """
     return {"connecter": connecter, "connexion": None, "erreurs_ligne": erreurs_ligne,
             "cache": {table: {} for table in TABLES}, "rejetees": {}, "proteges": set(), "non_ecrivables": set(),
-            "repris": False, "ecrites": 0, "messages": {}}
+            "numeros": {}, "dernier_numero": 0, "repris": False, "ecrites": 0, "messages": {},
+            "sante": robustesse.nouvel_etat_bdd()}
 
 
 def deconnecter(lien: dict) -> None:
@@ -345,21 +425,28 @@ def deconnecter(lien: dict) -> None:
 def reprendre(lien: dict) -> set:
     """Reprend après un arrêt du moteur (question E18), dans nos lignes seulement.
 
-    Nos commandes laissées acceptées par le lancement précédent passent
-    expirées, code 4 DELAI (elles ne partiront plus) ; toutes nos commandes
-    déjà écrites sont protégées : le moteur ne les redécide pas et ne les
-    réécrit pas.
+    Nos commandes laissées acceptées et pas encore parties (``H_DEP_R``
+    vide) par le lancement précédent passent refusées, code 4 DELAI (elles ne
+    partiront plus) ; toutes nos commandes déjà écrites sont protégées : le
+    moteur ne les redécide pas et ne les réécrit pas. La numérotation des
+    ``ID_ENTRE`` reprend après le plus grand numéro trouvé.
 
     :param lien: Lien connecté.
     :return: Identifiants de nos commandes déjà présentes.
     """
+    debut = time.monotonic()
     curseur = lien["connexion"].cursor()
-    curseur.execute('UPDATE "%s" SET "STATUT" = \'EXPIREE\', "JUSTIF_REFUS" = %%s '
-                    'WHERE "STATUT" = \'ACCEPTEE\' AND "ID_ENTRE" = %%s' % TABLE_COMMANDE,
-                    (MOTIF_VERS_CODE["REF-DELAI"], hypotheses.ID_ENTREPRISE))
-    curseur.execute('SELECT "ID_COMMANDE" FROM "%s" WHERE "ID_ENTRE" = %%s' % TABLE_COMMANDE, (hypotheses.ID_ENTREPRISE,))
-    ids = {ligne[0] for ligne in curseur.fetchall()}
+    curseur.execute('UPDATE "%s" SET "STATUT" = \'REFUSEE\', "JUSTIF_REFUS" = %%s '
+                    'WHERE "STATUT" = \'ACCEPTEE\' AND "H_DEP_R" IS NULL AND "ID_ENTRE" ~ %%s' % TABLE_COMMANDE,
+                    (MOTIF_VERS_CODE["REF-DELAI"], MOTIF_ID_ENTRE))
+    curseur.execute('SELECT "ID_COMMANDE", "ID_ENTRE" FROM "%s" WHERE "ID_ENTRE" ~ %%s' % TABLE_COMMANDE,
+                    (MOTIF_ID_ENTRE,))
+    lignes = curseur.fetchall()
+    ids = {ligne[0] for ligne in lignes}
+    numeros = [int(ligne[1][len(hypotheses.PREFIXE_ENTREPRISE):]) for ligne in lignes]
+    lien["dernier_numero"] = max([lien["dernier_numero"]] + numeros)
     lien["connexion"].commit()
+    journalisation.evenement_sql("REPRISE", TABLE_COMMANDE, len(ids), journalisation.duree_ms(debut))
     lien["proteges"] |= ids
     lien["repris"] = True
     return ids
@@ -376,6 +463,7 @@ def ecrire(lien: dict, lignes: dict, maintenant: datetime.datetime) -> int:
     connexion, ecrites = lien["connexion"], 0
     for table in TABLES:
         indice = COLONNES[table].index(CLE)
+        debut, ecrites_table = time.monotonic(), 0
         for ligne in lignes[table]:
             try:
                 ecrire_ligne(connexion.cursor(), table, ligne)
@@ -383,11 +471,17 @@ def ecrire(lien: dict, lignes: dict, maintenant: datetime.datetime) -> int:
             except lien["erreurs_ligne"] as erreur:
                 connexion.rollback()
                 lien["rejetees"][(table, ligne[indice])] = ligne
+                lien["sante"]["rejetees"] += 1
+                journalisation.evenement_sql("UPSERT", table, 0, erreur="ligne %s rejetée : %s"
+                                             % (ligne[indice], journalisation.texte_erreur(erreur)))
                 robustesse.signaler(lien["messages"], "ligne", maintenant, "traçabilité Contrôle : ligne %s de %s rejetée : %s"
-                                    % (ligne[indice], table, str(erreur).strip()))
+                                    % (ligne[indice], table, journalisation.texte_erreur(erreur)), logging.ERROR, "controle")
                 continue
             lien["cache"][table][ligne[indice]] = ligne
             ecrites += 1
+            ecrites_table += 1
+        if ecrites_table:
+            journalisation.evenement_sql("UPSERT", table, ecrites_table, journalisation.duree_ms(debut))
     return ecrites
 
 
@@ -407,24 +501,39 @@ def synchroniser(lien: dict, etat: dict, ref: dict, couts: dict, maintenant: dat
     :param maintenant: Heure réelle (ou simulée) courante.
     :return: Nombre de lignes écrites (0 si rien n'a changé ou si la base est indisponible).
     """
+    etape, nb_lignes = "connexion", 0
     try:
         if lien["connexion"] is None:
+            debut = time.monotonic()
             lien["connexion"] = lien["connecter"]()
+            journalisation.evenement_sql("CONNEXION", "-", 0, journalisation.duree_ms(debut), niveau=logging.DEBUG)
         if not lien["repris"]:
+            etape = "reprise"
             ids = reprendre(lien)
             etat.setdefault("deja_archivees", set()).update(ids)
-            print("Traçabilité Contrôle : %d commande(s) %s déjà en base, laissées telles quelles"
-                  % (len(ids), hypotheses.ID_ENTREPRISE), flush=True)
+            JOURNAL.info("traçabilité Contrôle : %d commande(s) %s… déjà en base, laissées telles quelles ; "
+                         "numérotation reprise à %s%d", len(ids), hypotheses.PREFIXE_ENTREPRISE,
+                         hypotheses.PREFIXE_ENTREPRISE, lien["dernier_numero"] + 1)
+        etape = "calcul des lignes"
         lignes = lignes_modifiees(lien, etat, ref, couts)
-        if not any(lignes.values()):
+        nb_lignes = sum(len(l) for l in lignes.values())
+        if not nb_lignes:
+            robustesse.noter_succes_bdd(lien["sante"], maintenant, 0, "traçabilité Contrôle")
             return 0
+        etape = "écriture"
         ecrites = ecrire(lien, lignes, maintenant)
-    except Exception as erreur:  # R-ROB-02 : base injoignable, table absente… : le moteur ne doit pas s'arrêter
-        robustesse.signaler(lien["messages"], "base", maintenant, "traçabilité Contrôle : %s (nouvel essai au prochain tick)"
-                            % (str(erreur).strip() or type(erreur).__name__))
+    except Exception as erreur:  # R-ROB-02 / R-ROB-06 : base injoignable, table absente… : le moteur continue, mais le dit
+        robustesse.noter_echec_bdd(lien["sante"], maintenant, erreur, nb_lignes)
+        journalisation.evenement_sql(etape.upper(), ",".join(TABLES), nb_lignes, erreur=erreur)
+        robustesse.signaler(lien["messages"], "base", maintenant,
+                            "traçabilité Contrôle EN ÉCHEC (%s, %d échec(s) consécutif(s) depuis %s) : %s ; %d ligne(s) en "
+                            "attente, nouvel essai au prochain tick" % (etape, lien["sante"]["echecs"], lien["sante"]["depuis"],
+                                                                        journalisation.texte_erreur(erreur), nb_lignes),
+                            logging.ERROR, "controle")
         deconnecter(lien)
         return 0
     lien["ecrites"] += ecrites
+    robustesse.noter_succes_bdd(lien["sante"], maintenant, ecrites, "traçabilité Contrôle")
     return ecrites
 
 
@@ -489,17 +598,17 @@ def afficher_etat(parametres: dict = None) -> None:
     connexion = psycopg2.connect(**(parametres or referentiels.BDD))
     try:
         curseur = connexion.cursor()
-        curseur.execute('SELECT "STATUT", COUNT(*) FROM "%s" WHERE "ID_ENTRE" = %%s GROUP BY 1 ORDER BY 1' % TABLE_COMMANDE,
-                        (hypotheses.ID_ENTREPRISE,))
-        print("%s (%s) : %s" % (TABLE_COMMANDE, hypotheses.ID_ENTREPRISE,
-                                ", ".join("%s %d" % ligne for ligne in curseur.fetchall()) or "vide"))
-        curseur.execute('SELECT "JUSTIF_REFUS", COUNT(*) FROM "%s" WHERE "ID_ENTRE" = %%s AND "JUSTIF_REFUS" IS NOT NULL '
-                        'GROUP BY 1 ORDER BY 1' % TABLE_COMMANDE, (hypotheses.ID_ENTREPRISE,))
+        curseur.execute('SELECT "STATUT", COUNT(*) FROM "%s" WHERE "ID_ENTRE" ~ %%s GROUP BY 1 ORDER BY 1' % TABLE_COMMANDE,
+                        (MOTIF_ID_ENTRE,))
+        print("%s (%s…) : %s" % (TABLE_COMMANDE, hypotheses.PREFIXE_ENTREPRISE,
+                                 ", ".join("%s %d" % ligne for ligne in curseur.fetchall()) or "vide"))
+        curseur.execute('SELECT "JUSTIF_REFUS", COUNT(*) FROM "%s" WHERE "ID_ENTRE" ~ %%s AND "JUSTIF_REFUS" IS NOT NULL '
+                        'GROUP BY 1 ORDER BY 1' % TABLE_COMMANDE, (MOTIF_ID_ENTRE,))
         for code, nombre in curseur.fetchall():
             print("  refus %s %-12s : %d" % (code, CODES_REFUS.get(code, ("?",))[0], nombre))
         curseur.execute('SELECT COUNT(*), AVG(t."TAUX_REMPLI"), SUM(t."COUT_PRESTA") FROM "%s" t JOIN "%s" c '
-                        'ON t."ID_COMMANDE" = c."ID_COMMANDE" WHERE c."ID_ENTRE" = %%s' % (TABLE_TRAJET, TABLE_COMMANDE),
-                        (hypotheses.ID_ENTREPRISE,))
+                        'ON t."ID_COMMANDE" = c."ID_COMMANDE" WHERE c."ID_ENTRE" ~ %%s' % (TABLE_TRAJET, TABLE_COMMANDE),
+                        (MOTIF_ID_ENTRE,))
         nombre, remplissage, total = curseur.fetchone()
         print("%s : %d ligne(s), remplissage moyen %s, prix total %s"
               % (TABLE_TRAJET, nombre, "%.1f" % remplissage if remplissage is not None else "-",

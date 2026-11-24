@@ -1,4 +1,4 @@
-"""Tests de l'archivage dans les tables ``*_NORTH`` (:mod:`archivage`).
+"""Tests de l'archivage dans les tables ``LOG_NORTH_*`` (:mod:`archivage`).
 
 Reprend le référentiel fictif de :mod:`test_decision`. La base est simulée
 (:class:`FausseConnexion`) : on vérifie les lignes produites, les contraintes
@@ -8,8 +8,10 @@ Lancement, depuis ``1 - DEV/`` : ``python3 -m unittest discover -s tests``.
 """
 
 import datetime
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -45,16 +47,19 @@ class FausseConnexion:
 
     :param rejets: Clés primaires dont l'écriture lève :class:`ErreurLigne`.
     :param deja: Identifiants renvoyés par le ``SELECT "ID_COMMANDE"`` de :func:`archivage.reprendre`.
+    :param tables: Tables présentes dans ``information_schema`` (défaut : les trois).
     """
 
-    def __init__(self, rejets: tuple = (), deja: tuple = ()) -> None:
+    def __init__(self, rejets: tuple = (), deja: tuple = (), tables: tuple = None) -> None:
         """Initialise le journal des requêtes.
 
         :param rejets: Clés primaires refusées.
         :param deja: Commandes déjà archivées.
+        :param tables: Tables existantes (vérification du schéma à la première connexion).
         """
         self.requetes, self.rejets, self.deja = [], set(rejets), list(deja)
-        self.commits, self.rollbacks = 0, 0
+        self.tables = archivage.TABLES if tables is None else list(tables)
+        self.commits, self.rollbacks, self.rowcount, self.schema = 0, 0, 0, False
 
     def cursor(self) -> "FausseConnexion":
         """Renvoie la connexion elle-même, qui sert aussi de curseur.
@@ -70,6 +75,10 @@ class FausseConnexion:
         :param parametres: Paramètres.
         :raises ErreurLigne: si la clé primaire est refusée.
         """
+        # La lecture du schéma (information_schema) n'est pas comptée parmi les requêtes du moteur
+        self.schema = "information_schema" in requete
+        if self.schema:
+            return
         if parametres and parametres[0] in self.rejets:
             raise ErreurLigne("contrainte violée : %s" % parametres[0])
         self.requetes.append((requete, parametres))
@@ -86,10 +95,12 @@ class FausseConnexion:
         self.requetes += [(requete, ligne) for ligne in lignes]
 
     def fetchall(self) -> list:
-        """Résultat du ``SELECT`` de reprise.
+        """Résultat du dernier ``SELECT`` : colonnes des tables existantes, ou commandes déjà archivées.
 
-        :return: Lignes ``(ID_COMMANDE,)``.
+        :return: Lignes ``(table, colonne)`` ou ``(ID_COMMANDE,)``.
         """
+        if self.schema:
+            return [(t, c) for t in self.tables for c in archivage.COLONNES[t]]
         return [(i,) for i in self.deja]
 
     def commit(self) -> None:
@@ -119,10 +130,10 @@ def verifier_contraintes(test: unittest.TestCase, table: str, ligne: tuple) -> N
     :param ligne: Tuple dans l'ordre de :data:`archivage.COLONNES`.
     """
     valeurs = dict(zip(archivage.COLONNES[table], ligne))
-    if table == "TRAJET_NORTH":
+    if table == "LOG_NORTH_TRAJET":
         test.assertIn(valeurs["STATUT"], STATUTS_TRAJET)
         test.assertTrue(valeurs["TAUX_REMPL"] is None or 0 <= valeurs["TAUX_REMPL"] <= 100)
-    elif table == "ARCHIVAGE_COMMANDE_NORTH":
+    elif table == "LOG_NORTH_ARCHIVAGE_COMMANDE":
         test.assertIn(valeurs["STATUT"], STATUTS_COMMANDE)
         test.assertIn(valeurs["TYPE_MV"], ("Export", "Import"))
         test.assertGreater(valeurs["QTE_PAL"], 0)
@@ -166,14 +177,14 @@ class BaseArchivage(unittest.TestCase):
         return tournee
 
     def commande(self, demande: dict) -> dict:
-        """Ligne ``ARCHIVAGE_COMMANDE_NORTH`` de la demande, en dictionnaire.
+        """Ligne ``LOG_NORTH_ARCHIVAGE_COMMANDE`` de la demande, en dictionnaire.
 
         :param demande: Demande décidée.
         :return: ``{colonne: valeur}``.
         """
         ligne = archivage.ligne_commande(demande, self.etat, self.ref, COUTS)
-        verifier_contraintes(self, "ARCHIVAGE_COMMANDE_NORTH", ligne)
-        return dict(zip(archivage.COLONNES["ARCHIVAGE_COMMANDE_NORTH"], ligne))
+        verifier_contraintes(self, "LOG_NORTH_ARCHIVAGE_COMMANDE", ligne)
+        return dict(zip(archivage.COLONNES["LOG_NORTH_ARCHIVAGE_COMMANDE"], ligne))
 
 
 class TestLignes(BaseArchivage):
@@ -185,7 +196,7 @@ class TestLignes(BaseArchivage):
         self.assertEqual(demande["motif"], "REF-DONNEES")
         self.assertIsNone(archivage.ligne_commande(demande, self.etat, self.ref, COUTS))
         archive = archivage.nouvelle_archive(FausseConnexion, (ErreurLigne,))
-        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["ARCHIVAGE_COMMANDE_NORTH"], [])
+        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["LOG_NORTH_ARCHIVAGE_COMMANDE"], [])
         self.assertEqual(archive["non_archivables"], {"D1"})
 
     def test_hors_perimetre_ignore(self) -> None:
@@ -209,7 +220,7 @@ class TestLignes(BaseArchivage):
         self.assertIsNone(valeurs["H_DEP_R"])
         self.assertIsNone(valeurs["COUT_PREST"])
         trajet = archivage.ligne_trajet(self.etat["tournees"]["T00001"], self.etat, T0)
-        verifier_contraintes(self, "TRAJET_NORTH", trajet)
+        verifier_contraintes(self, "LOG_NORTH_TRAJET", trajet)
         self.assertEqual(trajet[1:], ("F1", 20.0, "EN_CONSTITUTION"))
 
     def test_spec(self) -> None:
@@ -262,11 +273,11 @@ class TestLignes(BaseArchivage):
         tournee = self.partir(self.decider(demande_test(self.ref, qte=14, h_dep_h=12.0)))
         self.assertFalse(archivage.ligne_camion(camion, T0)[-1])
         self.assertTrue(archivage.ligne_camion(camion, tournee["plan"]["fin"])[-1])
-        verifier_contraintes(self, "CAMION_NORTH", archivage.ligne_camion(camion, T0))
+        verifier_contraintes(self, "LOG_NORTH_CAMION", archivage.ligne_camion(camion, T0))
 
     def test_requete_upsert(self) -> None:
         """La clé primaire sert au ON CONFLICT et n'est jamais mise à jour."""
-        requete = archivage.requete_upsert("TRAJET_NORTH")
+        requete = archivage.requete_upsert("LOG_NORTH_TRAJET")
         self.assertIn('ON CONFLICT ("ID_TRAJET") DO UPDATE', requete)
         self.assertNotIn('"ID_TRAJET" = EXCLUDED', requete)
         self.assertEqual(requete.count("%s"), 4)
@@ -294,7 +305,7 @@ class TestPrix(BaseArchivage):
         demande = self.decider(demande_test(self.ref, qte=14, h_dep_h=12.0))
         self.partir(demande)
         ligne = archivage.ligne_commande(demande, self.etat, self.ref, dict(COUTS, source="defaut"))
-        self.assertIsNone(ligne[archivage.COLONNES["ARCHIVAGE_COMMANDE_NORTH"].index("COUT_PREST")])
+        self.assertIsNone(ligne[archivage.COLONNES["LOG_NORTH_ARCHIVAGE_COMMANDE"].index("COUT_PREST")])
 
 
 class TestSynchronisation(BaseArchivage):
@@ -320,14 +331,14 @@ class TestSynchronisation(BaseArchivage):
         connexion.requetes.clear()
         # Décision de départ : la commande passe PARTIE ; le trajet reste EN_CONSTITUTION pendant le chargement
         archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0)
-        self.assertEqual(connexion.tables_ecrites(), ["ARCHIVAGE_COMMANDE_NORTH"])
+        self.assertEqual(connexion.tables_ecrites(), ["LOG_NORTH_ARCHIVAGE_COMMANDE"])
         connexion.requetes.clear()
         archivage.synchroniser(archive, self.etat, self.ref, COUTS, tournee["plan"]["suivi"]["D1"]["depart"])
-        self.assertEqual(connexion.tables_ecrites(), ["TRAJET_NORTH"])
+        self.assertEqual(connexion.tables_ecrites(), ["LOG_NORTH_TRAJET"])
         connexion.requetes.clear()
         archivage.synchroniser(archive, self.etat, self.ref, COUTS, tournee["plan"]["fin"])
-        self.assertEqual(connexion.tables_ecrites(), ["CAMION_NORTH", "TRAJET_NORTH"])
-        self.assertEqual(archive["cache"]["TRAJET_NORTH"]["T00001"][-1], "TERMINE")
+        self.assertEqual(connexion.tables_ecrites(), ["LOG_NORTH_CAMION", "LOG_NORTH_TRAJET"])
+        self.assertEqual(archive["cache"]["LOG_NORTH_TRAJET"]["T00001"][-1], "TERMINE")
 
     def test_base_injoignable(self) -> None:
         """Base injoignable : le moteur continue, rien n'est mis en cache, tout est écrit au retour de la base."""
@@ -346,7 +357,7 @@ class TestSynchronisation(BaseArchivage):
         archive = archivage.nouvelle_archive(connecter, (ErreurLigne,))
         self.decider(demande_test(self.ref, h_dep_h=12.0))
         self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0), 0)
-        self.assertEqual(archive["cache"]["CAMION_NORTH"], {})
+        self.assertEqual(archive["cache"]["LOG_NORTH_CAMION"], {})
         disponible[0] = True
         self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, apres(0.1)), 3)
 
@@ -356,15 +367,55 @@ class TestSynchronisation(BaseArchivage):
         archive = self.archive(connexion)
         self.decider(demande_test(self.ref, h_dep_h=12.0))
         self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0), 2)
-        self.assertIn(("ARCHIVAGE_COMMANDE_NORTH", "D1"), archive["rejetees"])
-        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["ARCHIVAGE_COMMANDE_NORTH"], [])
+        self.assertIn(("LOG_NORTH_ARCHIVAGE_COMMANDE", "D1"), archive["rejetees"])
+        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["LOG_NORTH_ARCHIVAGE_COMMANDE"], [])
+
+    def test_table_absente_echec_visible(self) -> None:
+        """R-ROB-06 : table absente (renommée) : échec compté, journalisé en erreur, rétablissement annoncé."""
+        connexion = FausseConnexion(tables=("LOG_NORTH_CAMION", "LOG_NORTH_TRAJET"))
+        archive = self.archive(connexion)
+        self.decider(demande_test(self.ref, h_dep_h=12.0))
+        with self.assertLogs("nord", level="ERROR") as journaux:
+            self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0), 0)
+        self.assertTrue(any("LOG_NORTH_ARCHIVAGE_COMMANDE : table absente" in ligne for ligne in journaux.output))
+        self.assertEqual(connexion.requetes, [])
+        sante = archive["sante"]
+        self.assertEqual((sante["echecs"], sante["en_attente"], sante["connecte"]), (1, 0, False))
+        self.assertIn("table absente", sante["derniere_erreur"])
+        connexion.tables = archivage.TABLES
+        with self.assertLogs("nord", level="WARNING") as journaux:
+            self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, apres(0.1)), 3)
+        self.assertTrue(any("rétabli" in ligne for ligne in journaux.output))
+        self.assertEqual((sante["echecs"], sante["ecrites"]), (0, 3))
+
+    def test_ecritures_en_attente_comptees(self) -> None:
+        """R-ROB-06 : lignes calculées mais non écrites (base tombée pendant l'écriture) comptées en attente."""
+        connexion = FausseConnexion()
+        archive = self.archive(connexion)
+        archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0)
+        self.decider(demande_test(self.ref, h_dep_h=12.0))
+
+        def panne(requete: str, lignes: list) -> None:
+            """Simule une connexion perdue au milieu du lot.
+
+            :param requete: Requête SQL.
+            :param lignes: Paramètres.
+            :raises OSError: Toujours.
+            """
+            raise OSError("server closed the connection unexpectedly")
+
+        connexion.executemany = panne
+        with self.assertLogs("nord", level="ERROR"):
+            self.assertEqual(archivage.synchroniser(archive, self.etat, self.ref, COUTS, apres(0.1)), 0)
+        self.assertGreater(archive["sante"]["en_attente"], 0)
+        self.assertIn("server closed", archive["sante"]["derniere_erreur"])
 
     def test_reprise_apres_arret(self) -> None:
         """E18 : les commandes déjà en base ne sont ni redécidées ni réécrites."""
         connexion = FausseConnexion(deja=("D1",))
         archive = self.archive(connexion)
         archivage.synchroniser(archive, self.etat, self.ref, COUTS, T0)
-        self.assertTrue(connexion.requetes[0][0].startswith('UPDATE "ARCHIVAGE_COMMANDE_NORTH"'))
+        self.assertTrue(connexion.requetes[0][0].startswith('UPDATE "LOG_NORTH_ARCHIVAGE_COMMANDE"'))
         self.assertEqual(self.etat["deja_archivees"], {"D1"})
         champs = {"TYPE_MVT": "Export", "LOC_DEP": "Amsterdam", "LOC_ARR": "Paris", "TYPE_DEP": "USINE", "TYPE_ARR": "GMS",
                   "TYPE_MAT": "PF Frais", "QTE_PAL": 4, "TYPE_PAL": "EPAL", "H_DEP": apres(12).strftime("%d/%m/%y %H:%M:%S"), "SPEC": ""}
@@ -372,7 +423,74 @@ class TestSynchronisation(BaseArchivage):
         self.assertNotIn("D1", self.etat["demandes"])
         # Même présente dans l'état, une commande protégée n'est pas réécrite
         self.decider(demande_test(self.ref, h_dep_h=12.0))
-        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["ARCHIVAGE_COMMANDE_NORTH"], [])
+        self.assertEqual(archivage.lignes_modifiees(archive, self.etat, self.ref, COUTS, T0)["LOG_NORTH_ARCHIVAGE_COMMANDE"], [])
+
+
+class TestReinitialisation(unittest.TestCase):
+    """Remise à zéro des tables ``LOG_NORTH_*`` (:func:`archivage.reinitialiser`)."""
+
+    def setUp(self) -> None:
+        """Dossier temporaire pour la sauvegarde et les fichiers PID."""
+        self.dossier = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dossier.cleanup)
+
+    def test_sauvegarde_puis_suppression_dans_l_ordre(self) -> None:
+        """Sauvegarde d'abord, puis DELETE des commandes aux camions, une seule validation."""
+        connexion = FausseConnexion(deja=("D1", "D2"))
+        chemin = os.path.join(self.dossier.name, "sauvegardes", "s.json")
+        with self.assertLogs("nord", level="WARNING"):
+            supprimees = archivage.reinitialiser(connexion, chemin)
+        deletes = [r for r, _ in connexion.requetes if r.startswith("DELETE")]
+        self.assertEqual([r.split('"')[1] for r in deletes], list(reversed(archivage.TABLES)))
+        self.assertTrue(all(r.startswith("SELECT") for r, _ in connexion.requetes[:len(archivage.TABLES)]))
+        self.assertEqual(set(supprimees), set(archivage.TABLES))
+        self.assertEqual(connexion.commits, 1)
+        with open(chemin, encoding="utf-8") as fichier:
+            sauvegarde = json.load(fichier)
+        self.assertEqual(len(sauvegarde["LOG_NORTH_ARCHIVAGE_COMMANDE"]), 2)
+        self.assertNotIn("TRUNCATE", " ".join(r for r, _ in connexion.requetes))
+
+    def test_sauvegarde_impossible_rien_supprime(self) -> None:
+        """Sauvegarde en échec : aucune suppression, transaction annulée, erreur remontée."""
+        connexion = FausseConnexion()
+        fichier_bloquant = os.path.join(self.dossier.name, "fichier")
+        open(fichier_bloquant, "w").close()
+        with self.assertLogs("nord", level="ERROR"), self.assertRaises(OSError):
+            archivage.reinitialiser(connexion, os.path.join(fichier_bloquant, "s.json"))
+        self.assertFalse([r for r, _ in connexion.requetes if r.startswith("DELETE")])
+        self.assertEqual((connexion.commits, connexion.rollbacks), (0, 1))
+
+    def test_erreur_de_la_base_annule_tout(self) -> None:
+        """Un DELETE refusé annule la transaction (rien n'est supprimé)."""
+        connexion = FausseConnexion()
+        execute = connexion.execute
+
+        def panne(requete: str, parametres: tuple = ()) -> None:
+            """Refuse le second DELETE.
+
+            :param requete: Requête SQL.
+            :param parametres: Paramètres.
+            :raises RuntimeError: au DELETE des trajets.
+            """
+            if requete.startswith('DELETE FROM "LOG_NORTH_TRAJET"'):
+                raise RuntimeError("permission denied")
+            execute(requete, parametres)
+
+        connexion.execute = panne
+        with self.assertLogs("nord", level="ERROR"), self.assertRaises(RuntimeError):
+            archivage.reinitialiser(connexion)
+        self.assertEqual((connexion.commits, connexion.rollbacks), (0, 1))
+
+    def test_moteur_en_marche(self) -> None:
+        """PID vivant → PID ; fichier absent ou illisible → ``None``."""
+        self.assertIsNone(archivage.moteur_en_marche(self.dossier.name))
+        chemin = os.path.join(self.dossier.name, "moteur.pid")
+        with open(chemin, "w") as fichier:
+            fichier.write("pas un pid")
+        self.assertIsNone(archivage.moteur_en_marche(self.dossier.name))
+        with open(chemin, "w") as fichier:
+            fichier.write(str(os.getpid()))
+        self.assertEqual(archivage.moteur_en_marche(self.dossier.name), os.getpid())
 
 
 if __name__ == "__main__":

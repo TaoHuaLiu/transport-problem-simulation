@@ -1,11 +1,11 @@
-"""Archivage du moteur NORTH dans les tables ``*_NORTH`` de la base.
+"""Archivage du moteur NORTH dans les tables ``LOG_NORTH_*`` de la base.
 
 Tient à jour les trois tables propres au transporteur, créées par
 ``3 - Documentation/tables-nord.sql`` :
 
-- ``CAMION_NORTH`` : une ligne par camion de la flotte NORTH, avec sa disponibilité ;
-- ``TRAJET_NORTH`` : une ligne par tournée, avec son remplissage et son statut ;
-- ``ARCHIVAGE_COMMANDE_NORTH`` : une ligne par demande NORTH décidée
+- ``LOG_NORTH_CAMION`` : une ligne par camion de la flotte NORTH, avec sa disponibilité ;
+- ``LOG_NORTH_TRAJET`` : une ligne par tournée, avec son remplissage et son statut ;
+- ``LOG_NORTH_ARCHIVAGE_COMMANDE`` : une ligne par demande NORTH décidée
   (acceptée, partie, refusée ou expirée), avec son motif de refus et son prix.
 
 Principe : à chaque tick, :func:`synchroniser` recalcule les lignes à partir
@@ -23,35 +23,54 @@ Utilisation, sur la VM (lecture seule) :
 
 .. code-block:: bash
 
-    python3 archivage.py --etat     # nombre de lignes par statut dans les trois tables
+    python3 archivage.py --etat       # nombre de lignes par statut dans les trois tables
+    python3 archivage.py --verifier   # les trois tables existent-elles avec les colonnes attendues ?
+    python3 archivage.py --reinitialiser   # vide les trois tables (moteur arrêté, sauvegarde JSON avant)
+
+Une écriture en échec n'est jamais silencieuse (règle R-ROB-06) : chaque lot et
+chaque erreur vont au journal SQL (:func:`journalisation.evenement_sql`), l'échec est
+journalisé en erreur avec le nombre de lignes en attente, et ``archive["sante"]``
+(repris dans ``sante_moteur.json`` et sur le tableau de bord) donne le dernier succès,
+la dernière erreur et le nombre d'échecs consécutifs. À la première connexion, les
+trois tables sont vérifiées : une table absente ou renommée donne un message explicite.
 """
 
 import argparse
 import datetime
+import json
+import logging
+import os
+import sys
+import time
 
+import journalisation
 import planification
 import referentiels
 import regles
+import robustesse
+
+JOURNAL = journalisation.journal("archivage")
 
 #: Tables écrites, dans l'ordre des clés étrangères.
-TABLES = ["CAMION_NORTH", "TRAJET_NORTH", "ARCHIVAGE_COMMANDE_NORTH"]
+TABLES = ["LOG_NORTH_CAMION", "LOG_NORTH_TRAJET", "LOG_NORTH_ARCHIVAGE_COMMANDE"]
 
 #: Colonnes de chaque table, dans l'ordre des tuples ; la première est la clé primaire.
 COLONNES = {
-    "CAMION_NORTH": ["IMMAT_CAMI", "REFERENCE", "REMORQUE_REFRIGEREE", "PTAC", "SPEC_ENR", "SPEC_COL", "DISPO"],
-    "TRAJET_NORTH": ["ID_TRAJET", "IMMAT_CAMI", "TAUX_REMPL", "STATUT"],
-    "ARCHIVAGE_COMMANDE_NORTH": ["ID_COMMANDE", "TYPE_MV", "LOC_DEP", "LOC_ARR", "TYPE_DEP", "TYPE_ARR", "TYPE_MAT",
+    "LOG_NORTH_CAMION": ["IMMAT_CAMI", "REFERENCE", "REMORQUE_REFRIGEREE", "PTAC", "SPEC_ENR", "SPEC_COL", "DISPO"],
+    "LOG_NORTH_TRAJET": ["ID_TRAJET", "IMMAT_CAMI", "TAUX_REMPL", "STATUT"],
+    "LOG_NORTH_ARCHIVAGE_COMMANDE": ["ID_COMMANDE", "TYPE_MV", "LOC_DEP", "LOC_ARR", "TYPE_DEP", "TYPE_ARR", "TYPE_MAT",
                                  "QTE_PAL", "TYPE_PAL", "H_DEP", "H_DEP_R", "SPEC_ENR", "SPEC_PTAC", "SPEC_COL",
                                  "COUT_PREST", "STATUT", "JUSTI_REFUS", "ID_TRAJET"],
 }
 
 #: Statuts finals : une ligne écrite avec ce statut ne change plus.
-STATUTS_FINAUX = {"TRAJET_NORTH": ("TERMINE", "ANNULE"),
-                  "ARCHIVAGE_COMMANDE_NORTH": ("PARTIE", "REFUSEE", "EXPIREE")}
+STATUTS_FINAUX = {"LOG_NORTH_TRAJET": ("TERMINE", "ANNULE"),
+                  "LOG_NORTH_ARCHIVAGE_COMMANDE": ("PARTIE", "REFUSEE", "EXPIREE")}
 
 #: Libellé de chaque motif de refus, pour la colonne ``JUSTI_REFUS``.
 LIBELLES_MOTIFS = {
     "REF-DONNEES": "données de la demande inexploitables",
+    "REF-EXPIREE": "H_DEP déjà dépassée à la lecture (moteur arrêté)",
     "REF-SPEC": "aucun camion ne respecte la SPEC",
     "REF-FRIGO": "aucun camion frigorifique compatible disponible",
     "REF-CAMION": "aucun camion compatible disponible",
@@ -60,11 +79,11 @@ LIBELLES_MOTIFS = {
     "REF-RENTABILITE": "tournée annulée, remplissage sous le seuil",
 }
 
+#: Dossier des sauvegardes JSON faites par :func:`reinitialiser` avant de vider les tables.
+DOSSIER_SAUVEGARDES = os.path.join(journalisation.DOSSIER, "..", "donnees", "sauvegardes")
+
 #: Justification écrite par :func:`reprendre` pour les commandes laissées acceptées par un moteur arrêté.
 JUSTI_REDEMARRAGE = "REF-DELAI : moteur redémarré avant le départ"
-
-#: Délai minimal (temps réel) entre deux messages d'erreur de la base dans la console.
-DELAI_MESSAGES = datetime.timedelta(minutes=1)
 
 
 # ---------------------------------------------------------------- Lignes (fonctions pures)
@@ -82,7 +101,7 @@ def requete_upsert(table: str) -> str:
 
 
 def ligne_camion(camion: dict, maintenant: datetime.datetime) -> tuple:
-    """Ligne ``CAMION_NORTH`` d'un camion de la flotte.
+    """Ligne ``LOG_NORTH_CAMION`` d'un camion de la flotte.
 
     Un camion est disponible s'il n'est réservé par aucune tournée ouverte
     et qu'il a fini sa tournée précédente.
@@ -97,7 +116,7 @@ def ligne_camion(camion: dict, maintenant: datetime.datetime) -> tuple:
 
 
 def statut_trajet(tournee: dict, etat: dict, maintenant: datetime.datetime) -> str:
-    """Statut ``TRAJET_NORTH`` d'une tournée à l'instant donné (machine à états).
+    """Statut ``LOG_NORTH_TRAJET`` d'une tournée à l'instant donné (machine à états).
 
     - tournée ouverte → ``EN_CONSTITUTION`` ; annulée → ``ANNULE`` ;
     - tournée partie, d'après son plan : fin du plan passée → ``TERMINE`` ;
@@ -136,7 +155,7 @@ def statut_trajet(tournee: dict, etat: dict, maintenant: datetime.datetime) -> s
 
 
 def ligne_trajet(tournee: dict, etat: dict, maintenant: datetime.datetime) -> tuple:
-    """Ligne ``TRAJET_NORTH`` d'une tournée.
+    """Ligne ``LOG_NORTH_TRAJET`` d'une tournée.
 
     Le taux de remplissage est celui du plan (R-KPI-TR : remplissage au départ
     du lieu de chargement, par la surface au sol des palettes), en pour cent ; il suit la tournée pendant qu'elle
@@ -153,7 +172,7 @@ def ligne_trajet(tournee: dict, etat: dict, maintenant: datetime.datetime) -> tu
 
 
 def statut_commande(demande: dict):
-    """Statut ``ARCHIVAGE_COMMANDE_NORTH`` d'une demande.
+    """Statut ``LOG_NORTH_ARCHIVAGE_COMMANDE`` d'une demande.
 
     :param demande: Demande préparée.
     :return: ``ACCEPTEE``, ``PARTIE``, ``REFUSEE`` ou ``EXPIREE`` ; ``None`` si la demande n'est pas à
@@ -200,7 +219,7 @@ def archivable(demande: dict, statut: str) -> bool:
 
 
 def ligne_commande(demande: dict, etat: dict, ref: dict, couts: dict):
-    """Ligne ``ARCHIVAGE_COMMANDE_NORTH`` d'une demande décidée.
+    """Ligne ``LOG_NORTH_ARCHIVAGE_COMMANDE`` d'une demande décidée.
 
     - ``SPEC_PTAC``, ``SPEC_ENR``, ``SPEC_COL`` : vide si la clé n'est pas
       demandée ou si aucun camion n'est affecté ; sinon, la SPEC est-elle
@@ -254,23 +273,25 @@ def lignes_modifiees(archive: dict, etat: dict, ref: dict, couts: dict, maintena
     """
     cache, rejetees = archive["cache"], archive["rejetees"]
     candidates = {table: [] for table in TABLES}
-    candidates["CAMION_NORTH"] = [ligne_camion(c, maintenant) for c in etat["flotte"].values()]
+    candidates["LOG_NORTH_CAMION"] = [ligne_camion(c, maintenant) for c in etat["flotte"].values()]
     for tournee in etat["tournees"].values():
-        ancienne = cache["TRAJET_NORTH"].get(tournee["id"])
-        if ancienne is None or ancienne[-1] not in STATUTS_FINAUX["TRAJET_NORTH"]:
-            candidates["TRAJET_NORTH"].append(ligne_trajet(tournee, etat, maintenant))
+        ancienne = cache["LOG_NORTH_TRAJET"].get(tournee["id"])
+        if ancienne is None or ancienne[-1] not in STATUTS_FINAUX["LOG_NORTH_TRAJET"]:
+            candidates["LOG_NORTH_TRAJET"].append(ligne_trajet(tournee, etat, maintenant))
     for demande in etat["demandes"].values():
         if demande["id"] in archive["proteges"]:
             continue
-        ancienne = cache["ARCHIVAGE_COMMANDE_NORTH"].get(demande["id"])
-        if ancienne is not None and ancienne[COLONNES["ARCHIVAGE_COMMANDE_NORTH"].index("STATUT")] in STATUTS_FINAUX["ARCHIVAGE_COMMANDE_NORTH"]:
+        ancienne = cache["LOG_NORTH_ARCHIVAGE_COMMANDE"].get(demande["id"])
+        if ancienne is not None and ancienne[COLONNES["LOG_NORTH_ARCHIVAGE_COMMANDE"].index("STATUT")] in STATUTS_FINAUX["LOG_NORTH_ARCHIVAGE_COMMANDE"]:
             continue
         ligne = ligne_commande(demande, etat, ref, couts)
         if ligne is None:
-            if statut_commande(demande) is not None:
+            if statut_commande(demande) is not None and demande["id"] not in archive["non_archivables"]:
                 archive["non_archivables"].add(demande["id"])
+                JOURNAL.warning("demande %s (%s, motif %s) non archivable : données hors contraintes de la table, "
+                                "au journal CSV seulement", demande["id"], statut_commande(demande), demande.get("motif") or "-")
             continue
-        candidates["ARCHIVAGE_COMMANDE_NORTH"].append(ligne)
+        candidates["LOG_NORTH_ARCHIVAGE_COMMANDE"].append(ligne)
     return {table: [ligne for ligne in lignes
                     if cache[table].get(ligne[0]) != ligne and rejetees.get((table, ligne[0])) != ligne]
             for table, lignes in candidates.items()}
@@ -283,7 +304,8 @@ def ouvrir(parametres: dict = None) -> dict:
 
     :param parametres: Paramètres de connexion (défaut : :data:`referentiels.BDD`).
     :return: Archive : ``connecter``, ``connexion``, ``erreurs_ligne`` (exceptions propres à une ligne),
-        ``cache``, ``rejetees``, ``proteges``, ``non_archivables``, ``repris``, ``ecrites``, ``dernier_message``.
+        ``cache``, ``rejetees``, ``proteges``, ``non_archivables``, ``repris``, ``verifie``, ``ecrites``,
+        ``messages`` (:func:`robustesse.signaler`), ``sante`` (:func:`robustesse.nouvel_etat_bdd`).
     """
     import psycopg2  # disponible sur la VM uniquement
 
@@ -303,19 +325,36 @@ def nouvelle_archive(connecter, erreurs_ligne: tuple) -> dict:
     """
     return {"connecter": connecter, "connexion": None, "erreurs_ligne": erreurs_ligne,
             "cache": {table: {} for table in TABLES}, "rejetees": {}, "proteges": set(), "non_archivables": set(),
-            "repris": False, "ecrites": 0, "dernier_message": None}
+            "repris": False, "verifie": False, "ecrites": 0, "messages": {}, "sante": robustesse.nouvel_etat_bdd()}
 
 
-def signaler(archive: dict, maintenant: datetime.datetime, message: str) -> None:
-    """Affiche une erreur de la base, au plus une fois par :data:`DELAI_MESSAGES`.
+def ecarts_schema(colonnes_base: list) -> list:
+    """Compare les colonnes trouvées en base à :data:`COLONNES`.
 
-    :param archive: Archive.
-    :param maintenant: Heure réelle courante.
-    :param message: Texte à afficher.
+    :param colonnes_base: ``(table, colonne)`` lus dans ``information_schema.columns``.
+    :return: Écarts lisibles (vide si les trois tables ont toutes leurs colonnes).
     """
-    if archive["dernier_message"] is None or maintenant - archive["dernier_message"] >= DELAI_MESSAGES:
-        print("[%s] ! archivage : %s" % (maintenant.strftime("%H:%M:%S"), message), flush=True)
-        archive["dernier_message"] = maintenant
+    trouvees = {}
+    for table, colonne in colonnes_base:
+        trouvees.setdefault(table, set()).add(colonne)
+    ecarts = []
+    for table in TABLES:
+        if table not in trouvees:
+            ecarts.append("%s : table absente (la créer avec 3 - Documentation/tables-nord.sql)" % table)
+            continue
+        ecarts += ["%s.%s : colonne absente" % (table, c) for c in COLONNES[table] if c not in trouvees[table]]
+    return ecarts
+
+
+def lire_ecarts(curseur: object) -> list:
+    """Lit les colonnes des trois tables dans ``information_schema`` (SELECT uniquement).
+
+    :param curseur: Curseur DB-API.
+    :return: Écarts (:func:`ecarts_schema`).
+    """
+    curseur.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN %s",
+                    (tuple(TABLES),))
+    return ecarts_schema([(ligne[0], ligne[1]) for ligne in curseur.fetchall()])
 
 
 def deconnecter(archive: dict) -> None:
@@ -345,13 +384,20 @@ def reprendre(archive: dict) -> set:
     :param archive: Archive connectée.
     :return: Identifiants des commandes déjà archivées.
     """
+    debut = time.monotonic()
     curseur = archive["connexion"].cursor()
-    curseur.execute('UPDATE "ARCHIVAGE_COMMANDE_NORTH" SET "STATUT" = \'EXPIREE\', "JUSTI_REFUS" = %s '
+    curseur.execute('UPDATE "LOG_NORTH_ARCHIVAGE_COMMANDE" SET "STATUT" = \'EXPIREE\', "JUSTI_REFUS" = %s '
                     'WHERE "STATUT" = \'ACCEPTEE\'', (JUSTI_REDEMARRAGE,))
-    curseur.execute('UPDATE "TRAJET_NORTH" SET "STATUT" = \'ANNULE\' WHERE "STATUT" = \'EN_CONSTITUTION\'')
-    curseur.execute('SELECT "ID_COMMANDE" FROM "ARCHIVAGE_COMMANDE_NORTH"')
+    expirees = curseur.rowcount
+    curseur.execute('UPDATE "LOG_NORTH_TRAJET" SET "STATUT" = \'ANNULE\' WHERE "STATUT" = \'EN_CONSTITUTION\'')
+    annules = curseur.rowcount
+    curseur.execute('SELECT "ID_COMMANDE" FROM "LOG_NORTH_ARCHIVAGE_COMMANDE"')
     ids = {ligne[0] for ligne in curseur.fetchall()}
     archive["connexion"].commit()
+    journalisation.evenement_sql("REPRISE", "LOG_NORTH_ARCHIVAGE_COMMANDE", expirees, journalisation.duree_ms(debut))
+    if expirees or annules:
+        JOURNAL.warning("reprise : %d commande(s) acceptée(s) par le lancement précédent passées EXPIREE, "
+                        "%d trajet(s) en constitution passés ANNULE", expirees, annules)
     archive["proteges"] |= ids
     archive["repris"] = True
     return ids
@@ -378,8 +424,11 @@ def ecrire_ligne_a_ligne(archive: dict, lignes: dict, maintenant: datetime.datet
             except archive["erreurs_ligne"] as erreur:
                 connexion.rollback()
                 archive["rejetees"][(table, ligne[0])] = ligne
-                print("[%s] ! archivage : ligne %s de %s rejetée : %s"
-                      % (maintenant.strftime("%H:%M:%S"), ligne[0], table, str(erreur).strip()), flush=True)
+                archive["sante"]["rejetees"] += 1
+                journalisation.evenement_sql("UPSERT", table, 0, erreur="ligne %s rejetée : %s"
+                                             % (ligne[0], journalisation.texte_erreur(erreur)))
+                robustesse.signaler(archive["messages"], "ligne", maintenant, "archivage : ligne %s de %s rejetée : %s"
+                                    % (ligne[0], table, journalisation.texte_erreur(erreur)), logging.ERROR, "archivage")
                 continue
             archive["cache"][table][ligne[0]] = ligne
             ecrites += 1
@@ -387,7 +436,7 @@ def ecrire_ligne_a_ligne(archive: dict, lignes: dict, maintenant: datetime.datet
 
 
 def synchroniser(archive: dict, etat: dict, ref: dict, couts: dict, maintenant: datetime.datetime) -> int:
-    """Écrit dans les tables ``*_NORTH`` ce qui a changé depuis la dernière fois.
+    """Écrit dans les tables ``LOG_NORTH_*`` ce qui a changé depuis la dernière fois.
 
     Se connecte si besoin ; à la première connexion, appelle :func:`reprendre`
     et ajoute les commandes protégées à ``etat["deja_archivees"]``. Si la base
@@ -403,36 +452,63 @@ def synchroniser(archive: dict, etat: dict, ref: dict, couts: dict, maintenant: 
     :param maintenant: Heure réelle (ou simulée) courante.
     :return: Nombre de lignes écrites (0 si rien n'a changé ou si la base est indisponible).
     """
+    etape, nb_lignes = "connexion", 0
     try:
         if archive["connexion"] is None:
+            debut = time.monotonic()
             archive["connexion"] = archive["connecter"]()
+            journalisation.evenement_sql("CONNEXION", "-", 0, journalisation.duree_ms(debut), niveau=logging.DEBUG)
+        if not archive["verifie"]:
+            etape = "vérification des tables"
+            ecarts = lire_ecarts(archive["connexion"].cursor())
+            archive["connexion"].rollback()  # fin de la transaction de lecture
+            if ecarts:
+                raise RuntimeError("tables LOG_NORTH_* non conformes : " + " ; ".join(ecarts))
+            archive["verifie"] = True
         if not archive["repris"]:
+            etape = "reprise"
             ids = reprendre(archive)
             etat.setdefault("deja_archivees", set()).update(ids)
-            print("Archivage : %d commande(s) déjà en base, laissées telles quelles" % len(ids), flush=True)
+            JOURNAL.info("archivage : %d commande(s) déjà en base, laissées telles quelles", len(ids))
+        etape = "calcul des lignes"
         lignes = lignes_modifiees(archive, etat, ref, couts, maintenant)
-        if not any(lignes.values()):
+        nb_lignes = sum(len(l) for l in lignes.values())
+        if not nb_lignes:
+            robustesse.noter_succes_bdd(archive["sante"], maintenant, 0, "archivage")
             return 0
+        etape = "écriture"
         curseur = archive["connexion"].cursor()
         try:
             for table in TABLES:
                 if lignes[table]:
+                    debut = time.monotonic()
                     curseur.executemany(requete_upsert(table), lignes[table])
+                    journalisation.evenement_sql("UPSERT", table, len(lignes[table]), journalisation.duree_ms(debut))
             archive["connexion"].commit()
-        except archive["erreurs_ligne"]:
+        except archive["erreurs_ligne"] as erreur:
             archive["connexion"].rollback()
+            journalisation.evenement_sql("UPSERT", "lot", nb_lignes, erreur=erreur, niveau=logging.WARNING)
+            JOURNAL.warning("archivage : lot de %d ligne(s) refusé (%s), reprise ligne à ligne",
+                            nb_lignes, journalisation.texte_erreur(erreur))
             ecrites = ecrire_ligne_a_ligne(archive, lignes, maintenant)
             archive["ecrites"] += ecrites
+            robustesse.noter_succes_bdd(archive["sante"], maintenant, ecrites, "archivage")
             return ecrites
-    except Exception as erreur:  # base injoignable, table absente… : le moteur ne doit pas s'arrêter
-        signaler(archive, maintenant, "%s (nouvel essai au prochain tick)" % str(erreur).strip())
+    except Exception as erreur:  # R-ROB-02 / R-ROB-06 : base injoignable, table absente… : le moteur continue, mais le dit
+        robustesse.noter_echec_bdd(archive["sante"], maintenant, erreur, nb_lignes)
+        journalisation.evenement_sql(etape.upper(), ",".join(TABLES), nb_lignes, erreur=erreur)
+        robustesse.signaler(archive["messages"], "base", maintenant,
+                            "archivage EN ÉCHEC (%s, %d échec(s) consécutif(s) depuis %s) : %s ; %d ligne(s) en attente, "
+                            "nouvel essai au prochain tick" % (etape, archive["sante"]["echecs"], archive["sante"]["depuis"],
+                                                               journalisation.texte_erreur(erreur), nb_lignes),
+                            logging.ERROR, "archivage")
         deconnecter(archive)
         return 0
     for table in TABLES:
         archive["cache"][table].update((ligne[0], ligne) for ligne in lignes[table])
-    ecrites = sum(len(l) for l in lignes.values())
-    archive["ecrites"] += ecrites
-    return ecrites
+    archive["ecrites"] += nb_lignes
+    robustesse.noter_succes_bdd(archive["sante"], maintenant, nb_lignes, "archivage")
+    return nb_lignes
 
 
 def fermer(archive: dict) -> None:
@@ -441,6 +517,21 @@ def fermer(archive: dict) -> None:
     :param archive: Archive.
     """
     deconnecter(archive)
+
+
+def verifier_tables(parametres: dict = None) -> list:
+    """Vérifie que les trois tables existent avec leurs colonnes (SELECT uniquement).
+
+    :param parametres: Paramètres de connexion (défaut : :data:`referentiels.BDD`).
+    :return: Écarts (:func:`ecarts_schema`).
+    """
+    import psycopg2  # disponible sur la VM uniquement
+
+    connexion = psycopg2.connect(**(parametres or referentiels.BDD))
+    try:
+        return lire_ecarts(connexion.cursor())
+    finally:
+        connexion.close()
 
 
 def afficher_etat(parametres: dict = None) -> None:
@@ -453,13 +544,13 @@ def afficher_etat(parametres: dict = None) -> None:
     connexion = psycopg2.connect(**(parametres or referentiels.BDD))
     try:
         curseur = connexion.cursor()
-        curseur.execute('SELECT "DISPO", COUNT(*) FROM "CAMION_NORTH" GROUP BY "DISPO" ORDER BY 1')
-        print("CAMION_NORTH : " + ", ".join("%s %d" % ("disponibles" if d else "occupés", n) for d, n in curseur.fetchall()))
-        for table in ("TRAJET_NORTH", "ARCHIVAGE_COMMANDE_NORTH"):
+        curseur.execute('SELECT "DISPO", COUNT(*) FROM "LOG_NORTH_CAMION" GROUP BY "DISPO" ORDER BY 1')
+        print("LOG_NORTH_CAMION : " + ", ".join("%s %d" % ("disponibles" if d else "occupés", n) for d, n in curseur.fetchall()))
+        for table in ("LOG_NORTH_TRAJET", "LOG_NORTH_ARCHIVAGE_COMMANDE"):
             curseur.execute('SELECT "STATUT", COUNT(*) FROM "%s" GROUP BY "STATUT" ORDER BY 1' % table)
             print("%s : %s" % (table, ", ".join("%s %d" % ligne for ligne in curseur.fetchall()) or "vide"))
-        curseur.execute('SELECT COUNT(*), COUNT("COUT_PREST"), AVG("TAUX_REMPL") FROM "ARCHIVAGE_COMMANDE_NORTH" a '
-                        'LEFT JOIN "TRAJET_NORTH" t ON a."ID_TRAJET" = t."ID_TRAJET" WHERE a."STATUT" = \'PARTIE\'')
+        curseur.execute('SELECT COUNT(*), COUNT("COUT_PREST"), AVG("TAUX_REMPL") FROM "LOG_NORTH_ARCHIVAGE_COMMANDE" a '
+                        'LEFT JOIN "LOG_NORTH_TRAJET" t ON a."ID_TRAJET" = t."ID_TRAJET" WHERE a."STATUT" = \'PARTIE\'')
         parties, avec_prix, remplissage = curseur.fetchone()
         print("Commandes parties : %d, dont %d avec prix ; remplissage moyen de leur trajet : %s %%"
               % (parties, avec_prix, "%.1f" % remplissage if remplissage is not None else "-"))
@@ -467,10 +558,136 @@ def afficher_etat(parametres: dict = None) -> None:
         connexion.close()
 
 
+# ---------------------------------------------------------------- Remise à zéro (hors moteur)
+
+def moteur_en_marche(repertoire_run: str = None):
+    """PID du moteur s'il tourne d'après son fichier PID (``nord.sh``), ``None`` sinon.
+
+    :param repertoire_run: Dossier des fichiers PID (défaut : :data:`journalisation.REPERTOIRE_RUN`).
+    :return: PID du moteur en marche, ou ``None``.
+    :rtype: int or None
+    """
+    chemin = os.path.join(repertoire_run or journalisation.REPERTOIRE_RUN, "moteur.pid")
+    try:
+        with open(chemin, encoding="utf-8") as fichier:
+            pid = int(fichier.read().strip())
+        os.kill(pid, 0)  # signal 0 : teste seulement l'existence du processus
+    except (OSError, ValueError):  # pas de fichier, contenu illisible ou processus disparu
+        return None
+    return pid
+
+
+def sauvegarder_tables(curseur: object, chemin: str) -> dict:
+    """Copie le contenu des trois tables dans un fichier JSON (SELECT uniquement).
+
+    :param curseur: Curseur DB-API.
+    :param chemin: Fichier JSON à écrire (le dossier est créé si besoin).
+    :return: Nombre de lignes sauvegardées par table.
+    """
+    contenu, comptes = {}, {}
+    for table in TABLES:
+        curseur.execute('SELECT %s FROM "%s"' % (", ".join('"%s"' % c for c in COLONNES[table]), table))
+        lignes = curseur.fetchall()
+        contenu[table] = [dict(zip(COLONNES[table], ligne)) for ligne in lignes]
+        comptes[table] = len(lignes)
+    os.makedirs(os.path.dirname(os.path.abspath(chemin)), exist_ok=True)
+    with open(chemin, "w", encoding="utf-8") as fichier:
+        json.dump(contenu, fichier, ensure_ascii=False, indent=1, default=str)  # dates en texte ISO
+    return comptes
+
+
+def reinitialiser(connexion: object, chemin_sauvegarde: str = None) -> dict:
+    """Vide les trois tables ``LOG_NORTH_*``, après en avoir fait une sauvegarde JSON.
+
+    Ne touche qu'aux :data:`TABLES` (les nôtres) ; aucune table fournie ni table
+    du Contrôle n'est modifiée. Les ``DELETE`` partent des commandes vers les
+    camions (ordre inverse des clés étrangères) dans une seule transaction :
+    en cas d'erreur, rien n'est supprimé. ``TRUNCATE … CASCADE`` n'est pas
+    utilisé, car il viderait aussi toute autre table qui référencerait les nôtres.
+    Sans sauvegarde réussie, rien n'est supprimé.
+
+    :param connexion: Connexion DB-API ouverte.
+    :param chemin_sauvegarde: Fichier JSON de sauvegarde ; ``None`` pour ne pas sauvegarder.
+    :return: Nombre de lignes supprimées par table.
+    :raises Exception: toute erreur de la base ou d'écriture de la sauvegarde (transaction annulée).
+    """
+    curseur, supprimees = connexion.cursor(), {}
+    try:
+        if chemin_sauvegarde:
+            sauvegarder_tables(curseur, chemin_sauvegarde)
+        for table in reversed(TABLES):
+            debut = time.monotonic()
+            curseur.execute('DELETE FROM "%s"' % table)
+            supprimees[table] = curseur.rowcount
+            journalisation.evenement_sql("DELETE", table, curseur.rowcount, journalisation.duree_ms(debut))
+        connexion.commit()
+    except Exception as erreur:
+        connexion.rollback()
+        journalisation.evenement_sql("DELETE", ", ".join(TABLES), 0, erreur=erreur)
+        raise
+    JOURNAL.warning("tables LOG_NORTH_* vidées : %s", ", ".join("%s %d" % t for t in supprimees.items()))
+    return supprimees
+
+
+def lancer_reinitialisation(confirme: bool, sauvegarde: bool = True, parametres: dict = None) -> int:
+    """Remise à zéro en ligne de commande : vérifications, confirmation, sauvegarde puis suppression.
+
+    Refuse si le moteur tourne : il garde en mémoire ce qu'il a déjà écrit et
+    ne réécrirait que les lignes modifiées ensuite (tables incohérentes).
+
+    :param confirme: ``True`` pour ne pas demander de taper ``OUI``.
+    :param sauvegarde: ``False`` pour ne pas écrire de sauvegarde JSON.
+    :param parametres: Paramètres de connexion (défaut : :data:`referentiels.BDD`).
+    :return: Code de sortie (0 si les tables ont été vidées).
+    """
+    import psycopg2  # disponible sur la VM uniquement
+
+    pid = moteur_en_marche()
+    if pid is not None:
+        print("Refusé : le moteur tourne (PID %d). L'arrêter d'abord : sh nord.sh arreter" % pid)
+        return 1
+    connexion = psycopg2.connect(**(parametres or referentiels.BDD))
+    try:
+        curseur = connexion.cursor()
+        for table in TABLES:
+            curseur.execute('SELECT COUNT(*) FROM "%s"' % table)
+            print("  %-30s %d ligne(s)" % (table, curseur.fetchone()[0]))
+        connexion.rollback()  # fin de la transaction de lecture
+        if not confirme and input("Supprimer toutes ces lignes ? Taper OUI : ").strip() != "OUI":
+            print("Annulé, rien n'a été supprimé.")
+            return 1
+        chemin = None
+        if sauvegarde:
+            chemin = os.path.join(DOSSIER_SAUVEGARDES,
+                                  datetime.datetime.now().strftime("log_north_%Y%m%d-%H%M%S.json"))
+        supprimees = reinitialiser(connexion, chemin)
+    finally:
+        connexion.close()
+    print("Tables vidées : " + ", ".join("%s %d" % t for t in supprimees.items()))
+    if chemin:
+        print("Sauvegarde : " + os.path.abspath(chemin))
+    return 0
+
+
 if __name__ == "__main__":
-    parseur = argparse.ArgumentParser(description="Tables *_NORTH : état de l'archivage du moteur NORTH")
+    parseur = argparse.ArgumentParser(description="Tables LOG_NORTH_* : état de l'archivage du moteur NORTH")
     parseur.add_argument("--etat", action="store_true", help="nombre de lignes par statut (lecture seule)")
+    parseur.add_argument("--verifier", action="store_true",
+                         help="vérifie que les trois tables existent avec leurs colonnes (code de sortie 1 sinon)")
+    parseur.add_argument("--reinitialiser", action="store_true",
+                         help="vide les trois tables LOG_NORTH_* (moteur arrêté ; sauvegarde JSON dans ../donnees/sauvegardes/)")
+    parseur.add_argument("--oui", action="store_true", help="avec --reinitialiser : ne pas demander de confirmation")
+    parseur.add_argument("--sans-sauvegarde", action="store_true", help="avec --reinitialiser : pas de sauvegarde JSON")
     options = parseur.parse_args()
+    if options.reinitialiser:
+        journalisation.configurer("archivage", False, sql=True)  # moteur arrêté : seul écrivain de sql.jsonl
+        sys.exit(lancer_reinitialisation(options.oui, not options.sans_sauvegarde))
+    if options.verifier:
+        ecarts_trouves = verifier_tables()
+        for ecart in ecarts_trouves:
+            print("! " + ecart)
+        print("Tables LOG_NORTH_* conformes" if not ecarts_trouves else "%d écart(s)" % len(ecarts_trouves))
+        sys.exit(1 if ecarts_trouves else 0)
     if options.etat:
         afficher_etat()
     else:

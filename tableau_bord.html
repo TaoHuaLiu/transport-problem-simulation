@@ -88,6 +88,20 @@
   .defile { max-height: 340px; overflow: auto; }
   .alerte { grid-column: span 12; padding: 12px var(--space-3); border-radius: var(--radius-md); border: 2px solid var(--critical);
             color: var(--text); background: var(--surface); font-weight: 700; display: none; }
+  /* Santé de la chaîne (R-ROB-06) : une tuile par service et par lien avec la base */
+  .sante { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+  .sante > div { border: 1px solid var(--border); border-left: 6px solid var(--flat-sand); border-radius: var(--radius-sm); padding: 8px 12px; }
+  .sante > div.ok { border-left-color: var(--ensibs-green); } .sante > div.ko { border-left-color: var(--critical); }
+  .sante > div.att { border-left-color: var(--warning); }
+  .sante b { display: block; font: 700 14px/1.3 var(--font-display); }
+  .sante span { display: block; font-size: 12px; color: var(--text-muted); }
+  .sante .err { color: var(--critical); word-break: break-word; }
+  .alertes-sante { margin: 0 0 12px; padding: 0; list-style: none; }
+  .alertes-sante li { padding: 6px 10px; margin-bottom: 6px; border-radius: var(--radius-sm); font-weight: 700; }
+  .alertes-sante li.critique { border: 2px solid var(--critical); } .alertes-sante li.attention { border: 2px solid var(--warning); }
+  tr.erreur td { color: var(--critical); }
+  .debug { grid-column: span 12; border: 2px dashed var(--ubs-navy); display: none; }
+  .debug pre { font: 11px/1.4 ui-monospace, "DejaVu Sans Mono", Menlo, monospace; white-space: pre-wrap; margin: 0; }
   /* Pied de page : le « blanc tournant » de la charte, coin supérieur droit arrondi */
   footer { margin: 0 var(--space-5) var(--space-5); padding: var(--space-3) var(--space-4); background: var(--surface);
            border-top-right-radius: var(--radius-tournant); color: var(--text-muted); font-size: 12px;
@@ -130,6 +144,13 @@
 
 <main>
   <div class="alerte" id="alerte"></div>
+
+  <section class="carte k12" id="c-sante">
+    <h2>Santé de la chaîne</h2>
+    <p class="sous" id="s-sante">collecteur, moteur, lecture du référentiel, écritures en base (LOG_NORTH_*, TRACABILITE_*)</p>
+    <ul class="alertes-sante" id="alertes-sante"></ul>
+    <div class="sante" id="sante"></div>
+  </section>
 
   <section class="carte tuile k3">
     <h2>Taux d’acceptation (TA)</h2>
@@ -208,6 +229,24 @@
     <p class="sous" id="s-journal">tronçons masqués</p>
     <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Événement</th><th>Demande</th><th>Tournée</th><th>Camion</th>
       <th>De</th><th>Vers</th><th class="d">Remplissage</th><th>Gamme</th><th>Motif</th></tr></thead><tbody id="t-evenements"></tbody></table></div>
+  </section>
+
+  <section class="carte k12">
+    <h2>Journal SQL</h2>
+    <p class="sous" id="s-sql">opérations du moteur sur la base : connexion, lecture du référentiel, écritures, lignes rejetées</p>
+    <label><input type="checkbox" id="sql-erreurs"> erreurs seulement</label>
+    <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Opération</th><th>Table</th><th class="d">Lignes</th>
+      <th class="d">Durée</th><th>Erreur</th></tr></thead><tbody id="t-sql"></tbody></table></div>
+  </section>
+
+  <section class="carte debug" id="c-debug">
+    <h2>Débogage</h2>
+    <p class="sous" id="s-debug">tableau de bord lancé avec --debug</p>
+    <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Niveau</th><th>Service</th><th>Message</th></tr></thead><tbody id="t-problemes"></tbody></table></div>
+    <h2 style="margin-top:12px">Dernières requêtes HTTP</h2>
+    <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Client</th><th>Requête</th><th>Statut</th><th class="d">Durée</th></tr></thead><tbody id="t-requetes"></tbody></table></div>
+    <h2 style="margin-top:12px">Santé brute</h2>
+    <pre id="debug-brut"></pre>
   </section>
 </main>
 <footer id="pied">
@@ -426,8 +465,86 @@ function rafraichir() {
   x.onerror = x.ontimeout = function () { pastille("p-maj", "ko", "serveur injoignable"); };
   x.send();
 }
+// ---------------------------------------------------------------- Santé, journal SQL, débogage (R-ROB-06)
+function lire(url, suite) {
+  var x = new XMLHttpRequest();
+  x.open("GET", url);
+  x.timeout = 10000;
+  x.onload = function () { if (x.status === 200) suite(JSON.parse(x.responseText)); };
+  x.send();
+}
+function depuis(texte, maintenant) {
+  var s = age(texte, maintenant);
+  if (s === null) return "jamais";
+  return s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : Math.round(s / 3600) + " h";
+}
+function tuileBdd(nom, b, maintenant) {
+  if (!b || !b.actif) return "<div><b>" + esc(nom) + "</b><span>non utilisé dans ce lancement</span></div>";
+  var etat = b.echecs ? "ko" : b.rejetees ? "att" : "ok";
+  var h = "<div class='" + etat + "'><b>" + esc(nom) + " · " + (b.echecs ? "EN ÉCHEC" : "OK") + "</b>" +
+    "<span>dernier succès il y a " + depuis(b.dernier_succes, maintenant) + "</span>" +
+    "<span>" + nb(b.ecrites) + " ligne(s) écrite(s) · " + nb(b.en_attente) + " en attente · " + nb(b.rejetees) + " rejetée(s)</span>";
+  if (b.echecs) h += "<span class=err>" + nb(b.echecs) + " échec(s) depuis " + esc(b.depuis) + " : " + esc(b.derniere_erreur) + "</span>";
+  return h + "</div>";
+}
+function afficherSante(r) {
+  var m = r.services.moteur, c = r.services.collecteur, t = r.maintenant, h = [];
+  document.getElementById("alertes-sante").innerHTML = r.alertes.map(function (a) {
+    return "<li class='" + a.niveau + "'>" + (a.niveau === "critique" ? "✗ " : "! ") + esc(a.service) + " : " + esc(a.texte) + "</li>";
+  }).join("");
+  if (c) h.push("<div class='" + (c.statut === "en marche" && c.age_s <= 30 ? "ok" : "ko") + "'><b>Collecteur · " + esc(c.statut) + "</b>" +
+    "<span>dernier message ERP il y a " + depuis(c.dernier_message, t) + "</span><span>" + nb(c.messages_recus) + " message(s), " +
+    nb(c.demandes_nouvelles) + " demande(s), " + nb(c.messages_illisibles) + " illisible(s), " + nb(c.incidents) + " incident(s)</span></div>");
+  else h.push("<div><b>Collecteur</b><span>pas de fichier de santé</span></div>");
+  if (m) {
+    h.push("<div class='" + (m.statut === "en marche" && m.age_s <= 30 ? (m.duree_tick_s > m.tick_s ? "att" : "ok") : "ko") + "'><b>Moteur · " + esc(m.statut) +
+      (m.mode === "audit" ? " (audit)" : "") + (m.debug ? " · débogage" : "") + "</b><span>dernier tick il y a " + depuis(m.dernier_tick, t) +
+      " · " + nb(m.duree_tick_s * 1000) + " ms (max " + nb(m.duree_max_s * 1000) + ")</span><span>" + nb(m.demandes_lues) + " demande(s) lue(s) · " +
+      nb(m.tournees_ouvertes) + " tournée(s) ouverte(s) · " + nb(m.incidents) + " incident(s)</span></div>");
+    h.push(tuileBdd("Référentiel (lecture)", m.referentiel, t));
+    h.push(tuileBdd("LOG_NORTH_* (archivage)", m.archivage, t));
+    h.push(tuileBdd("TRACABILITE_* (Contrôle)", m.controle, t));
+  } else h.push("<div><b>Moteur</b><span>pas de fichier de santé</span></div>");
+  document.getElementById("sante").innerHTML = h.join("");
+  var critiques = r.alertes.filter(function (a) { return a.niveau === "critique"; }).length;
+  document.getElementById("s-sante").textContent = critiques ? critiques + " alerte(s) critique(s)" : r.alertes.length ? r.alertes.length + " point(s) à surveiller" : "tout fonctionne";
+  var debugDemande = /[?&]debug=1/.test(location.search);
+  var panneau = document.getElementById("c-debug");
+  panneau.style.display = r.debug || debugDemande ? "block" : "none";
+  if (r.debug) {
+    document.getElementById("debug-brut").textContent = JSON.stringify(r.services, null, 1);
+    lire("/api/debug", afficherDebug);
+  } else if (debugDemande) {
+    document.getElementById("s-debug").textContent = "le serveur n’a pas été lancé avec --debug : panneau indisponible";
+  }
+}
+function afficherDebug(d) {
+  document.getElementById("s-debug").textContent = "PID " + d.pid + " · Python " + d.python + " · " + d.machine + " · démarré " + d.debut;
+  document.getElementById("t-problemes").innerHTML = d.problemes.map(function (l) {
+    return "<tr class='" + (l.niveau === "WARNING" ? "" : "erreur") + "'><td>" + esc(l.h) + "</td><td>" + esc(l.niveau) + "</td><td>" + esc(l.service) +
+      "</td><td>" + esc(l.message) + (l.trace ? "<pre>" + esc(l.trace) + "</pre>" : "") + "</td></tr>";
+  }).join("") || "<tr><td colspan=4>aucun avertissement ni erreur</td></tr>";
+  document.getElementById("t-requetes").innerHTML = d.requetes.map(function (q) {
+    return "<tr><td>" + esc(q.h) + "</td><td>" + esc(q.client) + "</td><td class=ids>" + esc(q.requete) + "</td><td>" + esc(q.statut) + "</td><td class=d>" + nb(q.duree_ms) + " ms</td></tr>";
+  }).join("");
+}
+function afficherSql(r) {
+  document.getElementById("s-sql").textContent = (r.erreurs ? r.erreurs + " erreur(s)" : "aucune erreur") + " dans les derniers événements · " + r.fichier;
+  document.getElementById("t-sql").innerHTML = r.evenements.map(function (e) {
+    return "<tr class='" + (e.statut === "erreur" ? "erreur" : "") + "'><td>" + esc((e.h || "").slice(11, 23)) + "</td><td>" + esc(e.operation) + "</td><td>" + esc(e.table) +
+      "</td><td class=d>" + nb(e.lignes) + "</td><td class=d>" + (e.duree_ms === null || e.duree_ms === undefined ? "" : nb(e.duree_ms) + " ms") + "</td><td>" + esc(e.erreur) + "</td></tr>";
+  }).join("") || "<tr><td colspan=6>aucun événement SQL (moteur sans base, ou pas encore lancé)</td></tr>";
+}
+function rafraichirSante() {
+  lire("/api/sante", afficherSante);
+  lire("/api/sql?n=100" + (document.getElementById("sql-erreurs").checked ? "&erreurs=1" : ""), afficherSql);
+}
+document.getElementById("sql-erreurs").addEventListener("change", rafraichirSante);
+
 rafraichir();
+rafraichirSante();
 setInterval(rafraichir, PERIODE_MS);
+setInterval(rafraichirSante, PERIODE_MS);
 </script>
 </body>
 </html>

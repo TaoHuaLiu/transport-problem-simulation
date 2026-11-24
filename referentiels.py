@@ -26,11 +26,14 @@ Utilisation :
 import argparse
 import datetime
 import json
+import logging
 import math
 import os
+import time
 import unicodedata
 
 import hypotheses
+import journalisation
 
 #: Paramètres de connexion à la base du projet. Les délais sont bornés (règle R-ROB-02) :
 #: sans ``connect_timeout``, un serveur muet bloque ``psycopg2.connect`` environ 2 min
@@ -178,9 +181,12 @@ def lire_table(curseur, table: str) -> list:
     :param table: Nom de la table, sans guillemets.
     :return: Liste de dictionnaires ``{colonne: valeur}``.
     """
+    debut = time.monotonic()
     curseur.execute('SELECT * FROM "%s"' % table)
     colonnes = [description[0] for description in curseur.description]
-    return [dict(zip(colonnes, ligne)) for ligne in curseur.fetchall()]
+    lignes = [dict(zip(colonnes, ligne)) for ligne in curseur.fetchall()]
+    journalisation.evenement_sql("LECTURE", table, len(lignes), journalisation.duree_ms(debut), niveau=logging.DEBUG)
+    return lignes
 
 
 def charger_depuis_bdd(parametres: dict = None) -> dict:
@@ -195,7 +201,13 @@ def charger_depuis_bdd(parametres: dict = None) -> dict:
     """
     import psycopg2  # disponible sur la VM uniquement
 
-    connexion = psycopg2.connect(**(parametres or BDD))
+    debut = time.monotonic()
+    try:
+        connexion = psycopg2.connect(**(parametres or BDD))
+    except Exception as erreur:
+        journalisation.evenement_sql("CONNEXION", "referentiel", 0, journalisation.duree_ms(debut), erreur,
+                                     niveau=logging.WARNING)
+        raise
     try:
         curseur = connexion.cursor()
         ref = {"lieux": {}, "affectations": [], "capacite": {}, "consommation": {}, "trajets": {}, "ports": {}}
@@ -214,8 +226,13 @@ def charger_depuis_bdd(parametres: dict = None) -> dict:
                     ref["trajets"][(min(a, int(colonne)), max(a, int(colonne)))] = float(valeur)
         for ligne in lire_table(curseur, "PORTS_AVAILABILITY"):
             ref["ports"][ligne["FK_LOCATIONS"]] = [ligne["AVAILABILITY_T0"], ligne["AVAILABILITY_T+4"], ligne["AVAILABILITY_T+8"]]
+    except Exception as erreur:
+        journalisation.evenement_sql("LECTURE", "referentiel", 0, journalisation.duree_ms(debut), erreur,
+                                     niveau=logging.WARNING)
+        raise
     finally:
         connexion.close()
+    journalisation.evenement_sql("LECTURE", "referentiel", len(ref["trajets"]), journalisation.duree_ms(debut))
     ref["source"] = "bdd"
     ref["lu_a"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     construire_index(ref)

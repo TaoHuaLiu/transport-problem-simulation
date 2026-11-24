@@ -11,7 +11,7 @@ Chaque décision et chaque mouvement est écrit dans un journal CSV local
 Les demandes hors périmètre NORTH ne sont pas journalisées : elles restent
 seulement dans l'état du moteur (``etat = "IGNOREE"``).
 
-Ce journal est la source de référence. Les tables ``*_NORTH`` de la base
+Ce journal est la source de référence. Les tables ``LOG_NORTH_*`` de la base
 (camions, trajets, commandes) en sont le reflet, écrit par :mod:`archivage`.
 L'écriture dans la table traçabilité partagée attend son schéma, fixé par le
 Contrôle (question A1).

@@ -113,6 +113,18 @@ class TestDACC(unittest.TestCase):
         self.assertEqual(self.decider(demande), "refuser")
         self.assertEqual(demande["motif"], "REF-DONNEES")
 
+    def test_ligne_2b_echeance_depassee(self) -> None:
+        """D-ACC ligne 2b (R-VAL-02) : données valides, H_DEP déjà passée à la lecture → REF-EXPIREE, pas REF-DONNEES."""
+        demande = demande_test(self.ref, h_dep_h=-1.0)
+        self.assertEqual(self.decider(demande), "refuser")
+        self.assertEqual(demande["motif"], "REF-EXPIREE")
+
+    def test_ligne_2_prime_sur_2b(self) -> None:
+        """D-ACC lignes 2 puis 2b : données invalides et H_DEP passée → REF-DONNEES (première ligne qui correspond)."""
+        demande = demande_test(self.ref, loc_arr="Atlantis", h_dep_h=-1.0)
+        self.decider(demande)
+        self.assertEqual(demande["motif"], "REF-DONNEES")
+
     def test_ligne_3_spec_impossible(self) -> None:
         """D-ACC ligne 3 (R-SPEC-01), SPEC bloquante : aucune couleur Violet dans la flotte → REF-SPEC."""
         ancien, hypotheses.SPEC_BLOQUANTE = hypotheses.SPEC_BLOQUANTE, True

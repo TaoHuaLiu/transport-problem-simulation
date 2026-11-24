@@ -121,14 +121,18 @@ SOUS_SEUIL = "partir"
 TICK_S = 5
 
 # ---------------------------------------------------------------- Tables de traçabilité du Contrôle (A1)
-#: A1 : identifiant de notre structure dans ``TRACABILITE_COMMANDE.ID_ENTRE`` (varchar(20)).
-#: Toutes nos écritures dans cette table sont limitées à ce code : à confirmer avec le Contrôle.
-ID_ENTREPRISE = "NORTH-EU"
+#: Spécification du Contrôle : ``TRACABILITE_COMMANDE.ID_ENTRE`` vaut ``Xx``, X = première lettre
+#: de la zone (N, S, E, O), x = numéro de la commande dans l'entreprise (1, 2, 3…). Notre lettre :
+PREFIXE_ENTREPRISE = "N"
+
+#: Motif (expression régulière PostgreSQL et Python) de nos ``ID_ENTRE`` : toutes nos mises à jour
+#: et lectures dans ``TRACABILITE_COMMANDE`` sont limitées aux lignes qui le respectent.
+MOTIF_ID_ENTRE = "^" + PREFIXE_ENTREPRISE + "[0-9]+$"
 
 #: A1 : ``TRACABILITE_TRAJET.TYPE_CAMI`` selon que la remorque est réfrigérée (varchar(20)).
 TYPES_CAMION = {True: "FRIGORIFIQUE", False: "SEC"}
 
-#: A1 : ``TRACABILITE_TRAJET.TAUX_REMPLI`` en pour cent (0-100, comme ``TRAJET_NORTH.TAUX_REMPL``) ;
+#: A1 : ``TRACABILITE_TRAJET.TAUX_REMPLI`` en pour cent (0-100, comme ``LOG_NORTH_TRAJET.TAUX_REMPL``) ;
 #: ``False`` : en fraction (0-1).
 TAUX_REMPLI_EN_POURCENT = True
 

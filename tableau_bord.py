@@ -7,7 +7,16 @@ collecteur (:mod:`audit`) et sert :
 - ``/api/kpi?debut=AAAA-MM-JJTHH:MM&duree=120`` : les indicateurs en JSON ;
 - ``/api/rapport.json`` : le même rapport, à télécharger (pièce pour l'audit) ;
 - ``/api/statuts.csv`` : statut final de chaque demande NORTH ;
+- ``/api/sante`` : santé de la chaîne (fichiers ``../donnees/run/sante_*.json``) et alertes
+  (moteur muet, écriture en base en échec, ERP muet…), règle R-ROB-06 ;
+- ``/api/sql?n=100&erreurs=1`` : derniers événements du journal SQL du moteur (``../donnees/logs/sql.jsonl``) ;
+- ``/api/debug`` (seulement avec ``--debug``) : configuration, temps de réponse des dernières
+  requêtes, derniers avertissements et erreurs de tous les services ;
 - ``/chart.js`` : Chart.js 2.5 (copie locale, la VM n'a pas internet).
+
+Mode débogage (``--debug``) : chaque requête HTTP est journalisée avec sa durée,
+et la page affiche un panneau de débogage. Sans ``--debug``, ``/api/debug`` répond 404 :
+les journaux des services ne sont pas exposés sur le VLAN.
 
 Les valeurs tirées de l'Annexe 2 (seuil de rentabilité, coût horaire) ne sont envoyées
 qu'avec ``--confidentiel`` : sans cette option, la page peut être montrée au
@@ -28,12 +37,17 @@ import argparse
 import datetime
 import json
 import os
+import platform
 import socket
+import time
 import urllib.parse
 
 import audit
 import hypotheses
+import journalisation
 import robustesse
+
+JOURNAL = journalisation.journal("tableau")
 
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,6 +60,15 @@ FICHIERS_CHARTJS = [os.path.join(DOSSIER, "static", "Chart_min.js"),
 
 #: Au-delà de cette ancienneté (secondes réelles) du journal, on le considère figé (rejeu terminé).
 JOURNAL_FIGE_S = 120
+
+#: Au-delà de cette ancienneté (secondes réelles), un fichier de santé signale un service muet ou arrêté.
+SANTE_MUETTE_S = 30
+
+#: Au-delà de cette durée (secondes réelles) sans message de l'ERP, le collecteur est signalé.
+ERP_MUET_S = 120
+
+#: Nombre de requêtes HTTP gardées pour le panneau de débogage.
+NB_REQUETES_GARDEES = 50
 
 
 def lire_parametres() -> argparse.Namespace:
@@ -69,6 +92,10 @@ def lire_parametres() -> argparse.Namespace:
     parseur.add_argument("--confidentiel", action="store_true",
                          help="affiche le seuil de rentabilité et le coût estimé (Annexe 2) : usage interne seulement")
     parseur.add_argument("--instantane", default=None, help="écrit un rapport JSON dans ce fichier et s'arrête")
+    parseur.add_argument("--debug", action="store_true",
+                         help="mode débogage : requêtes journalisées avec leur durée, panneau et /api/debug (pas en audit)")
+    parseur.add_argument("--logs", default=journalisation.REPERTOIRE_LOGS, help="dossier des journaux")
+    parseur.add_argument("--run", default=journalisation.REPERTOIRE_RUN, help="dossier des fichiers de santé")
     return parseur.parse_args()
 
 
@@ -87,7 +114,118 @@ def preparer_config(options: argparse.Namespace) -> dict:
         couts = hypotheses.charger_confidentiel()
         seuil = couts["seuil_rentabilite"]
         taux = couts["taux_conducteur_h"] + couts["taux_vehicule_h"] if couts["source"] != "defaut" else None
-    return {"cibles": cibles, "seuil": seuil, "taux_horaire": taux}
+    return {"cibles": cibles, "seuil": seuil, "taux_horaire": taux, "requetes": [], "debut": datetime.datetime.now()}
+
+
+def _age(texte: str, maintenant: datetime.datetime):
+    """Secondes écoulées depuis une heure ISO.
+
+    :param texte: Heure ``AAAA-MM-JJTHH:MM:SS`` ou ``AAAA-MM-JJ HH:MM:SS`` (``None`` accepté).
+    :param maintenant: Heure réelle courante.
+    :return: Secondes, ou ``None`` si l'heure est absente ou illisible.
+    :rtype: float or None
+    """
+    try:
+        return (maintenant - datetime.datetime.fromisoformat(str(texte).replace(" ", "T"))).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def alertes_sante(services: dict, maintenant: datetime.datetime) -> list:
+    """Alertes tirées des fichiers de santé (règle R-ROB-06).
+
+    :param services: Résultat de :func:`journalisation.lire_sante`.
+    :param maintenant: Heure réelle courante.
+    :return: ``[{"niveau": "critique"|"attention", "service", "texte"}]``, les critiques d'abord.
+    """
+    alertes = []
+
+    def ajouter(niveau: str, service: str, texte: str) -> None:
+        """Ajoute une alerte.
+
+        :param niveau: ``critique`` ou ``attention``.
+        :param service: Service concerné.
+        :param texte: Message.
+        """
+        alertes.append({"niveau": niveau, "service": service, "texte": texte})
+
+    moteur = services.get("moteur")
+    if moteur is None:
+        ajouter("attention", "moteur", "aucun fichier de santé du moteur (jamais lancé en direct sur cette machine)")
+    elif moteur.get("statut") != "en marche":
+        ajouter("critique", "moteur", "moteur %s" % moteur.get("statut"))
+    elif moteur.get("age_s", 0) > SANTE_MUETTE_S:
+        ajouter("critique", "moteur", "moteur muet depuis %.0f s (bloqué ou arrêté brutalement)" % moteur["age_s"])
+    if moteur is not None and moteur.get("statut") == "en marche":
+        for cle, nom, niveau in (("archivage", "écriture LOG_NORTH_*", "critique"),
+                                 ("controle", "écriture TRACABILITE_*", "critique"),
+                                 ("referentiel", "lecture du référentiel", "attention")):
+            bdd = moteur.get(cle) or {}
+            if bdd.get("actif") and bdd.get("echecs"):
+                ajouter(niveau, "moteur", "%s EN ÉCHEC depuis %s (%d essai(s), %d ligne(s) en attente) : %s"
+                        % (nom, bdd.get("depuis"), bdd["echecs"], bdd.get("en_attente", 0), bdd.get("derniere_erreur")))
+            elif bdd.get("actif") and bdd.get("rejetees"):
+                ajouter("attention", "moteur", "%s : %d ligne(s) rejetée(s) par la base (voir journal SQL)" % (nom, bdd["rejetees"]))
+        if moteur.get("duree_tick_s", 0) > moteur.get("tick_s", hypotheses.TICK_S):
+            ajouter("attention", "moteur", "tick de %.1f s : le moteur prend du retard" % moteur["duree_tick_s"])
+    collecteur = services.get("collecteur")
+    if collecteur is None:
+        ajouter("attention", "collecteur", "aucun fichier de santé du collecteur")
+    elif collecteur.get("statut") != "en marche" or collecteur.get("age_s", 0) > SANTE_MUETTE_S:
+        ajouter("critique", "collecteur", "collecteur %s : les messages de l'ERP sont perdus"
+                % (collecteur.get("statut") if collecteur.get("statut") != "en marche" else "muet"))
+    else:
+        silence = _age(collecteur.get("dernier_message") or collecteur.get("debut"), maintenant)
+        if silence is not None and silence > ERP_MUET_S:
+            ajouter("attention", "collecteur", "aucun message de l'ERP depuis %.0f s" % silence)
+    alertes.sort(key=lambda a: a["niveau"] != "critique")
+    return alertes
+
+
+def rapport_sante(options: argparse.Namespace) -> dict:
+    """Santé de la chaîne pour ``/api/sante``.
+
+    :param options: Options de la ligne de commande (``run``, ``debug``).
+    :return: ``{"maintenant", "services", "alertes", "debug"}``.
+    """
+    maintenant = datetime.datetime.now()
+    services = journalisation.lire_sante(options.run)
+    return {"maintenant": maintenant.isoformat(timespec="seconds"), "services": services,
+            "alertes": alertes_sante(services, maintenant), "debug": bool(options.debug)}
+
+
+def rapport_sql(options: argparse.Namespace, requete: dict) -> dict:
+    """Derniers événements du journal SQL pour ``/api/sql``.
+
+    :param options: Options de la ligne de commande (``logs``).
+    :param requete: Paramètres de l'URL : ``n`` (nombre, défaut 100, au plus 1000), ``erreurs=1`` (erreurs seulement).
+    :return: ``{"evenements" (du plus récent au plus ancien), "erreurs", "ok", "fichier"}``.
+    """
+    try:
+        nombre = max(1, min(1000, int(requete.get("n", 100))))
+    except ValueError:
+        nombre = 100
+    chemin = os.path.join(options.logs, journalisation.FICHIER_SQL)
+    evenements = journalisation.lire_fin_jsonl(chemin, 2000)
+    erreurs = sum(1 for e in evenements if e.get("statut") == "erreur")
+    if requete.get("erreurs") == "1":
+        evenements = [e for e in evenements if e.get("statut") == "erreur"]
+    return {"evenements": list(reversed(evenements[-nombre:])), "erreurs": erreurs, "ok": len(evenements) - erreurs
+            if requete.get("erreurs") != "1" else None, "fichier": os.path.abspath(chemin)}
+
+
+def rapport_debug(options: argparse.Namespace, config: dict) -> dict:
+    """Informations de débogage pour ``/api/debug`` (seulement avec ``--debug``).
+
+    :param options: Options de la ligne de commande.
+    :param config: Configuration (``requetes`` = dernières requêtes HTTP).
+    :return: Processus, options, temps de réponse, derniers problèmes de tous les services.
+    """
+    return {"pid": os.getpid(), "python": platform.python_version(), "machine": platform.node(),
+            "debut": config["debut"].isoformat(timespec="seconds"),
+            "options": {cle: valeur for cle, valeur in vars(options).items()},
+            "requetes": list(reversed(config["requetes"])),
+            "problemes": journalisation.derniers_problemes(options.logs, 50)}
 
 
 def heure_reference(sources: dict, mode: str) -> tuple:
@@ -189,6 +327,15 @@ def traiter_requete(ligne: str, options: argparse.Namespace, config: dict) -> by
             nom = "rapport_audit_NORTH_%s.json" % datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
             entetes["Content-Disposition"] = 'attachment; filename="%s"' % nom
         return reponse_http("200 OK", "application/json; charset=utf-8", corps, entetes)
+    if url.path == "/api/sante":
+        return reponse_http("200 OK", "application/json; charset=utf-8",
+                            json.dumps(rapport_sante(options), ensure_ascii=False, default=str).encode("utf-8"))
+    if url.path == "/api/sql":
+        return reponse_http("200 OK", "application/json; charset=utf-8",
+                            json.dumps(rapport_sql(options, requete), ensure_ascii=False, default=str).encode("utf-8"))
+    if url.path == "/api/debug" and options.debug:
+        return reponse_http("200 OK", "application/json; charset=utf-8",
+                            json.dumps(rapport_debug(options, config), ensure_ascii=False, default=str).encode("utf-8"))
     if url.path == "/api/statuts.csv":
         _, sources, maintenant = calculer_rapport(options, config, requete)
         nom = "statuts_NORTH_%s.csv" % datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -227,19 +374,26 @@ def servir(options: argparse.Namespace, config: dict) -> None:
     serveur.bind((options.hote, options.port))
     serveur.listen(5)
     adresse = "localhost" if options.hote in ("127.0.0.1", "0.0.0.0") else options.hote
-    print("Tableau de bord : http://%s:%d/  ('Ctrl+C' pour arrêter)" % (adresse, options.port))
-    print("Journal : %s\nDemandes : %s" % (os.path.abspath(options.journal), os.path.abspath(options.demandes)))
-    print("Cibles : %s ; données confidentielles : %s" % (config["cibles"], "affichées" if config["seuil"] is not None else "masquées"))
+    JOURNAL.info("tableau de bord : http://%s:%d/  ('Ctrl+C' pour arrêter)%s", adresse, options.port,
+                 " ; MODE DÉBOGAGE (/api/debug ouvert)" if options.debug else "")
+    JOURNAL.info("journal : %s ; demandes : %s", os.path.abspath(options.journal), os.path.abspath(options.demandes))
+    JOURNAL.info("cibles : %s ; données confidentielles : %s", config["cibles"],
+                 "affichées" if config["seuil"] is not None else "masquées")
     try:
         while True:
             connexion, client = serveur.accept()
             connexion.settimeout(5)
+            debut, ligne, statut = time.monotonic(), "", "-"
             try:
                 entete = lire_entete(connexion)
                 if entete:
-                    connexion.sendall(traiter_requete(entete.split("\r\n", 1)[0], options, config))
+                    ligne = entete.split("\r\n", 1)[0]
+                    reponse = traiter_requete(ligne, options, config)
+                    statut = reponse[9:12].decode("ascii", errors="replace")
+                    connexion.sendall(reponse)
             except Exception as erreur:  # le serveur doit survivre à une requête en erreur
-                print("[%s] erreur pour %s : %r" % (datetime.datetime.now().strftime("%H:%M:%S"), client[0], erreur))
+                statut = "500"
+                JOURNAL.error("erreur pour %s (%s) : %r", client[0], ligne, erreur, exc_info=True)
                 try:
                     connexion.sendall(reponse_http("500 Internal Server Error", "text/plain; charset=utf-8",
                                                    ("erreur : %r" % erreur).encode("utf-8")))
@@ -247,8 +401,14 @@ def servir(options: argparse.Namespace, config: dict) -> None:
                     pass
             finally:
                 connexion.close()
+                if ligne:
+                    duree = journalisation.duree_ms(debut)
+                    config["requetes"] = (config["requetes"] + [{"h": datetime.datetime.now().isoformat(timespec="seconds"),
+                                                                 "client": client[0], "requete": ligne[:200],
+                                                                 "statut": statut, "duree_ms": duree}])[-NB_REQUETES_GARDEES:]
+                    JOURNAL.debug("%s %s -> %s en %.0f ms", client[0], ligne[:200], statut, duree)
     except KeyboardInterrupt:
-        print("\nArrêt du tableau de bord.")
+        JOURNAL.info("arrêt du tableau de bord")
     finally:
         serveur.close()
 
@@ -278,8 +438,9 @@ def ecrire_instantane(options: argparse.Namespace, config: dict) -> dict:
 
 
 if __name__ == "__main__":
-    robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
     arguments = lire_parametres()
+    journalisation.configurer("tableau", arguments.debug, arguments.logs, fichiers=not arguments.instantane)
+    robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
     configuration = preparer_config(arguments)
     if arguments.instantane:
         ecrire_instantane(arguments, configuration)

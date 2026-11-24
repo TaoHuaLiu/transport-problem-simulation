@@ -24,6 +24,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import collecteur  # noqa: E402
+import journalisation  # noqa: E402
+import logging  # noqa: E402
+import socket  # noqa: E402
+import tableau_bord  # noqa: E402
 import decision  # noqa: E402
 import moteur  # noqa: E402
 import planification  # noqa: E402
@@ -32,6 +36,7 @@ import regles  # noqa: E402
 import robustesse  # noqa: E402
 import tracabilite  # noqa: E402
 import tracabilite_controle  # noqa: E402
+import flotte  # noqa: E402
 from test_decision import COUTS, T0, camion_test, referentiel_test  # noqa: E402
 
 DOSSIER_CODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -152,6 +157,98 @@ class TestDemandeEnErreur(MoteurTest):
         self.assertTrue(robustesse.signaler(messages, "y", T0, "b"))
         self.assertTrue(robustesse.signaler(messages, "x", T0 + datetime.timedelta(minutes=1), "a"))
         self.assertEqual(messages["nb"], 4)
+
+
+class TestRedemarrage(MoteurTest):
+    """R-VAL-02 : au redémarrage, le moteur relit le CSV du jour ; les demandes échues pendant l'arrêt sont des refus DELAI."""
+
+    def test_demandes_recues_pendant_l_arret(self) -> None:
+        """Relecture après 20 min d'arrêt : D1 échue → REF-EXPIREE, code 4 ; D2 encore valable → décidée normalement."""
+        redemarrage = T0 + datetime.timedelta(minutes=20)
+        self.tick([(T0, "D1", champs_test(h_dep_h=10.0)), (T0, "D2", champs_test(h_dep_h=30.0))], redemarrage)
+        d1, d2 = self.etat["demandes"]["D1"], self.etat["demandes"]["D2"]
+        self.assertEqual((d1["etat"], d1["motif"]), ("REFUSEE", "REF-EXPIREE"))
+        self.assertEqual(tracabilite_controle.code_justif(d1), 4)
+        self.assertEqual(d2["etat"], "ACCEPTEE")
+
+    def test_donnees_invalides_restent_code_7(self) -> None:
+        """Une demande illisible relue au redémarrage reste REF-DONNEES, code 7."""
+        champs = dict(champs_test(h_dep_h=10.0), QTE_PAL="")
+        self.tick([(T0, "D1", champs)], T0 + datetime.timedelta(minutes=20))
+        self.assertEqual(tracabilite_controle.code_justif(self.etat["demandes"]["D1"]), 7)
+
+
+class TestEtatFlotte(MoteurTest):
+    """R-ROB-07 : un moteur relancé ne redonne pas un camion parti avant l'arrêt."""
+
+    def setUp(self) -> None:
+        """Ajoute un fichier d'état de la flotte dans le dossier temporaire."""
+        super().setUp()
+        self.chemin = os.path.join(self.dossier.name, "run", "flotte_moteur.json")
+
+    def faire_partir_puis_relancer(self) -> dict:
+        """Fait partir une tournée sur F1, écrit l'état, puis recharge une flotte neuve et la reprend.
+
+        :return: Flotte du moteur relancé.
+        """
+        self.tick([(T0, "D1", champs_test(h_dep_h=3.0))], T0)
+        for minute in range(1, 4):  # D-DEPART : sous le seuil θ = 1, la tournée part à l'approche de H_DEP
+            self.tick([], T0 + datetime.timedelta(minutes=minute))
+        self.assertEqual(self.etat["demandes"]["D1"]["etat"], "PARTIE")
+        moteur.garder_flotte(self.etat, self.chemin, T0 + datetime.timedelta(minutes=3), {})
+        relance = {"flotte": {"F1": camion_test("F1")}, "messages": {}}
+        moteur.reprendre_flotte(relance, self.ref, self.chemin, T0 + datetime.timedelta(minutes=4))
+        return relance["flotte"]
+
+    def test_camion_parti_reste_occupe(self) -> None:
+        """F1 part avec D1 ; après relance, F1 reste occupé jusqu'à la fin de sa tournée, à son dernier lieu."""
+        f1 = self.faire_partir_puis_relancer()["F1"]
+        avant = self.etat["flotte"]["F1"]
+        self.assertGreater(f1["libre_a"], T0 + datetime.timedelta(minutes=4))
+        self.assertEqual((f1["libre_a"], f1["position"]), (avant["libre_a"], avant["position"]))
+        self.assertNotEqual(f1["position"], 1)
+        self.assertIsNone(f1["tournee"])
+
+    def test_camion_occupe_pas_reutilise(self) -> None:
+        """Après relance, une demande à partir avant la fin de la tournée de F1 n'obtient pas F1."""
+        relance = {"flotte": self.faire_partir_puis_relancer(), "tournees": {}, "demandes": {}, "compteur": 0, "messages": {}}
+        maintenant = T0 + datetime.timedelta(minutes=4)
+        moteur.executer_tick(relance, self.ref, [(maintenant, "D2", champs_test(h_dep_h=8.0))], maintenant, PARAMETRES,
+                             self.journal)
+        self.assertEqual(relance["demandes"]["D2"]["etat"], "REFUSEE")
+
+    def test_etat_d_un_autre_jour_ignore(self) -> None:
+        """Un fichier de la veille est ignoré : les fiches sont régénérées chaque jour réel."""
+        moteur.garder_flotte(self.etat, self.chemin, T0 - datetime.timedelta(days=1), {})
+        bilan = flotte.restaurer_etat({"F1": camion_test("F1")}, self.ref, self.chemin, T0)
+        self.assertEqual(bilan["restaures"], 0)
+        self.assertIn("pas d'aujourd'hui", bilan["raison"])
+
+    def test_fichier_illisible_ou_entrees_invalides(self) -> None:
+        """Fichier corrompu : pas d'erreur, état des fiches gardé ; camion ou lieu inconnu : entrée ignorée."""
+        os.makedirs(os.path.dirname(self.chemin))
+        with open(self.chemin, "w", encoding="utf-8") as fichier:
+            fichier.write("{pas du json")
+        bilan = moteur.reprendre_flotte({"flotte": {"F1": camion_test("F1")}}, self.ref, self.chemin, T0)
+        self.assertIn("illisible", bilan["raison"])
+        with open(self.chemin, "w", encoding="utf-8") as fichier:
+            json.dump({"jour": T0.strftime("%Y-%m-%d"), "camions": {
+                "INCONNU": {"position": 1, "libre_a": T0.isoformat(), "conduite_jour": 0},
+                "F1": {"position": 999, "libre_a": T0.isoformat(), "conduite_jour": 0}}}, fichier)
+        camions = {"F1": camion_test("F1")}
+        bilan = flotte.restaurer_etat(camions, self.ref, self.chemin, T0)
+        self.assertEqual((bilan["restaures"], bilan["ignores"]), (0, 2))
+        self.assertEqual(camions["F1"]["position"], 1)
+
+    def test_ecriture_en_echec_signalee_sans_arret(self) -> None:
+        """Disque plein : pas d'exception, erreur comptée, nouvel essai au tick suivant."""
+        suivi = {}
+        with mock.patch("os.replace", side_effect=OSError("disque plein")):
+            moteur.garder_flotte(self.etat, self.chemin, T0, suivi)
+        self.assertEqual(self.etat["messages"]["nb"], 1)
+        self.assertIsNone(suivi["flotte_ecrite"])
+        moteur.garder_flotte(self.etat, self.chemin, T0, suivi)
+        self.assertTrue(os.path.isfile(self.chemin))
 
 
 class TestBaseIndisponible(MoteurTest):
@@ -377,6 +474,113 @@ class TestCollecteur(unittest.TestCase):
         self.assertEqual(len(appels), 2)
         _, chemin_csv = collecteur.chemins_du_jour(self.dossier.name, datetime.date.today())
         self.assertEqual(collecteur.charger_ids_existants(chemin_csv), {"D2"})
+
+
+class TestSante(unittest.TestCase):
+    """R-ROB-06 : une erreur n'est jamais silencieuse ; santé et journaux ne bloquent jamais un service."""
+
+    def setUp(self) -> None:
+        """Dossier temporaire."""
+        self.dossier = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        """Supprime le dossier temporaire."""
+        self.dossier.cleanup()
+
+    def test_messages_masques_annonces(self) -> None:
+        """Les messages masqués sont comptés puis annoncés au message suivant de la clé."""
+        messages = {}
+        with self.assertLogs("nord", level="DEBUG") as journaux:
+            robustesse.signaler(messages, "x", T0, "panne", logging.ERROR)
+            robustesse.signaler(messages, "x", T0 + datetime.timedelta(seconds=10), "panne", logging.ERROR)
+            robustesse.signaler(messages, "x", T0 + datetime.timedelta(seconds=20), "panne", logging.ERROR)
+            robustesse.signaler(messages, "x", T0 + datetime.timedelta(minutes=2), "panne", logging.ERROR)
+        erreurs = [l for l in journaux.output if l.startswith("ERROR")]
+        self.assertEqual(len(erreurs), 2)
+        self.assertIn("2 message(s) semblable(s) masqué(s)", erreurs[1])
+        self.assertEqual(sum(1 for l in journaux.output if "(masqué)" in l), 2)
+
+    def test_echec_puis_retablissement(self) -> None:
+        """L'échec est daté et compté ; le rétablissement est annoncé et remet les compteurs à zéro."""
+        sante = robustesse.nouvel_etat_bdd()
+        robustesse.noter_echec_bdd(sante, T0, OSError("relation \"LOG_NORTH_CAMION\" does not exist\nLINE 1"), 12)
+        robustesse.noter_echec_bdd(sante, T0 + datetime.timedelta(seconds=5), OSError("idem"), 14)
+        self.assertEqual((sante["echecs"], sante["en_attente"], sante["depuis"]), (2, 14, T0.strftime("%Y-%m-%d %H:%M:%S")))
+        with self.assertLogs("nord", level="WARNING") as journaux:
+            robustesse.noter_succes_bdd(sante, T0 + datetime.timedelta(seconds=10), 14, "archivage")
+        self.assertIn("rétabli après 2 échec(s)", journaux.output[0])
+        self.assertEqual((sante["echecs"], sante["en_attente"], sante["ecrites"]), (0, 0, 14))
+
+    def test_ecrire_sante_ne_leve_jamais(self) -> None:
+        """Dossier de santé impossible à créer : pas d'exception ; dossier valide : relu avec son âge."""
+        fichier = os.path.join(self.dossier.name, "fichier")
+        open(fichier, "w").close()
+        self.assertFalse(journalisation.ecrire_sante("moteur", {"statut": "en marche"}, os.path.join(fichier, "run")))
+        self.assertTrue(journalisation.ecrire_sante("moteur", {"statut": "en marche", "h": T0}, self.dossier.name))
+        sante = journalisation.lire_sante(self.dossier.name)
+        self.assertEqual(sante["moteur"]["statut"], "en marche")
+        self.assertLess(sante["moteur"]["age_s"], 60)
+
+    def test_journaux_indisponibles_console_seule(self) -> None:
+        """Dossier des journaux impossible à créer : le service démarre quand même, avec la console."""
+        fichier = os.path.join(self.dossier.name, "fichier")
+        open(fichier, "w").close()
+        with contextlib.redirect_stdout(io.StringIO()) as console:
+            journalisation.configurer("test", repertoire=os.path.join(fichier, "logs"))
+            journalisation.journal("test").info("bonjour")
+        self.assertIn("console seule", console.getvalue())
+        self.assertIn("bonjour", console.getvalue())
+        self._reinitialiser()
+
+    def test_evenements_sql_dans_leur_fichier(self) -> None:
+        """Événement SQL réussi : journal SQL seulement ; en erreur : aussi console et journal du service."""
+        with contextlib.redirect_stdout(io.StringIO()) as console:
+            journalisation.configurer("test", repertoire=self.dossier.name, sql=True)
+            journalisation.evenement_sql("UPSERT", "LOG_NORTH_TRAJET", 3, 1.5)
+            journalisation.evenement_sql("UPSERT", "LOG_NORTH_TRAJET", 0, erreur=OSError("table absente"))
+        self._reinitialiser()
+        sql = journalisation.lire_fin_jsonl(os.path.join(self.dossier.name, journalisation.FICHIER_SQL))
+        self.assertEqual([e["statut"] for e in sql], ["ok", "erreur"])
+        self.assertEqual(sql[0]["lignes"], 3)
+        service = journalisation.lire_fin_jsonl(os.path.join(self.dossier.name, "test.jsonl"))
+        self.assertTrue(any("table absente" in l["message"] for l in service))
+        self.assertNotIn("3 ligne(s)", console.getvalue())
+        self.assertIn("table absente", console.getvalue())
+
+    def test_alertes_du_tableau_de_bord(self) -> None:
+        """Archivage en échec : alerte critique ; moteur muet : critique ; ERP muet : attention."""
+        maintenant = datetime.datetime(2026, 11, 20, 14, 0, 0)
+        archivage_ko = dict(robustesse.nouvel_etat_bdd(), echecs=3, depuis="2026-11-20 13:59:00",
+                            derniere_erreur="relation does not exist", en_attente=40)
+        services = {"moteur": {"statut": "en marche", "age_s": 2, "archivage": archivage_ko,
+                               "controle": robustesse.nouvel_etat_bdd(actif=False), "referentiel": robustesse.nouvel_etat_bdd()},
+                    "collecteur": {"statut": "en marche", "age_s": 2, "dernier_message": "2026-11-20T13:50:00"}}
+        alertes = tableau_bord.alertes_sante(services, maintenant)
+        self.assertEqual(alertes[0]["niveau"], "critique")
+        self.assertIn("LOG_NORTH_*", alertes[0]["texte"])
+        self.assertTrue(any(a["service"] == "collecteur" and a["niveau"] == "attention" for a in alertes))
+        services["moteur"]["age_s"] = 300
+        self.assertTrue(any("muet" in a["texte"] for a in tableau_bord.alertes_sante(services, maintenant)))
+
+    def test_collecteur_ecrit_sa_sante_sans_message(self) -> None:
+        """Attente de réception expirée : la collecte continue et la santé est écrite, puis « arrêté »."""
+        socket_simulee = FausseSocket([socket.timeout(), socket.timeout(), KeyboardInterrupt()])
+        with mock.patch.object(collecteur, "creer_client_udp", return_value=socket_simulee):
+            with self.assertRaises(KeyboardInterrupt):
+                collecteur.collecter(40040, os.path.join(self.dossier.name, "demandes"), self.dossier.name)
+        sante = journalisation.lire_sante(self.dossier.name)["collecteur"]
+        self.assertEqual((sante["statut"], sante["messages_recus"]), ("arrêté", 0))
+
+    @staticmethod
+    def _reinitialiser() -> None:
+        """Retire les gestionnaires installés par :func:`journalisation.configurer` (retour à l'état des tests)."""
+        for nom in (journalisation.RACINE, journalisation.NOM_SQL):
+            for gestionnaire in list(logging.getLogger(nom).handlers):
+                logging.getLogger(nom).removeHandler(gestionnaire)
+                gestionnaire.close()
+        logging.getLogger(journalisation.RACINE).addHandler(logging.NullHandler())
+        logging.getLogger(journalisation.RACINE).setLevel(logging.NOTSET)
+        sys.excepthook = sys.__excepthook__
 
 
 if __name__ == "__main__":

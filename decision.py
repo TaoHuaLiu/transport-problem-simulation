@@ -22,7 +22,7 @@ def refuser(demande: dict, motif: str, maintenant: datetime.datetime, journal: d
     """Refuse une demande et écrit le refus avec son motif.
 
     Écrit l'événement ``REFUS`` avec le motif reçu : ``REF-DONNEES``,
-    ``REF-SPEC``, ``REF-FRIGO``, ``REF-CAMION``, ``REF-DELAI`` ou
+    ``REF-EXPIREE``, ``REF-SPEC``, ``REF-FRIGO``, ``REF-CAMION``, ``REF-DELAI`` ou
     ``REF-CONDUCTEUR`` (table D-ACC), ``REF-RENTABILITE`` (table D-DEPART).
 
     :param demande: Demande préparée.
@@ -102,6 +102,8 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
 
     1. hors périmètre NORTH (R-PER-01/02) → ignorer ;
     2. données inexploitables (R-VAL-01) → REF-DONNEES ;
+    2b. données valides mais ``H_DEP`` déjà dépassée à la lecture, par exemple
+        demande reçue pendant un arrêt du moteur (R-VAL-02) → REF-EXPIREE ;
     3. aucun camion de la flotte ne respecte la SPEC (R-SPEC-01) → REF-SPEC,
        seulement si :data:`hypotheses.SPEC_BLOQUANTE` ; sinon la demande
        continue et sa gamme sera abaissée (R-SPEC-02) ;
@@ -129,6 +131,8 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
         return "ignorer"
     if not regles.valider_demande(demande, maintenant):
         return refuser(demande, "REF-DONNEES", maintenant, journal)
+    if regles.echeance_depassee(demande, maintenant):
+        return refuser(demande, "REF-EXPIREE", maintenant, journal)
     flotte = etat["flotte"]
     if hypotheses.SPEC_BLOQUANTE:
         conformes = [c for c in flotte.values() if not regles.verifier_spec(demande, c)]
@@ -178,7 +182,7 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
     _, _, _, id_tournee, immat, plan = min(candidats, key=lambda c: (c[0], c[1], c[2]))
     if id_tournee is None:
         etat["compteur"] += 1
-        # Le préfixe (date de démarrage du moteur) rend l'identifiant unique d'un lancement à l'autre (TRAJET_NORTH)
+        # Le préfixe (date de démarrage du moteur) rend l'identifiant unique d'un lancement à l'autre (LOG_NORTH_TRAJET)
         id_tournee = "%s%05d" % (etat.get("prefixe", "T"), etat["compteur"])
         etat["tournees"][id_tournee] = {"id": id_tournee, "camion": immat, "nature": demande["nature"],
                                         "demandes": [], "statut": "ouverte", "plan": plan}

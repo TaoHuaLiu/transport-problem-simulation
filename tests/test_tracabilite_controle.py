@@ -12,6 +12,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -84,14 +85,16 @@ class BaseControle:
         self.requetes.append((requete, tuple(parametres)))
         table = requete.split('"')[1]
         commandes = self.tables[tc.TABLE_COMMANDE]
-        if requete.startswith("UPDATE") and "'EXPIREE'" in requete:
-            code, entreprise = parametres
-            cibles = [l for l in commandes.values() if l["STATUT"] == "ACCEPTEE" and l["ID_ENTRE"] == entreprise]
+        if requete.startswith("UPDATE") and '"H_DEP_R" IS NULL' in requete:
+            # Reprise : nos acceptées pas encore parties passent refusées
+            code, motif = parametres
+            cibles = [l for l in commandes.values() if l["STATUT"] == "ACCEPTEE" and l["H_DEP_R"] is None
+                      and re.match(motif, l["ID_ENTRE"])]
             for ligne in cibles:
-                ligne.update({"STATUT": "EXPIREE", "JUSTIF_REFUS": code})
+                ligne.update({"STATUT": "REFUSEE", "JUSTIF_REFUS": code})
             self.rowcount = len(cibles)
         elif requete.startswith("SELECT"):
-            self.resultat = [(i,) for i, l in commandes.items() if l["ID_ENTRE"] == parametres[0]]
+            self.resultat = [(i, l["ID_ENTRE"]) for i, l in commandes.items() if re.match(parametres[0], l["ID_ENTRE"])]
         elif requete.startswith("UPDATE"):
             autres = [c for c in tc.COLONNES[table] if c != tc.CLE]
             valeurs = dict(zip(autres, parametres))
@@ -192,6 +195,10 @@ class TestDJustif(Contexte):
         self.assertEqual(self.code("REF-DELAI", etat="EXPIREE"), 4)
         self.assertEqual(self.code("REF-CONDUCTEUR"), 4)
 
+    def test_ligne_5_echeance_depassee_a_la_lecture(self) -> None:
+        """REF-EXPIREE (H_DEP passée à la lecture, R-VAL-02) → 4 DELAI, pas 7 DONNEES."""
+        self.assertEqual(self.code("REF-EXPIREE"), 4)
+
     def test_ligne_6_remplissage(self) -> None:
         """REF-RENTABILITE (tournée sous le seuil θ) → 6 REMPLISSAGE."""
         self.assertEqual(self.code("REF-RENTABILITE"), 6)
@@ -230,17 +237,17 @@ class TestLignes(Contexte):
         :param id_demande: Identifiant.
         :return: ``{colonne: valeur}`` ou ``{}`` si la demande n'est pas écrivable.
         """
-        ligne = tc.ligne_commande(self.etat["demandes"][id_demande])
+        ligne = tc.ligne_commande(self.etat["demandes"][id_demande], "N1")
         return dict(zip(tc.COLONNES[tc.TABLE_COMMANDE], ligne)) if ligne else {}
 
     def test_commande_acceptee(self) -> None:
-        """Acceptée : champs de l'ERP, SPEC en JSON, notre ID_ENTRE, pas de code ni de départ réel."""
+        """Acceptée : champs de l'ERP, SPEC en JSON, ID_ENTRE donné, pas de code ni de départ réel."""
         self.tick([("D1", champs(spec="PTAC=19t"))])
         ligne = self.commande("D1")
         self.assertEqual((ligne["STATUT"], ligne["JUSTIF_REFUS"], ligne["H_DEP_R"]), ("ACCEPTEE", None, None))
         self.assertEqual((ligne["LOC_DEP"], ligne["LOC_ARR"], ligne["QTE_MAT"]), ("Amsterdam", "Paris", 4))
         self.assertEqual(json.loads(ligne["SPEC"]), {"PTAC": "19t"})
-        self.assertEqual(ligne["ID_ENTRE"], hypotheses.ID_ENTREPRISE)
+        self.assertEqual(ligne["ID_ENTRE"], "N1")
 
     def test_commande_ville_inconnue(self) -> None:
         """Ville inconnue : refusée REF-DONNEES, écrite quand même avec le nom reçu et le code 7."""
@@ -260,15 +267,34 @@ class TestLignes(Contexte):
         self.assertEqual(tc.lignes_modifiees(lien, self.etat, self.ref, COUTS), {tc.TABLE_COMMANDE: [], tc.TABLE_TRAJET: []})
 
     def test_commande_et_trajet_partis(self) -> None:
-        """Partie : départ réel connu ; ligne trajet avec camion, type, capacité, prix et remplissage en %."""
+        """Partie : STATUT ACCEPTEE, départ réel connu ; ligne trajet avec camion, type, capacité, prix et remplissage en %."""
         self.tick([("D1", champs())], PARTIR)
-        self.assertEqual(self.commande("D1")["STATUT"], "PARTIE")
+        self.assertEqual(self.etat["demandes"]["D1"]["etat"], "PARTIE")
+        self.assertEqual(self.commande("D1")["STATUT"], "ACCEPTEE")
         self.assertIsNotNone(self.commande("D1")["H_DEP_R"])
         trajet = dict(zip(tc.COLONNES[tc.TABLE_TRAJET], tc.ligne_trajet(self.etat["demandes"]["D1"], self.etat, self.ref, COUTS)))
         self.assertEqual((trajet["IMMAT_CAMI"], trajet["TYPE_CAMI"], trajet["CAPA_CAMI"]), ("F1", "FRIGORIFIQUE", "19t"))
         self.assertGreater(trajet["COUT_PRESTA"], 0)
         self.assertTrue(0 < trajet["TAUX_REMPLI"] <= 100)
         self.assertEqual((trajet["SPEC_PTAC"], trajet["SPEC_ENER"], trajet["SPEC_COL"]), (None, None, None))
+
+    def test_capacite_sans_espace(self) -> None:
+        """CAPA_CAMI au format « 19t », sans espace, même si la fiche en contenait un."""
+        self.assertEqual(tc.capacite_controle("19t"), "19t")
+        self.assertEqual(tc.capacite_controle("19 t"), "19t")
+        self.assertEqual(tc.capacite_controle(" 44 t "), "44t")
+
+    def test_expiree_ecrite_refusee(self) -> None:
+        """Acceptée puis expirée avant le départ : STATUT REFUSEE, code 4, pas de départ réel."""
+        self.tick([("D1", champs())])
+        self.etat["demandes"]["D1"].update({"etat": "EXPIREE", "motif": "REF-DELAI"})
+        ligne = self.commande("D1")
+        self.assertEqual((ligne["STATUT"], ligne["JUSTIF_REFUS"], ligne["H_DEP_R"]), ("REFUSEE", 4, None))
+
+    def test_statuts_limites_a_la_specification(self) -> None:
+        """Seuls ACCEPTEE et REFUSEE sont écrits, quel que soit l'état du moteur."""
+        self.assertEqual(set(tc.STATUTS_CONTROLE.values()), {"ACCEPTEE", "REFUSEE"})
+        self.assertEqual(set(tc.STATUTS_CONTROLE), {"ACCEPTEE", "PARTIE", "REFUSEE", "EXPIREE"})
 
     def test_trajet_sans_annexe2(self) -> None:
         """Taux par défaut : pas de prix réel, donc pas de ligne trajet (COUT_PRESTA obligatoire)."""
@@ -304,20 +330,47 @@ class TestEcriture(Contexte):
         self.assertEqual(self.synchro(lien), 0)
         moteur.executer_tick(self.etat, self.ref, [], T0, PARTIR, self.journal)
         self.assertEqual(self.synchro(lien), 2)
-        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D1"]["STATUT"], "PARTIE")
+        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D1"]["STATUT"], "ACCEPTEE")
+        self.assertIsNotNone(base.tables[tc.TABLE_COMMANDE]["D1"]["H_DEP_R"])
+        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D1"]["ID_ENTRE"], "N1")
         self.assertEqual(base.tables[tc.TABLE_TRAJET]["D1"]["IMMAT_CAMI"], "F1")
         self.assertEqual(base.doublons, 0)
 
+    def test_id_entre_numerote(self) -> None:
+        """ID_ENTRE = N1, N2… dans l'ordre d'écriture ; une commande garde son numéro à la mise à jour."""
+        base = BaseControle()
+        lien = self.lien(base)
+        self.tick([("D1", champs()), ("D2", champs())])
+        self.synchro(lien)
+        self.tick([("D3", champs())])
+        moteur.executer_tick(self.etat, self.ref, [], T0, PARTIR, self.journal)
+        self.synchro(lien)
+        numeros = {i: l["ID_ENTRE"] for i, l in base.tables[tc.TABLE_COMMANDE].items()}
+        self.assertEqual(sorted(numeros.values()), ["N1", "N2", "N3"])
+        self.assertEqual(numeros["D3"], "N3")
+        self.assertTrue(all(re.match(hypotheses.MOTIF_ID_ENTRE, v) for v in numeros.values()))
+
+    def test_commande_non_ecrivable_sans_numero(self) -> None:
+        """Une commande non écrivable ne consomme pas de numéro."""
+        base = BaseControle()
+        self.tick([("D1", champs(qte="abc")), ("D2", champs())])
+        self.synchro(self.lien(base))
+        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D2"]["ID_ENTRE"], "N1")
+
     def test_reprise_apres_arret(self) -> None:
-        """Redémarrage : nos acceptées passent expirées (code 4) et sont protégées ; celles d'un autre groupe ne bougent pas."""
+        """Redémarrage : nos acceptées non parties passent refusées (code 4), protégées ; numérotation reprise ; autres groupes intacts."""
         base = BaseControle()
         nous = dict.fromkeys(tc.COLONNES[tc.TABLE_COMMANDE], "")
-        base.tables[tc.TABLE_COMMANDE]["V1"] = dict(nous, ID_COMMANDE="V1", STATUT="ACCEPTEE", ID_ENTRE=hypotheses.ID_ENTREPRISE)
-        base.tables[tc.TABLE_COMMANDE]["W1"] = dict(nous, ID_COMMANDE="W1", STATUT="ACCEPTEE", ID_ENTRE="WEST-EU")
+        commandes = base.tables[tc.TABLE_COMMANDE]
+        commandes["V1"] = dict(nous, ID_COMMANDE="V1", STATUT="ACCEPTEE", H_DEP_R=None, ID_ENTRE="N7")
+        commandes["V2"] = dict(nous, ID_COMMANDE="V2", STATUT="ACCEPTEE", H_DEP_R=T0, ID_ENTRE="N3")
+        commandes["W1"] = dict(nous, ID_COMMANDE="W1", STATUT="ACCEPTEE", H_DEP_R=None, ID_ENTRE="O40")
+        self.tick([("D1", champs())])
         self.synchro(self.lien(base))
-        self.assertEqual((base.tables[tc.TABLE_COMMANDE]["V1"]["STATUT"], base.tables[tc.TABLE_COMMANDE]["V1"]["JUSTIF_REFUS"]),
-                         ("EXPIREE", 4))
-        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["W1"]["STATUT"], "ACCEPTEE")
+        self.assertEqual((commandes["V1"]["STATUT"], commandes["V1"]["JUSTIF_REFUS"]), ("REFUSEE", 4))
+        self.assertEqual(commandes["V2"]["STATUT"], "ACCEPTEE")
+        self.assertEqual(commandes["W1"]["STATUT"], "ACCEPTEE")
+        self.assertEqual(commandes["D1"]["ID_ENTRE"], "N8")
         self.assertIn("V1", self.etat["deja_archivees"])
         self.assertNotIn("W1", self.etat["deja_archivees"])
 
@@ -325,12 +378,12 @@ class TestEcriture(Contexte):
         """Même identifiant déjà écrit par un autre groupe : notre écriture est refusée, sa ligne reste intacte."""
         base = BaseControle()
         base.tables[tc.TABLE_COMMANDE]["D1"] = dict.fromkeys(tc.COLONNES[tc.TABLE_COMMANDE], "")
-        base.tables[tc.TABLE_COMMANDE]["D1"].update({"ID_COMMANDE": "D1", "ID_ENTRE": "WEST-EU", "STATUT": "PARTIE"})
+        base.tables[tc.TABLE_COMMANDE]["D1"].update({"ID_COMMANDE": "D1", "ID_ENTRE": "O1", "STATUT": "ACCEPTEE"})
         lien = self.lien(base)
         lien["repris"] = True  # sans reprise : on teste seulement l'écriture
         self.tick([("D1", champs())])
         self.assertEqual(self.synchro(lien), 0)
-        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D1"]["ID_ENTRE"], "WEST-EU")
+        self.assertEqual(base.tables[tc.TABLE_COMMANDE]["D1"]["ID_ENTRE"], "O1")
         self.assertIn((tc.TABLE_COMMANDE, "D1"), lien["rejetees"])
 
     def test_ligne_rejetee_les_autres_ecrites(self) -> None:
@@ -345,15 +398,19 @@ class TestEcriture(Contexte):
         self.assertEqual(len(base.requetes), nb)
 
     def test_mises_a_jour_limitees_a_notre_entreprise(self) -> None:
-        """Toute mise à jour de TRACABILITE_COMMANDE porte la condition sur notre ID_ENTRE."""
+        """Toute mise à jour de TRACABILITE_COMMANDE porte la condition sur un de nos ID_ENTRE (N…)."""
         base = BaseControle()
+        lien = self.lien(base)
         self.tick([("D1", champs())])
-        self.synchro(self.lien(base))
+        self.synchro(lien)
+        moteur.executer_tick(self.etat, self.ref, [], T0, PARTIR, self.journal)
+        self.synchro(lien)
         updates = [(r, p) for r, p in base.requetes if r.startswith('UPDATE "%s"' % tc.TABLE_COMMANDE)]
         self.assertTrue(updates)
         for requete, parametres in updates:
-            self.assertIn('"ID_ENTRE" = %s', requete)
-            self.assertIn(hypotheses.ID_ENTREPRISE, parametres)
+            self.assertTrue('"ID_ENTRE" = %s' in requete or '"ID_ENTRE" ~ %s' in requete)
+            self.assertTrue(any(isinstance(p, str) and (re.match(hypotheses.MOTIF_ID_ENTRE, p) or p == hypotheses.MOTIF_ID_ENTRE)
+                                for p in parametres))
 
 
 class TestSchema(unittest.TestCase):

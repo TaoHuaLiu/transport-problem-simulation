@@ -19,7 +19,11 @@ Utilisation :
 
 .. code-block:: bash
 
-    python3 collecteur.py [--port 40040] [--sortie <répertoire>]
+    python3 collecteur.py [--port 40040] [--sortie <répertoire>] [--debug]
+
+Journaux (:mod:`journalisation`) : console, ``../donnees/logs/collecteur.jsonl`` et
+``../donnees/run/sante_collecteur.json`` (dernier message reçu, totaux, erreurs), réécrit
+au plus toutes les :data:`PERIODE_SANTE_S` secondes, même sans message de l'ERP.
 
 .. seealso:: :mod:`simulateur_erp` pour tester hors du VLAN de l'ENSIBS.
 """
@@ -29,11 +33,22 @@ import ast
 import csv
 import datetime
 import json
+import logging
 import os
 import socket
 import time
 
+import journalisation
 import robustesse
+
+JOURNAL = journalisation.journal("collecteur")
+
+#: Attente maximale de ``recvfrom`` (secondes réelles) : sans message, le collecteur se réveille quand même
+#: pour mettre à jour sa santé (un ERP muet se voit sur le tableau de bord).
+ATTENTE_RECEPTION_S = 5
+
+#: Période minimale d'écriture de ``sante_collecteur.json`` (secondes réelles).
+PERIODE_SANTE_S = 5
 
 #: Port UDP sur lequel l'ERP émet les demandes de transport.
 PORT_ERP = 40040
@@ -67,6 +82,7 @@ def creer_client_udp(port: int) -> socket.socket:
     clientUDP.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     clientUDP.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     clientUDP.bind(("", port))
+    clientUDP.settimeout(ATTENTE_RECEPTION_S)
     return clientUDP
 
 
@@ -242,15 +258,15 @@ def traiter_datagramme(data: bytes, adresse: tuple, maintenant: datetime.datetim
         try:
             contexte["ids"] = charger_ids_existants(contexte["chemin_csv"])
         except (OSError, ValueError, KeyError, csv.Error) as erreur:
-            print("[%s] ! CSV du jour illisible (%r) : doublons possibles avec un lancement précédent"
-                  % (h_reception, erreur), flush=True)
+            JOURNAL.warning("CSV du jour illisible (%r) : doublons possibles avec un lancement précédent", erreur)
             contexte["ids"] = set()
 
     try:
         message = decoder_message(texte)
     except ValueError as erreur:
-        print("[%s] ! Message ignoré (%s), conservé dans %s"
-              % (h_reception, erreur, os.path.basename(contexte["chemin_jsonl"])), flush=True)
+        JOURNAL.warning("message de %s ignoré (%s), conservé dans %s", adresse[0], erreur,
+                        os.path.basename(contexte["chemin_jsonl"]))
+        contexte["illisibles"] = contexte.get("illisibles", 0) + 1
         return 0
 
     # Une demande déjà vue n'est pas réécrite.
@@ -264,51 +280,90 @@ def traiter_datagramme(data: bytes, adresse: tuple, maintenant: datetime.datetim
         # Ajoutés seulement une fois écrits : après une erreur d'écriture, un renvoi éventuel serait réécrit
         contexte["ids"].update(ligne["ID_DEMANDE"] for ligne in lignes)
         contexte["nb"] = contexte.get("nb", 0) + len(lignes)
-    print("[%s] %d demande(s) reçue(s), %d nouvelle(s) - total session : %d"
-          % (h_reception, len(message), len(lignes), contexte.get("nb", 0)), flush=True)
+    JOURNAL.info("%d demande(s) reçue(s), %d nouvelle(s) - total session : %d", len(message), len(lignes),
+                 contexte.get("nb", 0))
+    if JOURNAL.isEnabledFor(logging.DEBUG):
+        JOURNAL.debug("message de %s:%s, %d octets, demandes %s", adresse[0], adresse[1], len(data),
+                      ", ".join(ligne["ID_DEMANDE"] for ligne in lignes) or "-")
     return len(lignes)
 
 
-def collecter(port: int, repertoire: str) -> None:
+def ecrire_sante(contexte: dict, messages: dict, statut: str, dossier_sante: str) -> None:
+    """Écrit ``sante_collecteur.json`` (règle R-ROB-06) ; ne lève jamais d'erreur.
+
+    :param contexte: Contexte de :func:`traiter_datagramme`.
+    :param messages: Erreurs signalées (:func:`robustesse.signaler`).
+    :param statut: ``en marche`` ou ``arrêté``.
+    :param dossier_sante: Dossier du fichier de santé ; ``None`` pour ne rien écrire (tests).
+    """
+    if dossier_sante is None:
+        return
+    journalisation.ecrire_sante("collecteur", {
+        "statut": statut, "debut": contexte.get("debut"), "dernier_message": contexte.get("dernier_message"),
+        "messages_recus": contexte.get("messages", 0), "demandes_nouvelles": contexte.get("nb", 0),
+        "messages_illisibles": contexte.get("illisibles", 0), "incidents": messages.get("nb", 0),
+        "fichier_csv": contexte.get("chemin_csv"), "debug": journalisation.CONFIG["debug"]}, dossier_sante)
+
+
+def collecter(port: int, repertoire: str, dossier_sante: str = None) -> None:
     """Reçoit, archive puis structure chaque message, jusqu'à ``Ctrl+C`` ou SIGTERM.
 
     Applique la règle R-ROB-04 : une erreur sur un message (écriture
     impossible, CSV du jour illisible…) ou sur la réception est signalée et
     la collecte continue ; seul un arrêt demandé l'interrompt, car l'ERP ne
-    renvoie pas les messages perdus.
+    renvoie pas les messages perdus. Applique la règle R-ROB-06 : la santé est
+    réécrite même quand l'ERP se tait (attente de réception bornée).
 
     :param port: Port UDP d'écoute.
     :param repertoire: Répertoire de sortie (créé s'il n'existe pas).
+    :param dossier_sante: Dossier de ``sante_collecteur.json`` (``None`` : pas de fichier de santé).
     """
     os.makedirs(repertoire, exist_ok=True)
     clientUDP = creer_client_udp(port)
-    contexte = {"repertoire": repertoire, "jour": None, "ids": set(), "nb": 0}
+    contexte = {"repertoire": repertoire, "jour": None, "ids": set(), "nb": 0, "messages": 0,
+                "debut": datetime.datetime.now().isoformat(timespec="seconds")}
     messages = {}
+    derniere_sante = 0.0
 
-    print("\nCollecte des demandes de transport sur le port %d -> %s" % (port, os.path.abspath(repertoire)))
-    print("'Ctrl+C' pour quitter le programme", flush=True)
-    while True:
-        try:
-            data, adresse = clientUDP.recvfrom(TAILLE_MAX_DATAGRAMME)
-        except OSError as erreur:  # R-ROB-04 : erreur de socket passagère
-            robustesse.signaler(messages, "reception", datetime.datetime.now(), "réception en erreur (%s) : la collecte continue" % erreur)
-            time.sleep(1)
-            continue
-        maintenant = datetime.datetime.now()
-        try:
-            traiter_datagramme(data, adresse, maintenant, contexte)
-        except Exception as erreur:  # R-ROB-04 : la collecte ne s'arrête jamais sur un message
-            robustesse.signaler(messages, "message", maintenant, "message de %s en erreur (%r) : la collecte continue"
-                                % (adresse[0], erreur))
+    JOURNAL.info("collecte des demandes de transport sur le port %d -> %s ; 'Ctrl+C' pour quitter", port,
+                 os.path.abspath(repertoire))
+    try:
+        while True:
+            if time.monotonic() - derniere_sante >= PERIODE_SANTE_S:
+                ecrire_sante(contexte, messages, "en marche", dossier_sante)
+                derniere_sante = time.monotonic()
+            try:
+                data, adresse = clientUDP.recvfrom(TAILLE_MAX_DATAGRAMME)
+            except socket.timeout:  # aucun message pendant ATTENTE_RECEPTION_S : on met la santé à jour
+                continue
+            except OSError as erreur:  # R-ROB-04 : erreur de socket passagère
+                robustesse.signaler(messages, "reception", datetime.datetime.now(),
+                                    "réception en erreur (%s) : la collecte continue" % erreur, logging.ERROR, "collecteur")
+                time.sleep(1)
+                continue
+            maintenant = datetime.datetime.now()
+            contexte["messages"] += 1
+            contexte["dernier_message"] = maintenant.isoformat(timespec="seconds")
+            try:
+                traiter_datagramme(data, adresse, maintenant, contexte)
+            except Exception as erreur:  # R-ROB-04 : la collecte ne s'arrête jamais sur un message
+                robustesse.signaler(messages, "message", maintenant, "message de %s en erreur (%r) : la collecte continue"
+                                    % (adresse[0], erreur), logging.ERROR, "collecteur")
+                JOURNAL.debug("trace du message en erreur", exc_info=True)
+    finally:
+        ecrire_sante(contexte, messages, "arrêté", dossier_sante)
 
 
 if __name__ == "__main__":
     parseur = argparse.ArgumentParser(description="Sauvegarde les demandes de transport de l'ERP (UDP) en JSONL et CSV")
     parseur.add_argument("--port", type=int, default=PORT_ERP, help="port UDP d'écoute (défaut : %d)" % PORT_ERP)
     parseur.add_argument("--sortie", default=REPERTOIRE_SORTIE, help="répertoire des fichiers produits")
+    parseur.add_argument("--debug", action="store_true", help="mode débogage : détail de chaque message reçu")
+    parseur.add_argument("--logs", default=None, help="dossier des journaux (défaut : ../donnees/logs)")
     arguments = parseur.parse_args()
+    journalisation.configurer("collecteur", arguments.debug, arguments.logs)
     robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter --tout » envoie SIGTERM
     try:
-        collecter(arguments.port, arguments.sortie)
+        collecter(arguments.port, arguments.sortie, journalisation.REPERTOIRE_RUN)
     except KeyboardInterrupt:
-        print("\nArrêt de la collecte.")
+        JOURNAL.info("arrêt de la collecte")

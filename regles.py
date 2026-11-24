@@ -86,16 +86,34 @@ def valider_demande(demande: dict, maintenant: datetime.datetime) -> bool:
 
     Applique la règle R-VAL-01 : lieux connus de ``LOCATIONS_NAMES``,
     ``QTE_PAL`` entier positif, ``TYPE_PAL`` et ``TYPE_MAT`` connus,
-    ``H_DEP`` lisible et pas encore dépassée. Un échec donne le motif ``REF-DONNEES``.
+    ``H_DEP`` lisible. Un échec donne le motif ``REF-DONNEES``. Une ``H_DEP``
+    lisible mais déjà dépassée relève de la règle R-VAL-02
+    (:func:`echeance_depassee`), pas d'une erreur de données.
 
     :param demande: Demande préparée.
-    :param maintenant: Heure réelle courante.
+    :param maintenant: Heure réelle courante (gardée pour la signature ; l'échéance est vérifiée à part).
     :return: ``True`` si la demande peut être examinée.
     """
     return (demande["pk_dep"] is not None and demande["pk_arr"] is not None
             and demande["qte"] is not None and demande["qte"] > 0
             and demande.get("TYPE_PAL") in TYPES_PAL and demande.get("TYPE_MAT") in TYPES_MAT
-            and demande["h_dep"] is not None and demande["h_dep"] > maintenant)
+            and demande["h_dep"] is not None)
+
+
+def echeance_depassee(demande: dict, maintenant: datetime.datetime) -> bool:
+    """Dit si l'échéance d'une demande exploitable est déjà passée quand le moteur la lit.
+
+    Applique la règle R-VAL-02 : ``H_DEP`` ≤ heure de lecture. Cas typique :
+    demande reçue par le collecteur pendant un arrêt du moteur et relue dans
+    le CSV du jour au redémarrage (ou envoyée par l'ERP déjà échue). Elle est
+    refusée avec le motif ``REF-EXPIREE`` (code 4 DELAI du Contrôle), et non
+    ``REF-DONNEES`` : ses données sont correctes, c'est le délai qui est passé.
+
+    :param demande: Demande préparée, valide au sens de :func:`valider_demande` (``h_dep`` lisible).
+    :param maintenant: Heure réelle courante.
+    :return: ``True`` si ``H_DEP`` est déjà dépassée.
+    """
+    return demande["h_dep"] <= maintenant
 
 
 def tonnes(ptac: str):

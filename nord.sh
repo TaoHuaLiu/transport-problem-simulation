@@ -8,9 +8,13 @@
 #   sh nord.sh etat                 processus, dernières lignes des journaux, adresse du tableau de bord
 #   sh nord.sh surveiller [options] relance toutes les 30 s ce qui s'est arrêté (Ctrl+C pour quitter)
 #   sh nord.sh journaux             suit les fichiers de log (Ctrl+C pour quitter)
-#   sh nord.sh audit [--seuil X] [--marge W] [--port N]
+#   sh nord.sh sante                santé de chaque service (base : dernier succès, échecs, lignes en attente)
+#   sh nord.sh erreurs [N]          N derniers avertissements et erreurs, tous services (défaut 30)
+#   sh nord.sh sql [N]              N derniers événements SQL du moteur (défaut 30)
+#   sh nord.sh audit [--seuil X] [--marge W] [--port N] [--debug]
 #                                   PRODUCTION pour l'audit (règle R-ROB-05) : vérifie la base, les fiches
-#                                   de la VM et l'Annexe 2 (et signale si les tables du Contrôle manquent),
+#                                   de la VM, l'Annexe 2 et nos tables LOG_NORTH_* (et signale si les
+#                                   tables du Contrôle manquent),
 #                                   relance moteur et tableau de bord en mode audit
 #                                   (base, archivage et tables du Contrôle obligatoires, pas de copie de secours, tableau de
 #                                   bord sans données confidentielles, visible du VLAN), puis surveille
@@ -22,7 +26,7 @@
 # Options de demarrer / redemarrer / surveiller (mémorisées dans ../donnees/run/options :
 # sans option, une commande reprend celles du dernier lancement) :
 #   --sans-bdd        moteur sans la base (lit ../donnees/referentiels.json) ; hors VLAN ou base en panne
-#   --sans-archive    le moteur n'écrit pas les tables *_NORTH (par défaut, il les écrit quand il lit la base)
+#   --sans-archive    le moteur n'écrit pas les tables LOG_NORTH_* (par défaut, il les écrit quand il lit la base)
 #   --sans-controle   le moteur n'écrit pas TRACABILITE_COMMANDE / TRACABILITE_TRAJET (tables du Contrôle ;
 #                     par défaut, il les remplit pour nos commandes quand il lit la base)
 #   --seuil X         seuil de départ θ du moteur (taux de remplissage, 0-1)
@@ -30,12 +34,16 @@
 #   --confidentiel    le tableau de bord affiche les valeurs de l'Annexe 2 : à ne pas montrer au Contrôle
 #   --port N          port du tableau de bord (défaut 10000)
 #   --local           tableau de bord sur 127.0.0.1 seulement (défaut : 0.0.0.0, visible du VLAN 40)
+#   --debug           mode débogage : chaque décision, requête SQL et requête HTTP journalisée ; panneau de
+#                     débogage du tableau de bord (en audit : collecteur et moteur seulement, le tableau
+#                     de bord public n'expose pas les journaux)
 #
 # Le collecteur doit tourner sans interruption (l'ERP ne renvoie pas les messages
 # perdus) : « arreter » et « redemarrer » le laissent tourner. Relancer le moteur
 # ouvre un nouveau journal ../donnees/moteur/evenements_*.csv ; le tableau de bord
 # lit toujours le plus récent.
-# Fichiers : PID dans ../donnees/run/, logs dans ../donnees/logs/.
+# Fichiers : PID et santé (sante_*.json) dans ../donnees/run/ ; dans ../donnees/logs/ : sortie console
+# (<service>.log), journal détaillé JSON (<service>.jsonl, rotation 10 Mo x 5), événements SQL (sql.jsonl).
 
 set -u
 
@@ -57,6 +65,7 @@ HOTE=0.0.0.0
 SEUIL=""
 MARGE=""
 TOUT=0
+DEBUG=0
 
 lire_options() {
     # Sans option : celles du dernier lancement (etat, redemarrer, surveiller restent cohérents)
@@ -75,6 +84,7 @@ lire_options() {
             --confidentiel) CONFIDENTIEL=1 ;;
             --local) HOTE=127.0.0.1 ;;
             --tout) TOUT=1 ;;
+            --debug) DEBUG=1 ;;
             --port) PORT=$2; shift ;;
             --seuil) SEUIL=$2; shift ;;
             --marge) MARGE=$2; shift ;;
@@ -91,6 +101,7 @@ lire_options_audit() {
             --port) PORT=$2; shift ;;
             --seuil) SEUIL=$2; shift ;;
             --marge) MARGE=$2; shift ;;
+            --debug) DEBUG=1 ;;
             *) echo "Option interdite en mode audit : $1 (base, archivage, tables du Contrôle et tableau de bord public imposés)" >&2; exit 2 ;;
         esac
         shift
@@ -121,10 +132,13 @@ pid_de() {
 commande_de() {
     case "$1" in
         collecteur)
-            echo "python3 -u collecteur.py" ;;
+            cmd="python3 -u collecteur.py"
+            [ "$DEBUG" -eq 0 ] || cmd="$cmd --debug"
+            echo "$cmd" ;;
         moteur)
             if [ "$MODE" = "audit" ]; then
                 cmd="python3 -u moteur.py --audit"
+                [ "$DEBUG" -eq 0 ] || cmd="$cmd --debug"
                 [ -z "$SEUIL" ] || cmd="$cmd --seuil $SEUIL"
                 [ -z "$MARGE" ] || cmd="$cmd --marge $MARGE"
                 echo "$cmd"
@@ -132,16 +146,19 @@ commande_de() {
             fi
             cmd="python3 -u moteur.py --direct"
             [ "$SANS_BDD" -eq 1 ] || cmd="$cmd --bdd"
-            # Tables CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH (archivage.py)
+            # Tables LOG_NORTH_CAMION, LOG_NORTH_TRAJET, LOG_NORTH_ARCHIVAGE_COMMANDE (archivage.py)
             [ "$SANS_BDD" -eq 1 ] || [ "$SANS_ARCHIVE" -eq 1 ] || cmd="$cmd --archiver"
             # Tables de traçabilité du Contrôle (tracabilite_controle.py)
             [ "$SANS_BDD" -eq 1 ] || [ "$SANS_CONTROLE" -eq 1 ] || cmd="$cmd --controle"
             [ -z "$SEUIL" ] || cmd="$cmd --seuil $SEUIL"
             [ -z "$MARGE" ] || cmd="$cmd --marge $MARGE"
+            [ "$DEBUG" -eq 0 ] || cmd="$cmd --debug"
             echo "$cmd" ;;
         tableau)
             cmd="python3 -u tableau_bord.py --hote $HOTE --port $PORT"
             [ "$CONFIDENTIEL" -eq 0 ] || cmd="$cmd --confidentiel"
+            # En audit, le tableau de bord est public : pas de panneau de débogage (journaux des services)
+            [ "$DEBUG" -eq 0 ] || [ "$MODE" = "audit" ] || cmd="$cmd --debug"
             echo "$cmd" ;;
     esac
 }
@@ -245,6 +262,12 @@ FIN
     fi
     [ -f "$DONNEES/cibles_contrat.json" ] || \
         echo "  ! ../donnees/cibles_contrat.json absent : le tableau de bord affichera les cibles par défaut"
+    # Nos tables LOG_NORTH_* : bloquant (l'archivage est imposé en audit ; sinon chaque écriture échouerait)
+    if [ "$erreurs" -eq 0 ] && ! (cd "$DEV" && python3 archivage.py --verifier >> "$LOGS/audit.log" 2>&1); then
+        echo "  ! tables LOG_NORTH_CAMION / LOG_NORTH_TRAJET / LOG_NORTH_ARCHIVAGE_COMMANDE absentes ou incomplètes" >&2
+        echo "    (détail : $LOGS/audit.log ; les créer ou migrer avec « 3 - Documentation/tables-nord.sql »)" >&2
+        erreurs=1
+    fi
     # Tables du Contrôle : non bloquant (créées par la DSI) ; le moteur réessaie chaque tick tant qu'elles manquent
     if [ "$erreurs" -eq 0 ] && ! (cd "$DEV" && python3 tracabilite_controle.py --verifier >> "$LOGS/audit.log" 2>&1); then
         echo "  ! tables TRACABILITE_COMMANDE / TRACABILITE_TRAJET absentes ou non conformes (détail : $LOGS/audit.log) :"
@@ -277,6 +300,7 @@ PORT=$PORT
 HOTE=$HOTE
 SEUIL=$SEUIL
 MARGE=$MARGE
+DEBUG=$DEBUG
 FIN
 }
 
@@ -338,6 +362,11 @@ etat() {
     journal=$(ls -t "$DONNEES"/moteur/evenements_*.csv 2>/dev/null | head -n 1)
     [ -z "$journal" ] || echo "  journal du moteur : $(($(wc -l < "$journal") - 1)) événements dans $journal"
     pid_de tableau >/dev/null && echo "  tableau de bord : $(adresse_tableau)"
+    [ "$DEBUG" -eq 0 ] || echo "  mode débogage actif"
+    echo "  santé :"
+    (cd "$DEV" && python3 journalisation.py --sante 2>&1) | sed 's/^/    /'
+    echo "  derniers problèmes (sh nord.sh erreurs pour plus) :"
+    (cd "$DEV" && python3 journalisation.py --erreurs 5 2>&1) | sed 's/^/    /'
 }
 
 boucle_surveillance() {
@@ -363,7 +392,7 @@ audit() {
     verifier_audit
     memoriser_options
     echo "== AUDIT : démarrage de la chaîne NORTH en production ($(date '+%H:%M:%S'))"
-    echo "   options : seuil θ ${SEUIL:-défaut}, marge W ${MARGE:-défaut}, port $PORT"
+    echo "   options : seuil θ ${SEUIL:-défaut}, marge W ${MARGE:-défaut}, port $PORT$([ "$DEBUG" -eq 1 ] && echo ', débogage')"
     # Moteur et tableau de bord relancés en mode audit ; le collecteur continue s'il tourne déjà
     arreter_service tableau
     arreter_service moteur
@@ -385,6 +414,10 @@ if [ "$action" = "arreter" ]; then
     for arg in "$@"; do [ "$arg" = "--tout" ] && TOUT=1; done
     set --
 fi
+if [ "$action" = "erreurs" ] || [ "$action" = "sql" ]; then
+    NOMBRE=${1:-30}
+    set --
+fi
 if [ "$action" = "audit" ]; then
     lire_options_audit "$@"
 else
@@ -398,5 +431,8 @@ case "$action" in
     etat) etat ;;
     surveiller) surveiller ;;
     journaux) tail -n 5 -F "$LOGS"/collecteur.log "$LOGS"/moteur.log "$LOGS"/tableau.log ;;
+    sante) cd "$DEV" && python3 journalisation.py --sante ;;
+    erreurs) cd "$DEV" && python3 journalisation.py --erreurs "$NOMBRE" ;;
+    sql) cd "$DEV" && python3 journalisation.py --sql "$NOMBRE" ;;
     *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

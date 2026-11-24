@@ -7,7 +7,7 @@
 3. décide chaque demande (table D-ACC, :mod:`decision`) ;
 4. décide le départ de chaque tournée ouverte (table D-DEPART, :mod:`planification`) ;
 5. écrit les événements dans le journal de traçabilité ;
-6. avec ``--archiver`` (mode direct), met à jour les tables ``*_NORTH`` de la base (:mod:`archivage`) ;
+6. avec ``--archiver`` (mode direct), met à jour les tables ``LOG_NORTH_*`` de la base (:mod:`archivage`) ;
 7. avec ``--controle`` (mode direct), remplit les tables de traçabilité du Contrôle
    ``TRACABILITE_COMMANDE`` et ``TRACABILITE_TRAJET`` (:mod:`tracabilite_controle`).
 
@@ -25,6 +25,11 @@ Utilisation :
     python3 moteur.py --rejeu "../../6 - Data/Briefcase/demandes_2026-10-19.jsonl"   # local
     python3 moteur.py --direct --bdd --archiver --controle                              # VM
     python3 moteur.py --audit                                                           # VM, audit (production)
+    python3 moteur.py --direct --bdd --archiver --debug                                 # VM, chaque décision et requête SQL affichée
+
+Journaux (:mod:`journalisation`) : console, ``../donnees/logs/moteur.jsonl``,
+``../donnees/logs/sql.jsonl`` (événements SQL) et ``../donnees/run/sante_moteur.json``
+(santé réécrite à chaque tick : dernier tick, référentiel, archivage, traçabilité Contrôle).
 
 Le mode **audit** (règle R-ROB-05) est le mode de production : direct, base,
 archivage, tables du Contrôle, fiches camion de la VM et Annexe 2 obligatoires. Il refuse de
@@ -37,6 +42,7 @@ import csv
 import datetime
 import io
 import json
+import logging
 import os
 import time
 
@@ -44,6 +50,7 @@ import archivage
 import decision
 import flotte as module_flotte
 import hypotheses
+import journalisation
 import planification
 import referentiels
 import regles
@@ -54,6 +61,8 @@ from collecteur import decoder_message
 
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
 
+JOURNAL = journalisation.journal("moteur")
+
 #: Fiches camion locales (copie de la VM), si le dossier de la VM est absent.
 REPERTOIRE_FICHES_LOCAL = os.path.join(DOSSIER, "..", "..", "6 - Data", "camions")
 
@@ -62,6 +71,9 @@ REPERTOIRE_DEMANDES = os.path.join(DOSSIER, "..", "donnees", "demandes")
 
 #: Dossier des journaux du moteur.
 REPERTOIRE_SORTIE = os.path.join(DOSSIER, "..", "donnees", "moteur")
+
+#: État des camions gardé d'un lancement à l'autre en direct (règle R-ROB-07, :func:`flotte.sauvegarder_etat`).
+FICHIER_ETAT_FLOTTE = os.path.join(journalisation.REPERTOIRE_RUN, "flotte_moteur.json")
 
 
 def lire_rejeu(chemin: str) -> list:
@@ -175,10 +187,15 @@ def decider_demande(id_demande: str, champs: dict, h_reception: datetime.datetim
     try:
         demande = regles.preparer_demande(id_demande, champs, h_reception, ref)
         decision.traiter_demande(demande, etat, ref, maintenant, parametres, journal)
+        if JOURNAL.isEnabledFor(logging.DEBUG):
+            JOURNAL.debug("demande %s %s %s->%s %s pal : %s %s tournée %s", id_demande, champs.get("TYPE_MVT"),
+                          champs.get("LOC_DEP"), champs.get("LOC_ARR"), champs.get("QTE_PAL"), demande.get("etat"),
+                          demande.get("motif") or "", demande.get("tournee") or "-")
         return
     except Exception as erreur:  # R-ROB-01 : une demande en erreur ne doit pas arrêter le moteur
         robustesse.signaler(etat.setdefault("messages", {}), "demande", maintenant,
-                            "demande %s en erreur (%r) : refusée REF-DONNEES" % (id_demande, erreur))
+                            "demande %s en erreur (%r) : refusée REF-DONNEES" % (id_demande, erreur), module="moteur")
+        JOURNAL.debug("trace de la demande %s en erreur", id_demande, exc_info=True)
     demande = etat["demandes"].get(id_demande)
     if demande is None:
         demande = dict(champs)
@@ -217,6 +234,9 @@ def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.d
     """
     try:
         choix = planification.decider_depart(tournee, etat, ref, maintenant, parametres)
+        if choix != "attendre":
+            JOURNAL.debug("tournée %s (camion %s, %d demande(s)) : %s", tournee.get("id"), tournee.get("camion"),
+                          len(tournee.get("demandes", [])), choix)
         if choix == "partir":
             planification.faire_partir(tournee, etat, ref, maintenant, parametres["couts"], journal)
         elif choix == "refuser":
@@ -227,7 +247,9 @@ def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.d
             etat["flotte"][tournee["camion"]]["tournee"] = None
     except Exception as erreur:  # R-ROB-01 : la tournée sera réexaminée au tick suivant
         robustesse.signaler(etat.setdefault("messages", {}), "tournee", maintenant,
-                            "tournée %s en erreur (%r) : nouvel essai au prochain tick" % (tournee.get("id"), erreur))
+                            "tournée %s en erreur (%r) : nouvel essai au prochain tick" % (tournee.get("id"), erreur),
+                            module="moteur")
+        JOURNAL.debug("trace de la tournée %s en erreur", tournee.get("id"), exc_info=True)
 
 
 def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.datetime,
@@ -256,7 +278,54 @@ def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.d
         decider_tournee(tournee, etat, ref, maintenant, parametres, journal)
 
 
-def rafraichir_referentiel(ref: dict, messages: dict, maintenant: datetime.datetime) -> dict:
+def reprendre_flotte(etat: dict, ref: dict, chemin: str, maintenant: datetime.datetime) -> dict:
+    """Au démarrage en direct, remet les camions dans l'état laissé par le lancement précédent.
+
+    Applique la règle R-ROB-07 (:func:`flotte.restaurer_etat`) : un camion
+    parti avant un plantage ou un redémarrage reste occupé jusqu'à la fin de
+    sa tournée et repart de son dernier lieu. Ne lève jamais d'erreur ; un
+    fichier illisible est signalé et le moteur part de l'état des fiches.
+
+    :param etat: État du moteur (``flotte`` modifiée sur place).
+    :param ref: Référentiel.
+    :param chemin: Fichier d'état de la flotte.
+    :param maintenant: Heure réelle de démarrage.
+    :return: Bilan de :func:`flotte.restaurer_etat`.
+    """
+    try:
+        bilan = module_flotte.restaurer_etat(etat["flotte"], ref, chemin, maintenant)
+    except Exception as erreur:  # R-ROB-01 : jamais d'arrêt au démarrage pour cette reprise
+        bilan = {"restaures": 0, "occupes": 0, "ignores": 0, "raison": "erreur %r" % erreur}
+    if bilan["raison"] is None:
+        JOURNAL.warning("reprise de la flotte (R-ROB-07) : %d camion(s) remis dans leur état précédent, dont %d encore "
+                        "en tournée ; %d entrée(s) ignorée(s)", bilan["restaures"], bilan["occupes"], bilan["ignores"])
+    elif bilan["raison"].startswith(("fichier illisible", "erreur")):
+        JOURNAL.error("reprise de la flotte impossible (%s) : camions repris des fiches, à leur usine", bilan["raison"])
+    else:
+        JOURNAL.info("flotte : %s, camions repris des fiches", bilan["raison"])
+    return bilan
+
+
+def garder_flotte(etat: dict, chemin: str, maintenant: datetime.datetime, suivi: dict) -> None:
+    """Écrit l'état des camions sur disque après un tick, s'il a changé (règle R-ROB-07).
+
+    Ne lève jamais d'erreur : un échec est signalé (au plus une fois par
+    minute) et réessayé au tick suivant.
+
+    :param etat: État du moteur (``flotte``, ``messages``).
+    :param chemin: Fichier d'état de la flotte.
+    :param maintenant: Heure réelle courante.
+    :param suivi: Suivi du moteur ; ``suivi["flotte_ecrite"]`` garde le dernier contenu écrit.
+    """
+    contenu, erreur = module_flotte.sauvegarder_etat(etat["flotte"], chemin, maintenant, suivi.get("flotte_ecrite"))
+    suivi["flotte_ecrite"] = contenu
+    if erreur is not None:
+        robustesse.signaler(etat["messages"], "etat_flotte", maintenant, "état de la flotte non écrit dans %s (%r) : "
+                            "un redémarrage remettrait les camions partis à leur usine" % (chemin, erreur),
+                            logging.ERROR, "moteur")
+
+
+def rafraichir_referentiel(ref: dict, messages: dict, maintenant: datetime.datetime, sante: dict = None) -> dict:
     """Relit le référentiel dans la base, ou garde le précédent si elle ne répond pas.
 
     Applique la règle R-ROB-02 : une base injoignable ou lente (délais bornés
@@ -266,14 +335,20 @@ def rafraichir_referentiel(ref: dict, messages: dict, maintenant: datetime.datet
     :param ref: Référentiel courant.
     :param messages: Messages d'erreur déjà affichés (:func:`robustesse.signaler`).
     :param maintenant: Heure réelle.
+    :param sante: Santé du référentiel (:func:`robustesse.nouvel_etat_bdd`), modifiée sur place si donnée.
     :return: Nouveau référentiel, ou ``ref`` en cas d'erreur.
     """
     try:
-        return referentiels.charger_depuis_bdd()
+        nouveau = referentiels.charger_depuis_bdd()
     except Exception as erreur:  # R-ROB-02 : base en panne, on garde le référentiel précédent
+        if sante is not None:
+            robustesse.noter_echec_bdd(sante, maintenant, erreur)
         robustesse.signaler(messages, "referentiel", maintenant, "base injoignable (%s) : référentiel lu à %s gardé"
-                            % (str(erreur).strip() or type(erreur).__name__, ref.get("lu_a", "?")))
+                            % (journalisation.texte_erreur(erreur), ref.get("lu_a", "?")), module="moteur")
         return ref
+    if sante is not None:
+        robustesse.noter_succes_bdd(sante, maintenant, 0, "référentiel")
+    return nouveau
 
 
 def charger_bdd_ou_copie(copie: str = None) -> dict:
@@ -293,8 +368,8 @@ def charger_bdd_ou_copie(copie: str = None) -> dict:
     except Exception as erreur:
         if not os.path.exists(copie):
             raise
-        print("! base injoignable au démarrage (%s) : copie %s, remplacée dès que la base répond"
-              % (str(erreur).strip() or type(erreur).__name__, os.path.abspath(copie)), flush=True)
+        JOURNAL.warning("base injoignable au démarrage (%s) : copie %s, remplacée dès que la base répond",
+                        journalisation.texte_erreur(erreur), os.path.abspath(copie))
         return referentiels.charger_depuis_json(copie)
 
 
@@ -357,14 +432,17 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     parametres = {"couts": couts, "seuil": arguments.seuil if arguments.seuil is not None else hypotheses.SEUIL_DEPART_DEFAUT,
                   "marge_h": arguments.marge if arguments.marge is not None else hypotheses.MARGE_DEPART_H}
     if audit:
-        print("== MODE AUDIT (production) : base, archivage, fiches de la VM, Annexe 2 ==")
-    print("Référentiel : %s" % ref["source"])
+        JOURNAL.info("== MODE AUDIT (production) : base, archivage, fiches de la VM, Annexe 2 ==")
+    JOURNAL.info("référentiel : %s", ref["source"])
     for remarque in ref.get("remarques", []):
-        print("  ! %s" % remarque)
-    print("Fiches camion : %s\nFlotte NORTH : %d camions\n%s" % (os.path.abspath(fiches), len(flotte), module_flotte.resume_flotte(flotte, ref)))
-    print("Coûts : %s ; seuil de départ θ = %.2f ; marge W = %.1f h projet"
-          % ("Annexe 2" if couts["source"] != "defaut" else "taux par défaut", parametres["seuil"], parametres["marge_h"]))
-    # Le préfixe des tournées (heure de démarrage) les rend uniques d'un lancement à l'autre (TRAJET_NORTH)
+        JOURNAL.warning("référentiel : %s", remarque)
+    JOURNAL.info("fiches camion : %s ; flotte NORTH : %d camions\n%s", os.path.abspath(fiches), len(flotte),
+                 module_flotte.resume_flotte(flotte, ref))
+    if not flotte:
+        JOURNAL.error("aucun camion NORTH exploitable dans %s : toutes les demandes seront refusées", os.path.abspath(fiches))
+    JOURNAL.info("coûts : %s ; seuil de départ θ = %.2f ; marge W = %.1f h projet",
+                 "Annexe 2" if couts["source"] != "defaut" else "taux par défaut", parametres["seuil"], parametres["marge_h"])
+    # Le préfixe des tournées (heure de démarrage) les rend uniques d'un lancement à l'autre (LOG_NORTH_TRAJET)
     etat = {"flotte": flotte, "tournees": {}, "demandes": {}, "compteur": 0,
             "prefixe": debut.strftime("T%y%m%d%H%M%S-"), "deja_archivees": set(), "messages": {}}
     return etat, ref, parametres
@@ -408,29 +486,71 @@ def en_direct(arguments: argparse.Namespace) -> None:
     Applique les règles R-ROB-01 à R-ROB-03 : une erreur pendant un tick est
     signalée et le moteur passe au tick suivant ; la base est réessayée une
     fois par minute ; à l'arrêt, la dernière synchronisation des tables
-    ``*_NORTH`` est faite. Un tick plus long que :data:`hypotheses.TICK_S`
+    ``LOG_NORTH_*`` est faite. Un tick plus long que :data:`hypotheses.TICK_S`
     est signalé (le moteur prend du retard sur l'ERP).
 
     :param arguments: Options de la ligne de commande.
     """
     debut = datetime.datetime.now()
     etat, ref, parametres = preparer(arguments, debut)
+    # R-ROB-07 : avant tout, les camions partis avant un arrêt restent occupés
+    reprendre_flotte(etat, ref, FICHIER_ETAT_FLOTTE, debut)
     messages = etat["messages"]
     journal = tracabilite.ouvrir_journal(arguments.sortie, debut)
     lecteur = {"repertoire": arguments.demandes, "messages": messages}
     dernier_rafraichissement = debut
+    sante_ref = robustesse.nouvel_etat_bdd(actif=bool(arguments.bdd))
+    if arguments.bdd and ref.get("source") == "bdd":
+        robustesse.noter_succes_bdd(sante_ref, debut, 0, "référentiel")
     archive = archivage.ouvrir() if arguments.archiver else None
     if archive is not None:
         # Avant la première lecture : reprise après arrêt (commandes déjà archivées) et flotte en base
         archivage.synchroniser(archive, etat, ref, parametres["couts"], debut)
-        print("Archivage dans CAMION_NORTH, TRAJET_NORTH, ARCHIVAGE_COMMANDE_NORTH : %d ligne(s) écrite(s)" % archive["ecrites"])
+        if archive["sante"]["echecs"]:
+            JOURNAL.error("archivage dans LOG_NORTH_CAMION, LOG_NORTH_TRAJET, LOG_NORTH_ARCHIVAGE_COMMANDE EN ÉCHEC au "
+                          "démarrage : %s (le moteur décide quand même ; nouvel essai à chaque tick)",
+                          archive["sante"]["derniere_erreur"])
+        else:
+            JOURNAL.info("archivage dans LOG_NORTH_CAMION, LOG_NORTH_TRAJET, LOG_NORTH_ARCHIVAGE_COMMANDE : %d ligne(s) écrite(s)",
+                         archive["ecrites"])
     controle = tracabilite_controle.ouvrir() if getattr(arguments, "controle", False) else None
     if controle is not None:
         # Avant la première lecture : nos commandes déjà dans les tables du Contrôle sont protégées (R-CTL-01)
         tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], debut)
-        print("Traçabilité Contrôle (TRACABILITE_COMMANDE, TRACABILITE_TRAJET, ID_ENTRE %s) active"
-              % hypotheses.ID_ENTREPRISE, flush=True)
-    print("Moteur en direct sur %s ; 'Ctrl+C' pour arrêter" % os.path.abspath(arguments.demandes), flush=True)
+        if controle["sante"]["echecs"]:
+            JOURNAL.error("traçabilité Contrôle EN ÉCHEC au démarrage : %s", controle["sante"]["derniere_erreur"])
+        else:
+            JOURNAL.info("traçabilité Contrôle (TRACABILITE_COMMANDE, TRACABILITE_TRAJET, ID_ENTRE %s1, %s2…) active",
+                         hypotheses.PREFIXE_ENTREPRISE, hypotheses.PREFIXE_ENTREPRISE)
+    JOURNAL.info("moteur en direct sur %s ; journal %s ; 'Ctrl+C' pour arrêter", os.path.abspath(arguments.demandes),
+                 os.path.abspath(journal["chemin"]))
+    suivi = {"debut": debut, "ticks": 0, "duree_tick_s": 0.0, "duree_max_s": 0.0, "dernier_tick": None, "nouvelles": 0}
+
+    def ecrire_sante(statut: str) -> None:
+        """Écrit ``sante_moteur.json`` (règle R-ROB-06) ; ne lève jamais d'erreur.
+
+        :param statut: ``en marche``, ``arrêté``…
+        """
+        try:
+            kpi = tracabilite.calculer_kpi(etat)
+            journalisation.ecrire_sante("moteur", {
+                "statut": statut, "mode": "audit" if getattr(arguments, "audit", False) else "direct",
+                "debug": journalisation.CONFIG["debug"], "debut": debut, "dernier_tick": suivi["dernier_tick"],
+                "ticks": suivi["ticks"], "duree_tick_s": round(suivi["duree_tick_s"], 3),
+                "duree_max_s": round(suivi["duree_max_s"], 3), "tick_s": hypotheses.TICK_S,
+                "demandes_lues": suivi["nouvelles"], "demandes_decidees": len(etat["demandes"]),
+                "tournees_ouvertes": sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte"),
+                "ta": kpi["ta"], "tr": kpi["tr"], "incidents": messages.get("nb", 0),
+                "lignes_illisibles": lecteur.get("ignorees", 0), "journal": os.path.abspath(journal["chemin"]),
+                "referentiel": dict(sante_ref, source=ref.get("source"), lu_a=ref.get("lu_a")),
+                "archivage": dict(archive["sante"], non_archivables=len(archive["non_archivables"]))
+                if archive is not None else robustesse.nouvel_etat_bdd(actif=False),
+                "controle": dict(controle["sante"], non_ecrivables=len(controle["non_ecrivables"]))
+                if controle is not None else robustesse.nouvel_etat_bdd(actif=False)})
+        except Exception as erreur:  # la santé ne doit jamais arrêter le moteur
+            JOURNAL.debug("santé non écrite : %r", erreur)
+
+    ecrire_sante("en marche")
     try:
         while True:
             debut_tick = time.monotonic()
@@ -439,39 +559,57 @@ def en_direct(arguments: argparse.Namespace) -> None:
                 # TRAVEL_TIME_MATRIX et PORTS_AVAILABILITY changent toutes les heures projet (1 min réelle)
                 if arguments.bdd and maintenant - dernier_rafraichissement >= datetime.timedelta(minutes=1):
                     dernier_rafraichissement = maintenant  # même en échec : un seul essai par minute
-                    ref = rafraichir_referentiel(ref, messages, maintenant)
+                    ref = rafraichir_referentiel(ref, messages, maintenant, sante_ref)
                 nouvelles = lire_nouvelles_lignes(lecteur, maintenant)
+                suivi["nouvelles"] += len(nouvelles)
                 executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
+                garder_flotte(etat, FICHIER_ETAT_FLOTTE, maintenant, suivi)
                 if archive is not None:
                     archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
                 if controle is not None:
                     tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], maintenant)
                 if nouvelles:
                     kpi = tracabilite.calculer_kpi(etat)
-                    print("[%s] %d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d"
-                          % (maintenant.strftime("%H:%M:%S"), len(nouvelles), 100 * kpi["ta"], 100 * kpi["tr"],
-                             sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte")), flush=True)
+                    JOURNAL.info("%d nouvelle(s) ; TA %.1f %%, TR %.1f %%, tournées ouvertes %d", len(nouvelles),
+                                 100 * kpi["ta"], 100 * kpi["tr"],
+                                 sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte"))
             except Exception as erreur:  # R-ROB-01 : dernier filet, le moteur passe au tick suivant
-                robustesse.signaler(messages, "tick", maintenant, "tick en erreur (%r) : le moteur continue" % erreur)
+                robustesse.signaler(messages, "tick", maintenant, "tick en erreur (%r) : le moteur continue" % erreur,
+                                    logging.ERROR, "moteur")
+                JOURNAL.debug("trace du tick en erreur", exc_info=True)
             duree = time.monotonic() - debut_tick
+            suivi.update({"ticks": suivi["ticks"] + 1, "duree_tick_s": duree, "dernier_tick": maintenant,
+                          "duree_max_s": max(suivi["duree_max_s"], duree)})
+            JOURNAL.debug("tick %d en %.3f s", suivi["ticks"], duree)
             if duree > hypotheses.TICK_S:
                 robustesse.signaler(messages, "lenteur", maintenant, "tick de %.1f s (> %d s) : le moteur prend du retard"
-                                    % (duree, hypotheses.TICK_S))
+                                    % (duree, hypotheses.TICK_S), module="moteur")
+            ecrire_sante("en marche")
             time.sleep(max(0.0, hypotheses.TICK_S - duree))
     except KeyboardInterrupt:
-        print("\nArrêt du moteur (%d incident(s) signalé(s), %d ligne(s) illisible(s) ignorée(s)).\n%s"
-              % (messages.get("nb", 0), lecteur.get("ignorees", 0), tracabilite.resume_kpi(tracabilite.calculer_kpi(etat))))
+        JOURNAL.info("arrêt du moteur (%d incident(s) signalé(s), %d ligne(s) illisible(s) ignorée(s)).\n%s",
+                     messages.get("nb", 0), lecteur.get("ignorees", 0), tracabilite.resume_kpi(tracabilite.calculer_kpi(etat)))
     finally:
+        garder_flotte(etat, FICHIER_ETAT_FLOTTE, datetime.datetime.now(), suivi)
         if archive is not None:
             archivage.synchroniser(archive, etat, ref, parametres["couts"], datetime.datetime.now())
             archivage.fermer(archive)
-            print("Archivage : %d ligne(s) écrite(s), %d demande(s) non archivable(s) (données invalides, au journal seulement)"
-                  % (archive["ecrites"], len(archive["non_archivables"])), flush=True)
+            JOURNAL.info("archivage : %d ligne(s) écrite(s), %d demande(s) non archivable(s) (données invalides, au journal "
+                         "seulement), %d ligne(s) rejetée(s), %d en attente", archive["ecrites"],
+                         len(archive["non_archivables"]), archive["sante"]["rejetees"], archive["sante"]["en_attente"])
+            if archive["sante"]["en_attente"]:
+                JOURNAL.error("archivage : %d ligne(s) jamais écrites à l'arrêt (dernière erreur : %s)",
+                              archive["sante"]["en_attente"], archive["sante"]["derniere_erreur"])
         if controle is not None:
             tracabilite_controle.synchroniser(controle, etat, ref, parametres["couts"], datetime.datetime.now())
             tracabilite_controle.fermer(controle)
-            print("Traçabilité Contrôle : %d ligne(s) écrite(s), %d commande(s) non écrivable(s) (quantité ou H_DEP illisible)"
-                  % (controle["ecrites"], len(controle["non_ecrivables"])), flush=True)
+            JOURNAL.info("traçabilité Contrôle : %d ligne(s) écrite(s), %d commande(s) non écrivable(s) (quantité ou H_DEP "
+                         "illisible), %d en attente", controle["ecrites"], len(controle["non_ecrivables"]),
+                         controle["sante"]["en_attente"])
+            if controle["sante"]["en_attente"]:
+                JOURNAL.error("traçabilité Contrôle : %d ligne(s) jamais écrites à l'arrêt (dernière erreur : %s)",
+                              controle["sante"]["en_attente"], controle["sante"]["derniere_erreur"])
+        ecrire_sante("arrêté")
 
 
 if __name__ == "__main__":
@@ -484,7 +622,7 @@ if __name__ == "__main__":
                            "Annexe 2 et fiches de la VM obligatoires")
     parseur.add_argument("--bdd", action="store_true", help="lit le référentiel dans la base (VM)")
     parseur.add_argument("--archiver", action="store_true",
-                         help="mode direct : écrit CAMION_NORTH, TRAJET_NORTH et ARCHIVAGE_COMMANDE_NORTH dans la base (VM)")
+                         help="mode direct : écrit LOG_NORTH_CAMION, LOG_NORTH_TRAJET et LOG_NORTH_ARCHIVAGE_COMMANDE dans la base (VM)")
     parseur.add_argument("--controle", action="store_true",
                          help="mode direct : remplit TRACABILITE_COMMANDE et TRACABILITE_TRAJET (tables du Contrôle, VM)")
     parseur.add_argument("--referentiels", default=None, help="référentiel JSON (défaut : ../donnees/referentiels.json, sinon exemple) ; "
@@ -494,7 +632,11 @@ if __name__ == "__main__":
     parseur.add_argument("--sortie", default=REPERTOIRE_SORTIE, help="dossier des journaux")
     parseur.add_argument("--seuil", type=float, default=None, help="seuil de départ θ (taux de remplissage, 0-1)")
     parseur.add_argument("--marge", type=float, default=None, help="marge W avant le départ au plus tard (h projet)")
+    parseur.add_argument("--debug", action="store_true",
+                         help="mode débogage : chaque décision, chaque tick et chaque requête SQL dans la console et les journaux")
+    parseur.add_argument("--logs", default=None, help="dossier des journaux (défaut : ../donnees/logs)")
     options = parseur.parse_args()
+    journalisation.configurer("moteur", options.debug, options.logs, sql=not options.rejeu)
     robustesse.arreter_sur_sigterm()  # R-ROB-03 : « nord.sh arreter » envoie SIGTERM
     if options.audit:
         # R-ROB-05 : le mode audit impose la base et l'archivage, et ignore les sources de remplacement
@@ -510,4 +652,5 @@ if __name__ == "__main__":
         else:
             en_direct(options)
     except ErreurAudit as erreur:
-        raise SystemExit("! %s : le moteur ne démarre pas" % erreur)
+        JOURNAL.critical("%s : le moteur ne démarre pas", erreur)
+        raise SystemExit(1)

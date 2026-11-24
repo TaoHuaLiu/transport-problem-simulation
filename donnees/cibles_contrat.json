@@ -1,0 +1,7 @@
+{
+  "ta": 0.75,
+  "tr": 0.62,
+  "part_haute": 0.50,
+  "_source": "Contrat_EURO-NORD-EU_v3.docx (2026-11-20) : §4.3 TA cible = (min(k×N_F) + min(k×N_S)) / N_D, plafonnée à 75 % (3 000 camions, ≈ 294 frigorifiques / 336 non frigorifiques NORTH, ≈ 2 116 demandes NORTH en 2 h) ; §4.1 TR cible 62 % si q ≥ 1 000 demandes NORTH / h réelle (55 % si 500–999, 46 % si 250–499, 40 % sous 250) ; §4.2 au moins 50 % de trajets en gamme haute (et 90 % haute + médiane, non suivi par le tableau de bord).",
+  "_a_revoir_le_jour_de_l_audit": "TA et TR dépendent de la flotte et du débit réels de l'audit : recalculer avec les formules du contrat, ou lancer tableau_bord.py --cible-ta X --cible-tr Y."
+}
