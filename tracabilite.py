@@ -6,7 +6,10 @@ Chaque décision et chaque mouvement est écrit dans un journal CSV local
 - ``ACQUITTEMENT`` / ``REFUS`` (avec motif ``REF-…``) : décision D-ACC ;
 - ``DEPART`` : une tournée part ; ``TRONCON`` : un trajet de cette tournée ;
 - ``PARTIE`` : une demande quitte son lieu de départ (avec sa gamme) ;
-- ``EXPIRATION`` : une demande acceptée n'est pas partie avant ``H_DEP``.
+- ``REAFFECTATION`` : une demande acceptée, retirée d'un plan devenu impossible,
+  est replacée dans une autre tournée (R-DEL-02) ;
+- ``EXPIRATION`` : une demande acceptée n'est pas partie avant ``H_DEP``, ou
+  n'a trouvé aucun autre plan après son retrait (R-DEL-02, motif de D-ACC).
 
 Les demandes hors périmètre NORTH ne sont pas journalisées : elles restent
 seulement dans l'état du moteur (``etat = "IGNOREE"``).
@@ -15,11 +18,20 @@ Ce journal est la source de référence. Les tables ``LOG_NORTH_*`` de la base
 (camions, trajets, commandes) en sont le reflet, écrit par :mod:`archivage`.
 L'écriture dans la table traçabilité partagée attend son schéma, fixé par le
 Contrôle (question A1).
+
+Règle R-ROB-08 : :func:`noter` ne lève jamais d'erreur. Une ligne qui ne peut
+pas être écrite (disque plein, droits, fichier supprimé) reste en mémoire et
+est réécrite, dans l'ordre, à l'événement suivant ; l'échec est journalisé en
+erreur, compté dans ``journal["sante"]`` (repris dans ``sante_moteur.json``
+sous la clé ``evenements``) et le rétablissement est annoncé.
 """
 
 import csv
 import datetime
+import logging
 import os
+
+import robustesse
 
 #: Colonnes du journal, dans l'ordre.
 COLONNES = ["H_EVENEMENT", "EVENEMENT", "ID_DEMANDE", "ID_TOURNEE", "IMMAT", "LIEU_DEP", "LIEU_ARR",
@@ -28,6 +40,10 @@ COLONNES = ["H_EVENEMENT", "EVENEMENT", "ID_DEMANDE", "ID_TOURNEE", "IMMAT", "LI
 #: Format des dates du journal (heure réelle).
 FORMAT_DATE = "%Y-%m-%d %H:%M:%S"
 
+#: Nombre maximal de lignes gardées en mémoire quand le fichier ne peut pas être écrit (R-ROB-08) ;
+#: au-delà, les plus anciennes sont perdues et comptées dans ``journal["perdus"]``.
+MAX_EN_ATTENTE = 100000
+
 
 def ouvrir_journal(repertoire: str, debut: datetime.datetime, suffixe: str = "") -> dict:
     """Crée le fichier du journal et son en-tête.
@@ -35,18 +51,24 @@ def ouvrir_journal(repertoire: str, debut: datetime.datetime, suffixe: str = "")
     :param repertoire: Dossier de sortie (créé si besoin).
     :param debut: Heure réelle de démarrage, qui nomme le fichier.
     :param suffixe: Complément du nom (par exemple ``"_rejeu"``).
-    :return: Journal : ``{"chemin", "nb"}``.
+    :return: Journal : ``{"chemin", "nb", "en_attente", "perdus", "messages", "sante"}`` ; ``nb`` = lignes
+        écrites, ``en_attente`` = lignes pas encore écrites (R-ROB-08), ``sante`` = :func:`robustesse.nouvel_etat_bdd`.
     """
     os.makedirs(repertoire, exist_ok=True)
     chemin = os.path.join(repertoire, "evenements_%s%s.csv" % (debut.strftime("%Y-%m-%d_%H%M%S"), suffixe))
     with open(chemin, "w", newline="", encoding="utf-8") as fichier:
         csv.DictWriter(fichier, fieldnames=COLONNES, delimiter=";").writeheader()
-    return {"chemin": chemin, "nb": 0}
+    return {"chemin": chemin, "nb": 0, "en_attente": [], "perdus": 0, "messages": {}, "sante": robustesse.nouvel_etat_bdd()}
 
 
 def noter(journal: dict, maintenant: datetime.datetime, evenement: str, demande: dict = None, tournee: dict = None,
           troncon: dict = None, motif: str = "", gamme: str = "", remplissage: float = None, detail: str = "") -> None:
-    """Ajoute un événement au journal.
+    """Ajoute un événement au journal, sans jamais lever d'erreur.
+
+    Applique la règle R-ROB-08 : si le fichier ne peut pas être écrit, la
+    ligne est gardée en mémoire (au plus :data:`MAX_EN_ATTENTE`) et réécrite
+    avec les suivantes ; l'échec est signalé en erreur (au plus une fois par
+    minute) et noté dans ``journal["sante"]``.
 
     :param journal: Journal ouvert par :func:`ouvrir_journal`.
     :param maintenant: Heure réelle de l'événement.
@@ -72,9 +94,43 @@ def noter(journal: dict, maintenant: datetime.datetime, evenement: str, demande:
         remplissage = troncon["remplissage"]
     if remplissage is not None:
         ligne["REMPLISSAGE"] = "%.3f" % remplissage
-    with open(journal["chemin"], "a", newline="", encoding="utf-8") as fichier:
-        csv.DictWriter(fichier, fieldnames=COLONNES, delimiter=";").writerow(ligne)
-    journal["nb"] += 1
+    en_attente = journal.setdefault("en_attente", [])
+    en_attente.append(ligne)
+    if len(en_attente) > MAX_EN_ATTENTE:
+        trop = len(en_attente) - MAX_EN_ATTENTE
+        del en_attente[:trop]
+        journal["perdus"] = journal.get("perdus", 0) + trop
+    ecrire_en_attente(journal, maintenant)
+
+
+def ecrire_en_attente(journal: dict, maintenant: datetime.datetime) -> bool:
+    """Écrit les lignes en attente du journal ; ne lève jamais d'erreur.
+
+    Applique la règle R-ROB-08.
+
+    :param journal: Journal ouvert par :func:`ouvrir_journal`.
+    :param maintenant: Heure réelle (ou simulée en rejeu), pour les messages et la santé.
+    :return: ``True`` s'il ne reste aucune ligne en attente.
+    """
+    en_attente = journal.setdefault("en_attente", [])
+    sante = journal.setdefault("sante", robustesse.nouvel_etat_bdd())
+    if not en_attente:
+        return True
+    nombre = len(en_attente)
+    try:
+        with open(journal["chemin"], "a", newline="", encoding="utf-8") as fichier:
+            csv.DictWriter(fichier, fieldnames=COLONNES, delimiter=";").writerows(en_attente)
+    except (OSError, ValueError, csv.Error) as erreur:  # disque plein, droits, fichier supprimé…
+        robustesse.noter_echec_bdd(sante, maintenant, erreur, nombre)
+        robustesse.signaler(journal.setdefault("messages", {}), "journal", maintenant,
+                            "journal des événements %s EN ÉCHEC (%r) : %d ligne(s) gardée(s) en mémoire, %d perdue(s)"
+                            % (os.path.basename(journal["chemin"]), erreur, nombre, journal.get("perdus", 0)),
+                            logging.ERROR, "tracabilite")
+        return False
+    del en_attente[:]
+    journal["nb"] = journal.get("nb", 0) + nombre
+    robustesse.noter_succes_bdd(sante, maintenant, nombre, "journal des événements")
+    return True
 
 
 def calculer_kpi(etat: dict) -> dict:

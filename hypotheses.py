@@ -10,7 +10,7 @@ Unités : sauf mention contraire, les durées sont en **heures projet**
 
 Les données confidentielles de l'Annexe 2 (taux horaires, seuil de
 rentabilité) ne sont pas écrites ici : elles sont lues dans
-:data:`FICHIER_CONFIDENTIEL`, hors du code partagé.
+:data:`FICHIER_CONFIDENTIEL` (``../donnees/`` ou ``donnees/``).
 """
 
 import json
@@ -36,6 +36,11 @@ DECLASSEMENT_SPEC = "un_cran"
 
 #: A5 : ``PTAC=12t`` exige exactement 12 t (``False``) ou au moins 12 t (``True``).
 PTAC_SPEC_MINIMUM = False
+
+#: R-SPEC-03 : un camion de PTAC supérieur au PTAC demandé dans la SPEC n'est jamais
+#: utilisé, même si la SPEC est souple (contrat §4.2 : « pour un PTAC dépassé, c'est
+#: éliminatoire »). Un camion plus léger reste possible, gamme abaissée (R-SPEC-02).
+PTAC_DEPASSE_INTERDIT = True
 
 #: Une clé SPEC inconnue (autre que PTAC, ENR, COL) ne peut pas être vérifiée :
 #: ``True`` la traite comme non respectée (gamme abaissée, R-SPEC-02 ; refus REF-SPEC
@@ -147,9 +152,34 @@ PRIX_ENERGIE = {"Diesel": 1.70, "Essence": 1.85, "GPL": 1.00, "Electrique": 0.25
 COLONNE_CONSOMMATION = {"Diesel": "DIESEL (L)", "Essence": "GASOLINE (L)",
                         "GPL": "LPG (kg)", "Electrique": "ELECTRIC (kWh)"}
 
-#: Fichier des données confidentielles (Annexe 2), hors du dossier de code.
-FICHIER_CONFIDENTIEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "donnees", "annexe2_confidentiel.json")
+#: Dossier du code (``1 - DEV/`` en local, ``nord/DEV/`` sur la VM, racine du dépôt GitHub).
+DOSSIER_CODE = os.path.dirname(os.path.abspath(__file__))
+
+
+def chemin_donnees_contrat(nom: str, dossier_code: str = DOSSIER_CODE) -> str:
+    """Chemin d'un fichier de données du contrat (Annexe 2, cibles), selon la disposition.
+
+    Le paquet VM et le dépôt local rangent ces fichiers dans ``../donnees/``
+    (à côté du dossier de code) ; le miroir GitHub les range dans
+    ``donnees/`` (dans le dossier de code). On prend ``../donnees/<nom>`` s'il
+    existe, sinon ``donnees/<nom>`` s'il existe, sinon ``../donnees/<nom>``
+    (chemin attendu, cité dans les messages d'absence).
+    Applique la règle R-ROB-05 (préalable de l'audit : Annexe 2 trouvée dans
+    les deux dispositions).
+
+    :param nom: Nom du fichier, par exemple ``annexe2_confidentiel.json``.
+    :param dossier_code: Dossier du code (par défaut celui de ce module).
+    :return: Chemin du fichier retenu.
+    """
+    voisin = os.path.join(dossier_code, "..", "donnees", nom)
+    interne = os.path.join(dossier_code, "donnees", nom)
+    if not os.path.exists(voisin) and os.path.exists(interne):
+        return interne
+    return voisin
+
+
+#: Fichier des données de l'Annexe 2 (voir :func:`chemin_donnees_contrat`).
+FICHIER_CONFIDENTIEL = chemin_donnees_contrat("annexe2_confidentiel.json")
 
 
 def charger_confidentiel(chemin: str = FICHIER_CONFIDENTIEL) -> dict:

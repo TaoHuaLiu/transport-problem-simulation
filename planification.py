@@ -384,6 +384,9 @@ def decider_depart(tournee: dict, etat: dict, ref: dict, maintenant: datetime.da
     la règle R-RENT-01 (ne partir qu'à partir du seuil de remplissage, sauf à
     l'heure limite) :
 
+    0. plan devenu impossible pour une autre raison que le délai (gamme,
+       capacité, trajet inconnu, par exemple après le rafraîchissement du
+       référentiel) → ``"reparer"`` (R-DEL-02, :func:`retirer_bloquantes`) ;
     1. remplissage prévu ≥ seuil θ → ``"partir"`` ;
     2. sous le seuil, heure limite pas atteinte → ``"attendre"`` ;
     3. sous le seuil, heure limite atteinte → ``"partir"`` ou ``"refuser"``
@@ -398,18 +401,74 @@ def decider_depart(tournee: dict, etat: dict, ref: dict, maintenant: datetime.da
     :param ref: Référentiel.
     :param maintenant: Heure réelle courante.
     :param parametres: ``seuil`` (θ, taux entre 0 et 1), ``marge_h`` (W, heures projet), ``couts``.
-    :return: ``"partir"``, ``"attendre"`` ou ``"refuser"``.
+    :return: ``"reparer"``, ``"partir"``, ``"attendre"`` ou ``"refuser"``.
     """
     camion = etat["flotte"][tournee["camion"]]
     demandes = [etat["demandes"][i] for i in tournee["demandes"]]
     plan = evaluer_plan(ref, camion, demandes, max(maintenant, camion["libre_a"]), maintenant, parametres["couts"])
     tournee["plan"] = plan
+    # Ligne 0 (R-DEL-02) : le délai est traité au départ (R-DEL-01) ; tout autre échec se répare
+    if not plan["ok"] and plan["motif"] != "DELAI":
+        return "reparer"
     mesure = plan["remplissage_max"] if hypotheses.SEUIL_MESURE == "maximum" else plan["remplissage"]
     if plan["ok"] and mesure >= parametres["seuil"]:
         return "partir"
     if plan["ok"] and plan["marge_h"] > parametres["marge_h"]:
         return "attendre"
     return "refuser" if hypotheses.SOUS_SEUIL == "refuser" else "partir"
+
+
+def retirer_bloquantes(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime, couts: dict) -> list:
+    """Retire d'une tournée ouverte les demandes qui rendent son plan impossible.
+
+    Applique la règle R-DEL-02 (D-DEPART ligne 0) : un plan accepté peut
+    devenir impossible sans qu'aucune demande soit en retard, par exemple
+    quand le rafraîchissement des temps de trajet ou des attentes portuaires
+    fait sortir une demande de la gamme basse (R-GAM). On retire alors le
+    moins possible : à chaque tour, la demande dont le retrait rend le plan
+    réalisable en gardant le plus de chargement (puis le coût le plus bas) ;
+    si aucun retrait seul ne suffit, la demande hors gamme, sinon la dernière
+    acceptée, puis on recommence. On s'arrête dès que le plan est réalisable
+    ou qu'il n'échoue plus que sur le délai (traité par :func:`faire_partir`).
+
+    Les demandes retirées gardent leur état ; l'appelant les réaffecte
+    (:func:`decision.reaffecter`). La tournée vidée n'est pas annulée ici.
+
+    :param tournee: Tournée ouverte, modifiée sur place (``demandes``, ``plan``).
+    :param etat: État du moteur (``flotte``, ``demandes``).
+    :param ref: Référentiel.
+    :param maintenant: Heure réelle courante.
+    :param couts: Taux horaires.
+    :return: Identifiants des demandes retirées, dans l'ordre du retrait.
+    """
+    camion = etat["flotte"][tournee["camion"]]
+    debut = max(maintenant, camion["libre_a"])
+    retirees = []
+    while tournee["demandes"]:
+        demandes = [etat["demandes"][i] for i in tournee["demandes"]]
+        plan = evaluer_plan(ref, camion, demandes, debut, maintenant, couts)
+        tournee["plan"] = plan
+        if plan["ok"] or plan["motif"] == "DELAI":
+            break
+        # Retrait d'une seule demande : garder le plus de chargement, puis le coût le plus bas
+        meilleur = None
+        for demande in demandes:
+            reste = [d for d in demandes if d is not demande]
+            if not reste:
+                continue
+            essai = evaluer_plan(ref, camion, reste, debut, maintenant, couts)
+            if essai["ok"]:
+                cle = (-essai["remplissage_max"], essai["cout"])
+                if meilleur is None or cle < meilleur[0]:
+                    meilleur = (cle, demande["id"])
+        if meilleur is not None:
+            victime = meilleur[1]
+        else:
+            hors_gamme = [i for i in tournee["demandes"] if "gamme" in plan["suivi"][i] and plan["suivi"][i]["gamme"] is None]
+            victime = hors_gamme[0] if hors_gamme else tournee["demandes"][-1]
+        tournee["demandes"].remove(victime)
+        retirees.append(victime)
+    return retirees
 
 
 def faire_partir(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime, couts: dict, journal: dict) -> None:
@@ -437,7 +496,8 @@ def faire_partir(tournee: dict, etat: dict, ref: dict, maintenant: datetime.date
         plan = evaluer_plan(ref, camion, demandes, debut, maintenant, couts)
         if plan["ok"]:
             break
-        # Retire les demandes en retard (toutes si le plan échoue pour une autre raison)
+        # Retire les demandes en retard ; toutes en dernier recours si le plan échoue pour une
+        # autre raison (normalement réparé avant par D-DEPART ligne 0, R-DEL-02)
         en_retard = [d["id"] for d in demandes
                      if "depart_controle" in plan["suivi"][d["id"]] and plan["suivi"][d["id"]]["depart_controle"] > d["h_dep"]]
         for id_demande in (en_retard or list(tournee["demandes"])):
@@ -449,8 +509,13 @@ def faire_partir(tournee: dict, etat: dict, ref: dict, maintenant: datetime.date
     if not tournee["demandes"]:
         tournee["statut"] = "annulee"
         return
+    # Tout l'état d'abord (tournée, camion, demandes), puis le journal : un événement
+    # non écrit ne peut pas laisser une tournée partie avec des demandes encore acceptées (R-ROB-08)
     tournee.update({"statut": "partie", "plan": plan})
     camion.update({"position": plan["lieu_fin"], "libre_a": plan["fin"], "conduite_jour": plan["conduite_jour"]})
+    for id_demande in tournee["demandes"]:
+        suivi = plan["suivi"][id_demande]
+        etat["demandes"][id_demande].update({"etat": "PARTIE", "gamme": suivi["gamme"], "h_depart": suivi["depart_controle"]})
     tracabilite.noter(journal, maintenant, "DEPART", tournee=tournee, remplissage=plan["remplissage"],
                       detail="fin %s, %d demande(s)" % (plan["fin"].strftime("%H:%M:%S"), len(tournee["demandes"])))
     for troncon in plan["troncons"]:
@@ -458,7 +523,6 @@ def faire_partir(tournee: dict, etat: dict, ref: dict, maintenant: datetime.date
     for id_demande in tournee["demandes"]:
         demande = etat["demandes"][id_demande]
         suivi = plan["suivi"][id_demande]
-        demande.update({"etat": "PARTIE", "gamme": suivi["gamme"], "h_depart": suivi["depart_controle"]})
         # Le premier horaire du détail est celui comparé à H_DEP (départ à vide de l'usine pour un import)
         if est_import_port(demande):
             detail = "départ %s (usine, à vide vers le port), chargé au port %s, arrivée %s" % (

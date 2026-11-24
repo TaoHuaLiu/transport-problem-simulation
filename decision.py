@@ -41,7 +41,8 @@ def compatible(tournee: dict, demande: dict, etat: dict, ref: dict) -> bool:
 
     Applique les règles R-FRA-01 (même nature, jamais frais et sec ensemble),
     R-SPEC-01 (le camion de la tournée respecte la SPEC de la nouvelle
-    demande, seulement si :data:`hypotheses.SPEC_BLOQUANTE`), R-CAP-01 (le plancher reste ≤ 1), R-OPT-03
+    demande, seulement si :data:`hypotheses.SPEC_BLOQUANTE`), R-SPEC-03 (jamais
+    un camion plus lourd que le PTAC de la SPEC), R-CAP-01 (le plancher reste ≤ 1), R-OPT-03
     (regrouper les demandes compatibles) et l'hypothèse C13 (même lieu
     de chargement seulement si :data:`hypotheses.REGROUPER_ENTRE_LIEUX_DEP` est faux).
     Les délais sont vérifiés ensuite par le plan.
@@ -53,7 +54,7 @@ def compatible(tournee: dict, demande: dict, etat: dict, ref: dict) -> bool:
     :return: ``True`` si l'insertion mérite d'être évaluée.
     """
     camion = etat["flotte"][tournee["camion"]]
-    spec_ko = hypotheses.SPEC_BLOQUANTE and regles.verifier_spec(demande, camion)
+    spec_ko = (hypotheses.SPEC_BLOQUANTE and regles.verifier_spec(demande, camion)) or regles.ptac_depasse(demande, camion)
     if tournee["nature"] != demande["nature"] or spec_ko or not regles.verifier_frigo(demande, camion):
         return False
     a_bord = [etat["demandes"][i] for i in tournee["demandes"]]
@@ -94,6 +95,145 @@ def motif_sans_candidat(demande: dict, echecs: list) -> str:
     return "REF-DELAI"
 
 
+def camions_candidats(demande: dict, flotte: dict) -> list:
+    """Camions candidats pour une demande, selon la SPEC.
+
+    Applique les règles R-SPEC-01 et R-SPEC-02 : si :data:`hypotheses.SPEC_BLOQUANTE`,
+    seuls les camions qui respectent la SPEC ; sinon tous, ceux qui la
+    respectent en premier. Applique R-SPEC-03 dans les deux cas : un camion
+    plus lourd que le PTAC de la SPEC n'est jamais candidat.
+
+    :param demande: Demande préparée.
+    :param flotte: Flotte ``{IMMAT: camion}``.
+    :return: Liste de camions.
+    """
+    camions = [c for c in flotte.values() if not regles.ptac_depasse(demande, c)]
+    if hypotheses.SPEC_BLOQUANTE:
+        return [c for c in camions if not regles.verifier_spec(demande, c)]
+    return sorted(camions, key=lambda c: bool(regles.verifier_spec(demande, c)))
+
+
+def chercher_plans(demande: dict, etat: dict, ref: dict, maintenant: datetime.datetime, couts: dict,
+                   conformes: list, exclure: str = None) -> tuple:
+    """Évalue les plans possibles d'une demande : tournées ouvertes, puis camions libres.
+
+    Lignes 5 à 9 de D-ACC : insertion dans une tournée ouverte compatible
+    (R-OPT-03), sinon un plan par groupe de camions libres interchangeables.
+
+    :param demande: Demande préparée.
+    :param etat: État du moteur.
+    :param ref: Référentiel.
+    :param maintenant: Heure réelle courante.
+    :param couts: Taux horaires.
+    :param conformes: Camions candidats (:func:`camions_candidats`).
+    :param exclure: Identifiant d'une tournée à ne pas proposer (celle d'où la demande vient d'être retirée).
+    :return: ``(candidats, echecs)`` : candidats ``(spec_non_tenue, cout, -remplissage, id_tournee, immat, plan)``,
+        motifs d'échec des plans évalués.
+    """
+    flotte = etat["flotte"]
+    candidats, echecs = [], []
+    # a) Insertion dans une tournée ouverte (consolidation)
+    for tournee in etat["tournees"].values():
+        if tournee["statut"] != "ouverte" or tournee["id"] == exclure or not compatible(tournee, demande, etat, ref):
+            continue
+        camion = flotte[tournee["camion"]]
+        a_bord = [etat["demandes"][i] for i in tournee["demandes"]]
+        debut = max(maintenant, camion["libre_a"])
+        plan = planification.evaluer_avec_motif(ref, camion, a_bord + [demande], debut, maintenant, couts)
+        if plan["ok"]:
+            avant = planification.evaluer_plan(ref, camion, a_bord, debut, maintenant, couts)
+            cout_avant = avant["cout"] if avant["ok"] else 0.0
+            candidats.append((bool(regles.verifier_spec(demande, camion)), plan["cout"] - cout_avant,
+                              -plan["remplissage"], tournee["id"], None, plan))
+        else:
+            echecs.append(plan["motif"])
+    # b) Nouvelle tournée : un plan par groupe de camions interchangeables
+    vus = set()
+    for camion in conformes:
+        if camion["tournee"] is not None or not regles.verifier_frigo(demande, camion) or signature(camion) in vus:
+            continue
+        vus.add(signature(camion))
+        plan = planification.evaluer_avec_motif(ref, camion, [demande], max(maintenant, camion["libre_a"]), maintenant, couts)
+        if plan["ok"]:
+            candidats.append((bool(regles.verifier_spec(demande, camion)), plan["cout"], -plan["remplissage"],
+                              None, camion["IMMAT"], plan))
+        else:
+            echecs.append(plan["motif"])
+    return candidats, echecs
+
+
+def affecter(demande: dict, candidats: list, etat: dict, maintenant: datetime.datetime, journal: dict,
+             evenement: str = "ACQUITTEMENT", detail: str = "") -> str:
+    """Place une demande dans le meilleur plan et l'écrit au journal.
+
+    Entre les lignes 8 et 9 de D-ACC : d'abord un camion qui respecte la SPEC
+    (R-SPEC-02), puis le coût marginal le plus bas, puis le remplissage le plus
+    haut (R-OPT-01, R-OPT-02).
+
+    :param demande: Demande préparée.
+    :param candidats: Candidats de :func:`chercher_plans` (au moins un).
+    :param etat: État du moteur, modifié sur place.
+    :param maintenant: Heure réelle courante.
+    :param journal: Journal de traçabilité.
+    :param evenement: ``ACQUITTEMENT`` (D-ACC) ou ``REAFFECTATION`` (R-DEL-02).
+    :param detail: Début du texte libre du journal.
+    :return: Identifiant de la tournée retenue.
+    """
+    flotte = etat["flotte"]
+    _, _, _, id_tournee, immat, plan = min(candidats, key=lambda c: (c[0], c[1], c[2]))
+    if id_tournee is None:
+        etat["compteur"] += 1
+        # Le préfixe (date de démarrage du moteur) rend l'identifiant unique d'un lancement à l'autre (LOG_NORTH_TRAJET)
+        id_tournee = "%s%05d" % (etat.get("prefixe", "T"), etat["compteur"])
+        etat["tournees"][id_tournee] = {"id": id_tournee, "camion": immat, "nature": demande["nature"],
+                                        "demandes": [], "statut": "ouverte", "plan": plan}
+        flotte[immat]["tournee"] = id_tournee
+    tournee = etat["tournees"][id_tournee]
+    tournee["demandes"].append(demande["id"])
+    tournee["plan"] = plan
+    demande.update({"etat": "ACCEPTEE", "tournee": id_tournee})
+    tracabilite.noter(journal, maintenant, evenement, demande=demande, tournee=tournee, remplissage=plan["remplissage"],
+                      detail=detail + "départ au plus tard dans %.1f h projet" % plan["marge_h"])
+    return id_tournee
+
+
+def reaffecter(demande: dict, etat: dict, ref: dict, maintenant: datetime.datetime, parametres: dict,
+               journal: dict, depuis: dict, motif_retrait: str) -> str:
+    """Replace une demande acceptée retirée de sa tournée (R-DEL-02).
+
+    La demande repasse par la recherche de plans de D-ACC (lignes 5 à 9),
+    sans revenir dans la tournée qu'elle quitte. Si un plan existe, elle reste
+    acceptée (événement ``REAFFECTATION``). Sinon elle expire (événement
+    ``EXPIRATION``) avec le motif de D-ACC qui correspond (REF-FRIGO,
+    REF-CAMION, REF-DELAI ou REF-CONDUCTEUR, :func:`motif_sans_candidat`) ;
+    REF-DELAI directement si ``H_DEP`` est déjà passée.
+
+    :param demande: Demande acceptée, retirée de la tournée ``depuis``.
+    :param etat: État du moteur, modifié sur place.
+    :param ref: Référentiel.
+    :param maintenant: Heure réelle courante.
+    :param parametres: ``couts``.
+    :param journal: Journal de traçabilité.
+    :param depuis: Tournée quittée.
+    :param motif_retrait: Échec du plan de la tournée quittée (``"GAMME"``, ``"CAPACITE"``, ``"TRAJET"``).
+    :return: ``"reaffectee"`` ou ``"expiree"``.
+    """
+    origine = "retirée de %s (plan %s), " % (depuis["id"], motif_retrait or "impossible")
+    candidats, echecs = [], []
+    if not regles.echeance_depassee(demande, maintenant):
+        candidats, echecs = chercher_plans(demande, etat, ref, maintenant, parametres["couts"],
+                                           camions_candidats(demande, etat["flotte"]), exclure=depuis["id"])
+    if candidats:
+        affecter(demande, candidats, etat, maintenant, journal, evenement="REAFFECTATION", detail=origine)
+        return "reaffectee"
+    demande["capacite_seule"] = bool(echecs) and all(echec == "CAPACITE" for echec in echecs)
+    motif = "REF-DELAI" if regles.echeance_depassee(demande, maintenant) else motif_sans_candidat(demande, echecs)
+    demande.update({"etat": "EXPIREE", "motif": motif})
+    tracabilite.noter(journal, maintenant, "EXPIRATION", demande=demande, tournee=depuis, motif=motif,
+                      detail=origine + "aucun autre plan")
+    return "expiree"
+
+
 def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.datetime,
                     parametres: dict, journal: dict) -> str:
     """Décide d'une demande reçue : ignorer, refuser ou accepter.
@@ -107,6 +247,8 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
     3. aucun camion de la flotte ne respecte la SPEC (R-SPEC-01) → REF-SPEC,
        seulement si :data:`hypotheses.SPEC_BLOQUANTE` ; sinon la demande
        continue et sa gamme sera abaissée (R-SPEC-02) ;
+    3a. tous les camions de la flotte sont plus lourds que le PTAC de la SPEC
+       (R-SPEC-03) → REF-SPEC ;
     4. frais sans aucun frigo compatible dans la flotte (R-FRA-01) → REF-FRIGO ;
     5. à 7. aucun plan réalisable → REF-CAMION / REF-FRIGO, REF-DELAI ou
        REF-CONDUCTEUR (voir :func:`motif_sans_candidat`) ;
@@ -134,63 +276,16 @@ def traiter_demande(demande: dict, etat: dict, ref: dict, maintenant: datetime.d
     if regles.echeance_depassee(demande, maintenant):
         return refuser(demande, "REF-EXPIREE", maintenant, journal)
     flotte = etat["flotte"]
-    if hypotheses.SPEC_BLOQUANTE:
-        conformes = [c for c in flotte.values() if not regles.verifier_spec(demande, c)]
-        if not conformes:
-            return refuser(demande, "REF-SPEC", maintenant, journal)
-    else:
-        # SPEC non bloquante : tout camion est candidat, ceux qui la respectent passent en premier
-        conformes = sorted(flotte.values(), key=lambda c: bool(regles.verifier_spec(demande, c)))
+    conformes = camions_candidats(demande, flotte)
+    if (hypotheses.SPEC_BLOQUANTE or regles.ptac_depasse_partout(demande, flotte)) and not conformes:
+        return refuser(demande, "REF-SPEC", maintenant, journal)
     if demande["nature"] == "frais" and not any(c["frigo"] for c in conformes):
         return refuser(demande, "REF-FRIGO", maintenant, journal)
 
-    couts = parametres["couts"]
-    candidats, echecs = [], []
-    # a) Insertion dans une tournée ouverte (consolidation)
-    for tournee in etat["tournees"].values():
-        if tournee["statut"] != "ouverte" or not compatible(tournee, demande, etat, ref):
-            continue
-        camion = flotte[tournee["camion"]]
-        a_bord = [etat["demandes"][i] for i in tournee["demandes"]]
-        debut = max(maintenant, camion["libre_a"])
-        plan = planification.evaluer_avec_motif(ref, camion, a_bord + [demande], debut, maintenant, couts)
-        if plan["ok"]:
-            avant = planification.evaluer_plan(ref, camion, a_bord, debut, maintenant, couts)
-            cout_avant = avant["cout"] if avant["ok"] else 0.0
-            candidats.append((bool(regles.verifier_spec(demande, camion)), plan["cout"] - cout_avant,
-                              -plan["remplissage"], tournee["id"], None, plan))
-        else:
-            echecs.append(plan["motif"])
-    # b) Nouvelle tournée : un plan par groupe de camions interchangeables
-    vus = set()
-    for camion in conformes:
-        if camion["tournee"] is not None or not regles.verifier_frigo(demande, camion) or signature(camion) in vus:
-            continue
-        vus.add(signature(camion))
-        plan = planification.evaluer_avec_motif(ref, camion, [demande], max(maintenant, camion["libre_a"]), maintenant, couts)
-        if plan["ok"]:
-            candidats.append((bool(regles.verifier_spec(demande, camion)), plan["cout"], -plan["remplissage"],
-                              None, camion["IMMAT"], plan))
-        else:
-            echecs.append(plan["motif"])
-
+    candidats, echecs = chercher_plans(demande, etat, ref, maintenant, parametres["couts"], conformes)
     if not candidats:
         # Pour le code JUSTIF_REFUS (D-JUSTIF) : des camions compatibles étaient libres, mais aucun n'avait la place
         demande["capacite_seule"] = bool(echecs) and all(echec == "CAPACITE" for echec in echecs)
         return refuser(demande, motif_sans_candidat(demande, echecs), maintenant, journal)
-
-    _, _, _, id_tournee, immat, plan = min(candidats, key=lambda c: (c[0], c[1], c[2]))
-    if id_tournee is None:
-        etat["compteur"] += 1
-        # Le préfixe (date de démarrage du moteur) rend l'identifiant unique d'un lancement à l'autre (LOG_NORTH_TRAJET)
-        id_tournee = "%s%05d" % (etat.get("prefixe", "T"), etat["compteur"])
-        etat["tournees"][id_tournee] = {"id": id_tournee, "camion": immat, "nature": demande["nature"],
-                                        "demandes": [], "statut": "ouverte", "plan": plan}
-        flotte[immat]["tournee"] = id_tournee
-    tournee = etat["tournees"][id_tournee]
-    tournee["demandes"].append(demande["id"])
-    tournee["plan"] = plan
-    demande.update({"etat": "ACCEPTEE", "tournee": id_tournee})
-    tracabilite.noter(journal, maintenant, "ACQUITTEMENT", demande=demande, tournee=tournee, remplissage=plan["remplissage"],
-                      detail="départ au plus tard dans %.1f h projet" % plan["marge_h"])
+    affecter(demande, candidats, etat, maintenant, journal)
     return "accepter"

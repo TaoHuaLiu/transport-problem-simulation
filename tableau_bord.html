@@ -78,6 +78,17 @@
   .chiffres div span { display: block; font-size: 12px; color: var(--text-muted); }
   .chiffres div b { font: 700 20px/1.25 var(--font-display); color: var(--text); }
   .graphe { position: relative; height: 240px; }
+  /* Note du contrat : total puis une case par indicateur */
+  .score { display: grid; grid-template-columns: 1.3fr repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 1100px) { .score { grid-template-columns: repeat(2, 1fr); } }
+  .score > div { border: 1px solid var(--border); border-left: 6px solid var(--flat-sand); border-radius: var(--radius-sm); padding: 8px 12px; }
+  .score > div.ok { border-left-color: var(--ensibs-green); } .score > div.att { border-left-color: var(--warning); }
+  .score > div.ko { border-left-color: var(--critical); }
+  .score span { display: block; font-size: 12px; color: var(--text-muted); }
+  .score b { display: block; font: 700 26px/1.2 var(--font-display); color: var(--text); }
+  .score > div.total b { font-size: 34px; color: var(--text-brand); }
+  .formules { margin: 12px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--text-muted); }
+  .formules li { margin-top: 4px; } .formules b { color: var(--text); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; font-weight: 700; color: var(--text-brand); font-size: 12px; border-bottom: 2px solid var(--accent); padding: 6px 8px; }
   td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
@@ -107,6 +118,26 @@
            border-top-right-radius: var(--radius-tournant); color: var(--text-muted); font-size: 12px;
            display: flex; gap: var(--space-3); flex-wrap: wrap; justify-content: space-between; align-items: flex-end; }
   footer .site { font: 700 13px/1.3 var(--font-display); color: var(--text-brand); }
+  /* Onglets : une seule vue visible ; les rafraîchissements ne tournent que pour la vue affichée */
+  .onglets { display: flex; gap: var(--space-1); margin-top: 12px; border-bottom: 2px solid var(--border); }
+  .onglets button { border: 1px solid var(--border); border-bottom: none; border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+                    margin-bottom: -2px; padding: 6px 16px; font-weight: 700; color: var(--text-muted); }
+  .onglets button.actif { color: var(--text-brand); background: var(--surface); border-color: var(--accent); border-bottom: 2px solid var(--surface); }
+  main[hidden] { display: none; }
+  .choix-tables { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+  .choix-tables button.actif { background: var(--accent); border-color: var(--accent); font-weight: 700; }
+  .puces { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 10px 0; font-size: 12px; }
+  .puces span { padding: 2px 10px; border-radius: 999px; background: var(--surface-tint); border: 1px solid var(--border); }
+  .puces span.ko { border-color: var(--critical); color: var(--critical); font-weight: 700; }
+  .large { max-height: 560px; overflow: auto; }
+  .large th { position: sticky; top: 0; background: var(--surface); }
+  .large td, .large th { white-space: nowrap; }
+  /* Carte schématique (aucun fond de carte : VM sans internet) */
+  .carte-svg { width: 100%; height: auto; display: block; background: var(--surface-tint); border-radius: var(--radius-sm); }
+  .carte-svg text { font: 11px var(--font-admin); fill: var(--text); paint-order: stroke; stroke: var(--surface-tint); stroke-width: 3px; }
+  .carte-svg text.nord { font-weight: 700; fill: var(--text-brand); }
+  .legende { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+  .legende i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
 </style>
 </head>
 <body>
@@ -140,9 +171,14 @@
     <a class="bouton" id="l-rapport" href="/api/rapport.json">Rapport JSON</a>
     <a class="bouton" id="l-statuts" href="/api/statuts.csv">Statuts CSV</a>
   </div>
+  <nav class="onglets" id="onglets">
+    <button class="actif" data-onglet="audit">Audit</button>
+    <button data-onglet="tables">Tables en base</button>
+    <button data-onglet="carte">Carte des camions</button>
+  </nav>
 </header>
 
-<main>
+<main id="onglet-audit">
   <div class="alerte" id="alerte"></div>
 
   <section class="carte k12" id="c-sante">
@@ -150,6 +186,13 @@
     <p class="sous" id="s-sante">collecteur, moteur, lecture du référentiel, écritures en base (LOG_NORTH_*, TRACABILITE_*)</p>
     <ul class="alertes-sante" id="alertes-sante"></ul>
     <div class="sante" id="sante"></div>
+  </section>
+
+  <section class="carte k12" id="c-score">
+    <h2>Note selon le contrat</h2>
+    <p class="sous">méthode régressive du contrat (§4.1 à §4.3) sur les cibles du jour ; le professionnalisme (§4.4) est noté par le Contrôle</p>
+    <div class="score num" id="score"></div>
+    <ul class="formules num" id="formules"></ul>
   </section>
 
   <section class="carte tuile k3">
@@ -167,11 +210,12 @@
     <div class="note num" id="n-tr"></div>
   </section>
   <section class="carte tuile k3">
-    <h2>Gamme haute</h2>
-    <p class="sous">part des demandes parties en gamme haute</p>
+    <h2>Gammes (contrat §4.2)</h2>
+    <p class="sous">part des trajets en gamme haute ; haute + médiane en dessous</p>
     <div class="valeur num" id="v-haute">—</div>
     <div class="detail num" id="d-haute"></div>
     <div class="note num" id="n-haute"></div>
+    <div class="note num" id="n-hm"></div>
   </section>
   <section class="carte tuile k3">
     <h2>Traçabilité</h2>
@@ -207,9 +251,25 @@
   </section>
   <section class="carte k4">
     <h2>Gammes et motifs de refus</h2>
-    <p class="sous">demandes parties par gamme ; demandes refusées par motif</p>
-    <div class="graphe" style="height:110px"><canvas id="g-gammes"></canvas></div>
+    <p class="sous">trajets par gamme du contrat (PTAC dépassé = hors gamme) ; demandes refusées par motif</p>
+    <div class="graphe" style="height:120px"><canvas id="g-gammes"></canvas></div>
     <div class="graphe" style="height:120px"><canvas id="g-motifs"></canvas></div>
+  </section>
+
+  <section class="carte k6">
+    <h2>Camions NORTH en route</h2>
+    <p class="sous" id="s-camions">camions entre le premier départ et la dernière arrivée de leur tournée, à la fin de chaque intervalle</p>
+    <div class="graphe"><canvas id="g-camions"></canvas></div>
+  </section>
+  <section class="carte k6">
+    <h2>Flotte NORTH et marchandises</h2>
+    <p class="sous" id="s-flotte">état actuel de la flotte du moteur ; le frais exige un frigo, le sec un camion non frigorifique</p>
+    <table class="num"><thead><tr><th>Type</th><th class="d">Camions</th><th class="d">Libres</th><th class="d">Réservés</th>
+      <th class="d">En route</th><th class="d">Demandes reçues</th><th class="d">Parties</th><th class="d">TA</th></tr></thead><tbody id="t-flotte"></tbody></table>
+    <p class="sous" id="p-ptac" style="margin-top:10px"></p>
+    <h2 style="margin-top:12px">Ce qui fait descendre les trajets</h2>
+    <p class="sous">gamme de chaque critère du §4.2 (le trajet prend la plus basse) ; « moteur » = seuils internes du journal, pour comparer</p>
+    <table class="num"><thead><tr><th>Critère</th><th class="d">Haute</th><th class="d">Médiane</th><th class="d">Basse</th></tr></thead><tbody id="t-criteres"></tbody></table>
   </section>
 
   <section class="carte k6">
@@ -228,7 +288,7 @@
     <h2>Derniers événements du moteur</h2>
     <p class="sous" id="s-journal">tronçons masqués</p>
     <div class="defile"><table class="num"><thead><tr><th>Heure</th><th>Événement</th><th>Demande</th><th>Tournée</th><th>Camion</th>
-      <th>De</th><th>Vers</th><th class="d">Remplissage</th><th>Gamme</th><th>Motif</th></tr></thead><tbody id="t-evenements"></tbody></table></div>
+      <th>De</th><th>Vers</th><th class="d">Remplissage</th><th title="seuils internes du moteur, pas la gamme du contrat">Gamme (moteur)</th><th>Motif</th></tr></thead><tbody id="t-evenements"></tbody></table></div>
   </section>
 
   <section class="carte k12">
@@ -249,6 +309,38 @@
     <pre id="debug-brut"></pre>
   </section>
 </main>
+
+<main id="onglet-tables" hidden>
+  <section class="carte k12">
+    <h2>Nos tables dans la base</h2>
+    <p class="sous" id="s-tables">lecture seule, toutes les 10 s pendant que l’onglet est ouvert ; tables du Contrôle : nos lignes seulement (ID_ENTRE N1, N2…)</p>
+    <div class="choix-tables" id="choix-tables"></div>
+    <div class="puces num" id="puces-table"></div>
+    <div class="large"><table class="num"><thead id="th-table"></thead><tbody id="tb-table"></tbody></table></div>
+  </section>
+</main>
+
+<main id="onglet-carte" hidden>
+  <section class="carte k8">
+    <h2>Camions NORTH</h2>
+    <p class="sous" id="s-carte">positions recalculées depuis le journal du moteur ; carte schématique (lignes droites entre villes)</p>
+    <svg class="carte-svg" id="svg-carte" viewBox="0 0 800 560" role="img" aria-label="Carte schématique des camions NORTH"></svg>
+    <div class="legende">
+      <span><i style="background:var(--ensibs-green-deep)"></i>usine NORTH (camions à l’arrêt)</span>
+      <span><i style="background:var(--flat-sand)"></i>autre usine ou client</span>
+      <span><i style="background:var(--surface);border:2px solid var(--ubs-navy)"></i>port</span>
+      <span><i style="background:var(--series-1)"></i>frigorifique en route (plein : chargé, creux : à vide)</span>
+      <span><i style="background:var(--ubs-navy)"></i>non frigorifique en route</span>
+    </div>
+  </section>
+  <section class="carte k4">
+    <h2>Où sont les camions</h2>
+    <p class="sous" id="s-carte-resume"></p>
+    <div class="defile"><table class="num"><thead><tr><th>Lieu</th><th class="d">Frigo</th><th class="d">Sec</th></tr></thead><tbody id="t-lieux"></tbody></table></div>
+    <h2 style="margin-top:12px">En route</h2>
+    <div class="defile"><table class="num"><thead><tr><th>Camion</th><th>Trajet</th><th class="d">Remplissage</th><th>Arrivée</th></tr></thead><tbody id="t-en-route"></tbody></table></div>
+  </section>
+</main>
 <footer id="pied">
   <span>1 minute réelle = 1 heure projet. Les heures affichées sont réelles. Indicateurs recalculés depuis les fichiers (audit.py), indépendamment de l’état du moteur.</span>
   <span class="site">www-ensibs.univ-ubs.fr</span>
@@ -261,7 +353,7 @@ var PERIODE_MS = 5000;           // rafraîchissement
 var css = getComputedStyle(document.documentElement);
 function v(nom) { return css.getPropertyValue(nom).trim(); }
 var C = { s1: v("--series-1"), s2: v("--series-2"), s3: v("--series-3"), haute: v("--ramp-high"), mediane: v("--ramp-mid"),
-          basse: v("--ramp-low"), sous: v("--ubs-sky"), seuil: v("--flat-orange"), grille: v("--grid"), axe: v("--axis"), texte: v("--text-muted"), cible: v("--target") };
+          basse: v("--ramp-low"), critique: v("--critical"), sec: v("--ubs-navy"), sous: v("--ubs-sky"), seuil: v("--flat-orange"), grille: v("--grid"), axe: v("--axis"), texte: v("--text-muted"), cible: v("--target") };
 
 Chart.defaults.global.defaultFontColor = C.texte;
 Chart.defaults.global.defaultFontFamily = v("--font-admin");
@@ -312,13 +404,21 @@ G.histo = new Chart(document.getElementById("g-histo"), { type: "bar",
           datasets: [{ label: "Tournées", backgroundColor: [], data: [] }] },
   options: { scales: axes(false), tooltips: { callbacks: { title: function (i) { return "Remplissage " + i[0].xLabel + " %"; } } }, legend: { display: false } } });
 G.gammes = new Chart(document.getElementById("g-gammes"), { type: "horizontalBar",
-  data: { labels: ["Haute", "Médiane", "Basse"], datasets: [{ label: "Demandes parties", backgroundColor: [C.haute, C.mediane, C.basse], data: [] }] },
+  data: { labels: ["Haute", "Médiane", "Basse", "Hors gamme"], datasets: [{ label: "Trajets", backgroundColor: [C.haute, C.mediane, C.basse, C.critique], data: [] }] },
   options: { scales: { xAxes: [{ gridLines: { color: C.grille, drawBorder: false }, ticks: { beginAtZero: true } }], yAxes: [{ gridLines: { display: false } }] },
              legend: { display: false } } });
 G.motifs = new Chart(document.getElementById("g-motifs"), { type: "horizontalBar",
   data: { labels: [], datasets: [{ label: "Demandes refusées", backgroundColor: C.s2, data: [] }] },
   options: { scales: { xAxes: [{ gridLines: { color: C.grille, drawBorder: false }, ticks: { beginAtZero: true } }], yAxes: [{ gridLines: { display: false } }] },
              legend: { display: false } } });
+
+G.camions = new Chart(document.getElementById("g-camions"), { type: "line",
+  data: { labels: [], datasets: [
+    { label: "Frigorifiques en route", borderColor: C.s1, backgroundColor: C.s1, borderWidth: 2, fill: false, lineTension: 0, pointRadius: 0, pointHitRadius: 8, data: [] },
+    { label: "Frigorifiques (total)", borderColor: C.s1, borderWidth: 1, borderDash: [4, 4], fill: false, pointRadius: 0, data: [] },
+    { label: "Non frigorifiques en route", borderColor: C.sec, backgroundColor: C.sec, borderWidth: 2, fill: false, lineTension: 0, pointRadius: 0, pointHitRadius: 8, data: [] },
+    { label: "Non frigorifiques (total)", borderColor: C.sec, borderWidth: 1, borderDash: [4, 4], fill: false, pointRadius: 0, data: [] }] },
+  options: { scales: axes(false), tooltips: infobulle(false), legend: { position: "top", align: "start" } } });
 
 // ---------------------------------------------------------------- Fenêtre d'audit (gardée dans le navigateur)
 var champDebut = document.getElementById("debut"), champDuree = document.getElementById("duree");
@@ -351,12 +451,61 @@ function age(texte, ref) {
   if (!texte) return null;
   return (new Date(ref.replace(" ", "T")) - new Date(texte.replace(" ", "T"))) / 1000;
 }
-function note(id, objectif) {
-  var el = document.getElementById(id);
-  if (!objectif || objectif.cible === null || objectif.cible === undefined) { el.innerHTML = "cible non saisie"; return; }
-  if (objectif.note === null) { el.innerHTML = "cible " + pct(objectif.cible, 0) + " · pas encore de mesure"; return; }
-  var signe = objectif.note >= 8.5 ? "✓" : objectif.note >= 6 ? "!" : "✗";
-  el.innerHTML = signe + " cible " + pct(objectif.cible, 0) + " · écart " + pct(objectif.ecart) + " · note <b>" + nb(objectif.note, 1) + "/10</b>";
+function note(id, objectif, prefixe) {
+  var el = document.getElementById(id), p = prefixe ? esc(prefixe) + " · " : "";
+  if (!objectif || objectif.cible === null || objectif.cible === undefined) { el.innerHTML = p + "cible inconnue (flotte du moteur absente ?)"; return; }
+  if (objectif.note === null) { el.innerHTML = p + "cible " + pct(objectif.cible, 1) + " · pas encore de mesure"; return; }
+  var signe = objectif.note >= 8 ? "✓" : objectif.note >= 6 ? "!" : "✗";
+  el.innerHTML = signe + " " + p + "cible " + pct(objectif.cible, 1) + " · écart " + pct(objectif.ecart) + " · note <b>" + nb(objectif.note, 1) + "/10</b>";
+}
+function etatNote(n) { return n === null || n === undefined ? "" : n >= 8 ? "ok" : n >= 6 ? "att" : "ko"; }
+function afficherScore(r) {
+  var sc = r.score, n = sc.notes, c = r.cibles, ta = c.ta;
+  var cases = [["Total mesuré", sc.total === null ? "—" : nb(sc.total, 1) + " / " + sc.max_mesure, "sur " + sc.max + " avec le professionnalisme", "total"],
+    ["RSE · remplissage (§4.1)", n.tr === null ? "—" : nb(n.tr, 1) + " / 10", "TR " + pct(r.remplissage.tr) + " · cible " + pct(c.tr.valeur, 0), etatNote(n.tr)],
+    ["Coût · gammes (§4.2)", n.gammes === null ? "—" : nb(n.gammes, 1) + " / 10", "la plus basse des deux notes de gamme", etatNote(n.gammes)],
+    ["Performance · TA (§4.3)", n.ta === null ? "—" : nb(n.ta, 1) + " / 10", "TA " + pct(r.acceptation.ta) + " · cible " + pct(ta.valeur), etatNote(n.ta)],
+    ["Professionnalisme (§4.4)", "Contrôle", "note sur 20 convertie, engagement ≥ 16/20", ""]];
+  document.getElementById("score").innerHTML = cases.map(function (k) {
+    return "<div class='" + k[3] + "'><span>" + esc(k[0]) + "</span><b>" + esc(k[1]) + "</b><span>" + esc(k[2]) + "</span></div>"; }).join("");
+  var f = [];
+  if (ta.source === "fixee") f.push("<b>TA cible " + pct(ta.valeur) + "</b> imposée (option ou cibles_contrat.json) ; formule du contrat : " + pct(ta.formule));
+  else if (ta.valeur === null) f.push("<b>TA cible inconnue</b> : N_F / N_S manquent (pas de flotte_moteur.json : lancer le moteur en direct, ou --camions-frigo / --camions-sec)");
+  else f.push("<b>TA cible " + pct(ta.valeur) + "</b> = (min(k × N_F, 75 % × N_D,frais) + min(k × N_S, 75 % × N_D,sec)) / N_D = (min(" + nb(ta.capacite_frais, 0) + ", " + nb(ta.plafond_frais, 0) +
+    ") + min(" + nb(ta.capacite_sec, 0) + ", " + nb(ta.plafond_sec, 0) + ")) / " + nb(ta.n_frais + ta.n_sec) + " ; k = 2,5 × " + nb(ta.duree_h, 2) + " h = " + nb(ta.k, 2) +
+    " ; N_F / N_S = " + nb(ta.camions_frigo) + " / " + nb(ta.camions_sec) + (ta.source_camions === "imposee" ? " (imposés)" : " (flotte du moteur)") + " ; N_D frais / sec = " + nb(ta.n_frais) + " / " + nb(ta.n_sec));
+  f.push(c.tr.source === "fixee" ? "<b>TR cible " + pct(c.tr.valeur, 0) + "</b> imposée" :
+    "<b>TR cible " + pct(c.tr.valeur, 0) + "</b> : débit q = " + (c.tr.debit === null ? "—" : nb(c.tr.debit, 0)) + " demandes NORTH / h réelle (62 % dès 1 000, 55 % dès 500, 46 % dès 250, sinon 40 %)");
+  f.push("<b>Gammes</b> : au moins " + pct(c.part_haute.valeur, 0) + " en haute et " + pct(c.part_haute_mediane.valeur, 0) + " en haute + médiane ; PTAC dépassé éliminatoire : compté hors gamme et refusé au TA (lecture prudente)");
+  f.push("Pendant l’audit, D est la durée déjà écoulée : k, N_D et q avancent ensemble et la cible rejoint celle du contrat à la fin. Barème TR et gammes : écart ≤ 3 % → 10, ≤ 7 % → 8, ≤ 15 % → 6, ≤ 35 % → 3, ≤ 50 % → 1 ; TA : ≤ 3 % → 10, ≤ 7 % → 8, ≤ 15 % → 6, au-delà 0 (le sujet p. 21 donne 8,5 au 2e palier).");
+  document.getElementById("formules").innerHTML = f.map(function (x) { return "<li>" + x + "</li>"; }).join("");
+}
+function afficherFlotte(r) {
+  var cam = r.camions, a = r.acceptation, s = r.series, n = s.etiquettes.length, lignes = [];
+  [["frigo", "Frigorifiques", a.frais, "frais"], ["sec", "Non frigorifiques", a.sec, "sec"]].forEach(function (t) {
+    var c = cam.types[t[0]];
+    lignes.push("<tr><td>" + t[1] + " <span class=ids>(" + t[3] + ")</span></td><td class=d>" + (cam.connue ? nb(c.total) : "—") + "</td><td class=d>" + (cam.connue ? nb(c.libres) : "—") +
+      "</td><td class=d>" + (cam.connue ? nb(c.reserves) : "—") + "</td><td class=d>" + (cam.connue ? nb(c.en_route) : "—") + "</td><td class=d>" + nb(t[2].recues) +
+      "</td><td class=d>" + nb(t[2].partie) + "</td><td class=d><b>" + pct(t[2].ta) + "</b></td></tr>");
+  });
+  document.getElementById("t-flotte").innerHTML = lignes.join("");
+  var ptac = [];
+  ["frigo", "sec"].forEach(function (t) {
+    var p = cam.types[t].par_ptac, cles = Object.keys(p).sort(function (x, y) { return parseFloat(x) - parseFloat(y); });
+    if (cles.length) ptac.push((t === "frigo" ? "frigorifiques" : "non frigorifiques") + " : " + cles.map(function (k) { return esc(k) + " × " + nb(p[k]); }).join(", "));
+  });
+  document.getElementById("p-ptac").innerHTML = cam.connue ? "Par PTAC · " + ptac.join(" · ") + " (état du " + esc(cam.jour) + ")" :
+    "Flotte du moteur inconnue : pas de ../donnees/run/flotte_moteur.json (moteur en direct seulement) ; N_F / N_S, PTAC dépassé et SPEC non vérifiés.";
+  document.getElementById("s-camions").textContent = cam.connue ? "camions entre le premier départ et la dernière arrivée de leur tournée, à la fin de chaque intervalle de " + s.pas_min + " min"
+    : "flotte du moteur inconnue : courbes vides";
+  G.camions.data.labels = s.etiquettes;
+  G.camions.data.datasets[0].data = cam.serie.frigo; G.camions.data.datasets[2].data = cam.serie.sec;
+  G.camions.data.datasets[1].data = cam.connue ? constante(cam.types.frigo.total, n) : [];
+  G.camions.data.datasets[3].data = cam.connue ? constante(cam.types.sec.total, n) : [];
+  G.camions.update(0);
+  var cr = r.gammes.criteres, noms = { delai: "Délai (avance sur H_DEP)", spec: "Spécifications (SPEC)", moteur: "Gamme du moteur (interne)" };
+  document.getElementById("t-criteres").innerHTML = ["delai", "spec", "moteur"].map(function (k) {
+    return "<tr><td>" + noms[k] + "</td><td class=d>" + nb(cr[k].haute) + "</td><td class=d>" + nb(cr[k].mediane) + "</td><td class=d>" + nb(cr[k].basse) + "</td></tr>"; }).join("");
 }
 function constante(valeur, n) { var t = []; for (var i = 0; i < n; i++) t.push(valeur); return t; }
 
@@ -391,8 +540,12 @@ function afficher(r) {
   document.getElementById("d-tr").textContent = nb(t.quantiles.n) + " tournées · médiane " + pct(t.quantiles.med) + " · P10 " + pct(t.quantiles.p10);
   note("n-tr", t.objectif);
   document.getElementById("v-haute").textContent = pct(g.part_haute);
-  document.getElementById("d-haute").textContent = "haute " + nb(g.comptes.haute) + " · médiane " + nb(g.comptes.mediane) + " · basse " + nb(g.comptes.basse);
-  note("n-haute", g.objectif);
+  document.getElementById("d-haute").textContent = "haute + médiane " + pct(g.part_haute_mediane) + " · " + nb(g.trajets) + " trajets · hors gamme " + nb(g.comptes.hors) +
+    (g.ptac_verifiable ? "" : " · SPEC non vérifiées (flotte inconnue)");
+  note("n-haute", g.objectif, "haute");
+  note("n-hm", g.objectif_hm, "haute + médiane");
+  afficherScore(r);
+  afficherFlotte(r);
   var bloquants = r.controles.filter(function (c) { return c.bloquant; });
   var passes = bloquants.filter(function (c) { return c.ok; }).length;
   document.getElementById("v-pro").textContent = passes + "\u00a0/\u00a0" + bloquants.length;
@@ -431,7 +584,7 @@ function afficher(r) {
   G.histo.data.datasets[0].backgroundColor = t.histogramme.map(function (_, i) { return t.seuil !== null && (i + 1) / 10 <= t.seuil + 1e-9 ? C.sous : C.s1; });
   document.getElementById("s-histo").textContent = "nombre de tournées par tranche de 10 %" + (t.seuil !== null ? "\u00a0; bleu clair\u00a0: sous le seuil de rentabilité " + pct(t.seuil, 1) : "");
   G.histo.update(0);
-  G.gammes.data.datasets[0].data = [g.comptes.haute, g.comptes.mediane, g.comptes.basse]; G.gammes.update(0);
+  G.gammes.data.datasets[0].data = [g.comptes.haute, g.comptes.mediane, g.comptes.basse, g.comptes.hors]; G.gammes.update(0);
   var motifs = Object.keys(a.motifs).sort(function (x, y) { return a.motifs[y] - a.motifs[x]; });
   G.motifs.data.labels = motifs.length ? motifs : ["aucun refus"];
   G.motifs.data.datasets[0].data = motifs.length ? motifs.map(function (m) { return a.motifs[m]; }) : [0];
@@ -504,6 +657,7 @@ function afficherSante(r) {
     h.push(tuileBdd("Référentiel (lecture)", m.referentiel, t));
     h.push(tuileBdd("LOG_NORTH_* (archivage)", m.archivage, t));
     h.push(tuileBdd("TRACABILITE_* (Contrôle)", m.controle, t));
+    if (m.evenements) h.push(tuileBdd("Journal des événements (CSV)", m.evenements, t));
   } else h.push("<div><b>Moteur</b><span>pas de fichier de santé</span></div>");
   document.getElementById("sante").innerHTML = h.join("");
   var critiques = r.alertes.filter(function (a) { return a.niveau === "critique"; }).length;
@@ -541,9 +695,111 @@ function rafraichirSante() {
 }
 document.getElementById("sql-erreurs").addEventListener("change", rafraichirSante);
 
-rafraichir();
+// ---------------------------------------------------------------- Onglets
+// Onglet au chargement : #audit, #tables ou #carte dans l'adresse, sinon le dernier ouvert
+var onglet = ["audit", "tables", "carte"].indexOf(location.hash.slice(1)) >= 0 ? location.hash.slice(1) : (localStorage.getItem("north_onglet") || "audit");
+function montrer(nom) {
+  onglet = nom; localStorage.setItem("north_onglet", nom); history.replaceState(null, "", "#" + nom);
+  ["audit", "tables", "carte"].forEach(function (o) { document.getElementById("onglet-" + o).hidden = o !== nom; });
+  Array.prototype.forEach.call(document.querySelectorAll("#onglets button"), function (b) { b.className = b.getAttribute("data-onglet") === nom ? "actif" : ""; });
+  if (nom === "audit") { Object.keys(G).forEach(function (k) { G[k].resize(); }); rafraichir(); }
+  if (nom === "tables") chargerTables();
+  if (nom === "carte") rafraichirCarte();
+}
+Array.prototype.forEach.call(document.querySelectorAll("#onglets button"), function (b) {
+  b.addEventListener("click", function () { montrer(b.getAttribute("data-onglet")); });
+});
+
+// ---------------------------------------------------------------- Onglet Tables (lecture seule, tables_direct.py)
+var tableChoisie = localStorage.getItem("north_table") || "TRACABILITE_COMMANDE", listeTables = null;
+function chargerTables() {
+  if (listeTables) { lireTable(); return; }
+  lire("/api/tables", function (r) {
+    listeTables = r.tables;
+    document.getElementById("choix-tables").innerHTML = r.tables.map(function (t) {
+      return "<button data-table='" + esc(t.nom) + "' title='" + esc(t.libelle) + "'>" + esc(t.nom) + "</button>"; }).join("") +
+      (r.actif ? "" : " <span class='statut ko'>onglet désactivé (--sans-tables)</span>");
+    Array.prototype.forEach.call(document.querySelectorAll("#choix-tables button"), function (b) {
+      b.addEventListener("click", function () { tableChoisie = b.getAttribute("data-table"); localStorage.setItem("north_table", tableChoisie); lireTable(); });
+    });
+    lireTable();
+  });
+}
+function lireTable() {
+  Array.prototype.forEach.call(document.querySelectorAll("#choix-tables button"), function (b) { b.className = b.getAttribute("data-table") === tableChoisie ? "actif" : ""; });
+  lire("/api/table?n=100&nom=" + encodeURIComponent(tableChoisie), afficherTable);
+}
+function afficherTable(r) {
+  var p = [];
+  if (!r.ok) p.push("<span class='ko'>✗ " + esc(r.erreur) + "</span>");
+  else {
+    p.push("<span>" + nb(r.total) + " ligne(s) · " + nb(r.lignes.length) + " affichée(s), les plus récentes d’abord</span>");
+    Object.keys(r.groupes).forEach(function (g) { p.push("<span>" + esc(g) + " : <b>" + nb(r.groupes[g]) + "</b></span>"); });
+    p.push("<span>lu à " + esc((r.lu_a || "").slice(11)) + (r.cache ? " (cache)" : "") + "</span>");
+  }
+  if (r.journal) {
+    var ecart = r.ok ? r.journal.decidees - r.total : null;
+    p.push("<span class='" + (ecart ? "ko" : "") + "'>journal du moteur : " + nb(r.journal.decidees) + " demandes décidées, " + nb(r.journal.parties) + " parties" +
+      (ecart === null ? "" : ecart === 0 ? " · ✓ même nombre que la table" : " · écart " + nb(ecart) + " (écritures en retard ou perdues ?)") + "</span>");
+  }
+  document.getElementById("puces-table").innerHTML = p.join("");
+  document.getElementById("th-table").innerHTML = "<tr>" + r.colonnes.map(function (c) { return "<th>" + esc(c) + "</th>"; }).join("") + "</tr>";
+  document.getElementById("tb-table").innerHTML = r.lignes.map(function (l) {
+    return "<tr>" + l.map(function (v) { return "<td>" + esc(v === null ? "∅" : typeof v === "object" ? JSON.stringify(v) : v) + "</td>"; }).join("") + "</tr>";
+  }).join("") || "<tr><td>" + (r.ok ? "table vide" : "") + "</td></tr>";
+}
+
+// ---------------------------------------------------------------- Onglet Carte (positions : audit.carte_camions)
+var LON0 = -7, LON1 = 28, LAT0 = 35.5, LAT1 = 55.5, KX = Math.cos(46 * Math.PI / 180);
+function projeter(lat, lon) {
+  // Projection équirectangulaire centrée sur 46° N, dans la boîte 800 × 560 avec une marge de 30
+  var l = (LON1 - LON0) * KX, h = LAT1 - LAT0, e = Math.min(740 / l, 500 / h);
+  return [30 + (lon - LON0) * KX * e, 30 + (LAT1 - lat) * e];
+}
+var ETIQUETTES = { Amsterdam: "haut", Rotterdam: "gauche", Anvers: "gauche", "Le Havre": "gauche", Paris: "gauche" };
+function rafraichirCarte() { lire("/api/carte", afficherCarte); }
+function afficherCarte(r) {
+  var svg = [], parId = {}, couleurs = { NORTH: v("--ensibs-green-deep"), WEST: v("--flat-sand"), EAST: v("--flat-sand"), SOUTH: v("--flat-sand"), GMS: v("--flat-sand") };
+  r.lieux.forEach(function (l) { parId[l.nom] = l; });
+  // Trajets en cours : trait léger du départ à l'arrivée
+  r.en_route.forEach(function (c) {
+    var a = parId[c.de], b = parId[c.vers]; if (!a || !b) return;
+    var p = projeter(a.lat, a.lon), q = projeter(b.lat, b.lon);
+    svg.push("<line x1='" + p[0] + "' y1='" + p[1] + "' x2='" + q[0] + "' y2='" + q[1] + "' stroke='" + (c.frigo ? C.s1 : C.sec) + "' stroke-opacity='0.12' stroke-width='1.5'/>");
+  });
+  r.lieux.forEach(function (l) {
+    var p = projeter(l.lat, l.lon), n = l.frigo + l.sec, rayon = 4 + 1.3 * Math.sqrt(n);
+    var titre = l.nom + " : " + l.frigo + " frigorifique(s), " + l.sec + " non frigorifique(s) à l’arrêt";
+    if (l.role === "port") svg.push("<circle cx='" + p[0] + "' cy='" + p[1] + "' r='" + rayon + "' fill='" + v("--surface") + "' stroke='" + C.sec + "' stroke-width='2'><title>" + esc(titre) + "</title></circle>");
+    else svg.push("<circle cx='" + p[0] + "' cy='" + p[1] + "' r='" + rayon + "' fill='" + couleurs[l.role] + "'" + (l.role === "NORTH" ? "" : " fill-opacity='0.8'") + "><title>" + esc(titre) + "</title></circle>");
+    // Villes serrées (Benelux, Rhénanie) : étiquette à gauche ou au-dessus pour ne pas se chevaucher
+    var cote = ETIQUETTES[l.nom] || "droite", x = p[0] + rayon + 3, y = p[1] + 4, ancre = "start";
+    if (cote === "gauche") { x = p[0] - rayon - 3; ancre = "end"; }
+    if (cote === "haut") { x = p[0]; y = p[1] - rayon - 4; ancre = "middle"; }
+    svg.push("<text x='" + x + "' y='" + y + "' text-anchor='" + ancre + "'" + (l.role === "NORTH" ? " class='nord'" : "") + ">" + esc(l.nom) + (n ? " · " + n : "") + "</text>");
+  });
+  r.en_route.forEach(function (c) {
+    var p = projeter(c.lat, c.lon), coul = c.frigo ? C.s1 : C.sec;
+    svg.push("<circle cx='" + p[0].toFixed(1) + "' cy='" + p[1].toFixed(1) + "' r='3.2' fill='" + (c.charge ? coul : v("--surface")) + "' stroke='" + coul + "' stroke-width='1.4'><title>" +
+      esc(c.immat + " · " + c.de + " → " + c.vers + " · " + (c.charge ? "chargé " + pct(c.remplissage, 0) : "à vide") + " · arrivée " + c.fin) + "</title></circle>");
+  });
+  document.getElementById("svg-carte").innerHTML = svg.join("");
+  var arret = r.lieux.reduce(function (t, l) { return t + l.frigo + l.sec; }, 0), charges = r.en_route.filter(function (c) { return c.charge; }).length;
+  document.getElementById("s-carte").textContent = "à " + r.maintenant.slice(11) + " · positions recalculées depuis le journal du moteur" +
+    (r.flotte_connue ? "" : " · flotte du moteur inconnue : seuls les camions déjà partis sont placés");
+  document.getElementById("s-carte-resume").textContent = nb(r.en_route.length) + " en route (" + nb(charges) + " chargés, " + nb(r.en_route.length - charges) + " à vide) · " + nb(arret) + " à l’arrêt";
+  document.getElementById("t-lieux").innerHTML = r.lieux.filter(function (l) { return l.frigo + l.sec; }).sort(function (a, b) { return (b.frigo + b.sec) - (a.frigo + a.sec); })
+    .map(function (l) { return "<tr><td>" + esc(l.nom) + "</td><td class=d>" + nb(l.frigo) + "</td><td class=d>" + nb(l.sec) + "</td></tr>"; }).join("") || "<tr><td colspan=3>aucun camion</td></tr>";
+  document.getElementById("t-en-route").innerHTML = r.en_route.slice().sort(function (a, b) { return a.fin < b.fin ? -1 : 1; }).map(function (c) {
+    return "<tr><td>" + esc(c.immat) + (c.frigo ? " ❄" : "") + "</td><td>" + esc(c.de) + " → " + esc(c.vers) + "</td><td class=d>" + (c.charge ? pct(c.remplissage, 0) : "à vide") + "</td><td>" + esc(c.fin) + "</td></tr>";
+  }).join("") || "<tr><td colspan=4>aucun camion en route</td></tr>";
+}
+
+montrer(onglet);
+if (onglet !== "audit") rafraichir();  // une fois : pastilles d'état de l'en-tête
 rafraichirSante();
-setInterval(rafraichir, PERIODE_MS);
+setInterval(function () { if (onglet === "audit") rafraichir(); else if (onglet === "carte") rafraichirCarte(); }, PERIODE_MS);
+setInterval(function () { if (onglet === "tables") lireTable(); }, 10000);
 setInterval(rafraichirSante, PERIODE_MS);
 </script>
 </body>

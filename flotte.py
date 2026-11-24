@@ -46,7 +46,12 @@ def lire_fiche(chemin: str):
     return None
 
 
-def charger_flotte(repertoire: str, ref: dict, usines: list, debut: datetime.datetime) -> dict:
+#: Motifs d'écart d'une fiche camion (R-FLO-01), dans l'ordre où ils sont testés.
+MOTIFS_ECART = ("illisible", "sans PTAC ou ENERGIE", "PTAC absent de TRUCKS_CAPACITY", "REFERENCE illisible",
+                "hors usines NORTH")
+
+
+def charger_flotte(repertoire: str, ref: dict, usines: list, debut: datetime.datetime, ecartees: dict = None) -> dict:
     """Charge les camions rattachés aux usines NORTH.
 
     Applique la règle R-FLO-01 : un camion dont la fiche n'a pas de ``PTAC``
@@ -58,22 +63,44 @@ def charger_flotte(repertoire: str, ref: dict, usines: list, debut: datetime.dat
     :param ref: Référentiel.
     :param usines: Clés ``PK_LOCATIONS`` des usines NORTH.
     :param debut: Heure réelle de démarrage.
+    :param ecartees: Si donné, rempli sur place : ``{motif: [nom de fichier]}`` pour chaque fiche
+        écartée, motifs de :data:`MOTIFS_ECART` (journalisés par l'appelant).
     :return: ``{IMMAT: camion}``.
     """
     flotte = {}
+    if ecartees is None:
+        ecartees = {}
+
+    def ecarter(motif: str, nom: str) -> None:
+        """Note une fiche écartée.
+
+        :param motif: Motif, parmi :data:`MOTIFS_ECART`.
+        :param nom: Nom du fichier.
+        """
+        ecartees.setdefault(motif, []).append(nom)
+
     for nom in sorted(os.listdir(repertoire)):
         chemin = os.path.join(repertoire, nom)
         if not os.path.isfile(chemin) or nom.startswith("__exemple__"):
             continue
         fiche = lire_fiche(chemin)
-        if not fiche or not fiche.get("PTAC") or not fiche.get("ENERGIE") or fiche["PTAC"] not in ref["capacite"]:
+        if not fiche:
+            ecarter("illisible", nom)
+            continue
+        if not fiche.get("PTAC") or not fiche.get("ENERGIE"):
+            ecarter("sans PTAC ou ENERGIE", nom)
+            continue
+        if fiche["PTAC"] not in ref["capacite"]:
+            ecarter("PTAC absent de TRUCKS_CAPACITY", nom)
             continue
         try:
             reference = int(fiche.get("REFERENCE", ""))
-        except ValueError:
+        except (TypeError, ValueError):
+            ecarter("REFERENCE illisible", nom)
             continue
         usine = referentiels.usine_attache(ref, reference)
         if usine not in usines:
+            ecarter("hors usines NORTH", nom)
             continue
         immat = fiche.get("IMMAT") or os.path.splitext(nom)[0]
         flotte[immat] = {"IMMAT": immat, "REFERENCE": reference, "PTAC": fiche["PTAC"], "ENERGIE": fiche["ENERGIE"],
@@ -91,14 +118,21 @@ def etat_a_sauvegarder(flotte: dict, maintenant: datetime.datetime) -> dict:
     La réservation par une tournée ouverte (``tournee``) n'est pas gardée :
     au redémarrage, les tournées ouvertes sont perdues et leurs commandes
     refusées (``archivage.reprendre``), le camion reste donc libre.
+    Le fichier porte aussi, pour le tableau de bord seulement (:func:`audit.resume_flotte`),
+    le type de camion (``frigo``), ``PTAC``, ``ENERGIE``, ``COULEUR`` (gammes du contrat), l'``usine`` et ``reserve``
+    (affecté à une tournée ouverte) : :func:`restaurer_etat` ne les relit pas.
 
     :param flotte: Flotte du moteur.
     :param maintenant: Heure réelle courante.
-    :return: ``{"jour": "AAAA-MM-JJ", "camions": {immat: {"position", "libre_a", "conduite_jour"}}}``.
+    :return: ``{"jour": "AAAA-MM-JJ", "camions": {immat: {"position", "libre_a", "conduite_jour", "frigo", "PTAC",
+        "ENERGIE", "COULEUR", "usine", "reserve"}}}``.
     """
     return {"jour": maintenant.strftime("%Y-%m-%d"),
             "camions": {immat: {"position": camion["position"], "libre_a": camion["libre_a"].isoformat(timespec="seconds"),
-                                "conduite_jour": round(float(camion["conduite_jour"]), 4)}
+                                "conduite_jour": round(float(camion["conduite_jour"]), 4),
+                                "frigo": bool(camion.get("frigo")), "PTAC": camion.get("PTAC", ""),
+                                "ENERGIE": camion.get("ENERGIE", ""), "COULEUR": camion.get("COULEUR", ""),
+                                "usine": camion.get("usine"), "reserve": camion.get("tournee") is not None}
                         for immat, camion in flotte.items()}}
 
 

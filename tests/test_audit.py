@@ -193,14 +193,110 @@ class TestBareme(unittest.TestCase):
         self.assertEqual(audit.ecart_et_note(0.9, 0.85), {"cible": 0.85, "ecart": 0.0, "note": 10.0})
 
     def test_paliers(self) -> None:
-        """Écart 5,9 % → 8,5 ; 20 % → 3 ; 60 % → 0."""
-        self.assertEqual(audit.ecart_et_note(0.80, 0.85)["note"], 8.5)
+        """Écart 5,9 % → 8 (contrat) ; 20 % → 3 ; 60 % → 0."""
+        self.assertEqual(audit.ecart_et_note(0.80, 0.85)["note"], 8.0)
         self.assertEqual(audit.ecart_et_note(0.68, 0.85)["note"], 3.0)
         self.assertEqual(audit.ecart_et_note(0.34, 0.85)["note"], 0.0)
+
+    def test_bareme_ta_plus_severe(self) -> None:
+        """TA (§4.3) : un écart de 20 % donne 0, contre 3 pour le TR (§4.1)."""
+        self.assertEqual(audit.ecart_et_note(0.68, 0.85, bareme=audit.BAREME_TA)["note"], 0.0)
+        self.assertEqual(audit.ecart_et_note(0.75, 0.85, bareme=audit.BAREME_TA)["note"], 6.0)
 
     def test_sans_cible(self) -> None:
         """Sans cible saisie, pas de note."""
         self.assertIsNone(audit.ecart_et_note(0.8, None)["note"])
+
+
+
+def flotte_test(ptac: str = "19t", frigo: bool = True, libre_a: float = 0) -> dict:
+    """État de la flotte du moteur avec le camion ``AA-1`` des tests et un camion sec libre.
+
+    :param ptac: PTAC du camion ``AA-1``.
+    :param frigo: ``True`` si ``AA-1`` est frigorifique.
+    :param libre_a: Fin de sa tournée, en minutes après ``T0``.
+    :return: Contenu de ``flotte_moteur.json``.
+    """
+    camion = {"PTAC": ptac, "ENERGIE": "Diesel", "COULEUR": "Rouge", "frigo": frigo, "usine": 1, "position": 1,
+              "libre_a": minute(libre_a).isoformat(timespec="seconds"), "conduite_jour": 0.0, "reserve": False}
+    return {"jour": T0.strftime("%Y-%m-%d"),
+            "camions": {"AA-1": camion, "BB-2": dict(camion, frigo=False, libre_a=T0.isoformat(timespec="seconds"))}}
+
+
+class TestContrat(unittest.TestCase):
+    """Cibles du jour, PTAC dépassé, gammes et note du contrat (§4.1 à §4.3)."""
+
+    def test_cible_ta_lignes_du_contrat(self) -> None:
+        """Tableau du §4.3, 2 116 demandes en 2 h dont 84 % fraîches : 500 camions → 23,3 %, 3 000 → plafond 75 %."""
+        frais, sec = 1777, 339
+        self.assertAlmostEqual(audit.cible_ta_contrat(frais, sec, 49, 56, 2.0)["valeur"], 0.236, places=3)
+        self.assertAlmostEqual(audit.cible_ta_contrat(frais, sec, 294, 336, 2.0)["valeur"], 0.75, places=3)
+        self.assertAlmostEqual(audit.cible_ta_contrat(frais, sec, 490, 560, 2.0)["valeur"], 0.75, places=3)
+
+    def test_cible_ta_sans_flotte(self) -> None:
+        """Sans N_F / N_S, pas de cible TA calculée."""
+        self.assertIsNone(audit.cible_ta_contrat(10, 2, None, None, 2.0)["valeur"])
+
+    def test_cible_tr_paliers(self) -> None:
+        """§4.1 : 62 % dès 1 000 demandes/h, 55 % dès 500, 46 % dès 250, 40 % en dessous."""
+        self.assertEqual([audit.cible_tr_contrat(q) for q in (1000, 999, 500, 250, 249)], [0.62, 0.55, 0.55, 0.46, 0.40])
+
+    def test_ptac_depasse_compte_refusee(self) -> None:
+        """D1 (SPEC PTAC=12t) partie dans un 19 t : refusée PTAC-DEPASSE, hors gamme, TA à 0."""
+        sources = sources_test()
+        sources["demandes"]["D1"].update({"spec_ptac": 12.0, "spec": {"PTAC": "12t"}})
+        rapport = audit.calculer(sources, minute(10), "journal", flotte=flotte_test("19t"))
+        self.assertEqual(rapport["acceptation"]["partie"], 0)
+        self.assertEqual(rapport["acceptation"]["motifs"].get(audit.MOTIF_PTAC_DEPASSE), 1)
+        self.assertEqual(rapport["gammes"]["comptes"]["hors"], 1)
+        self.assertEqual({c["code"]: c["n"] for c in rapport["controles"]}["PTAC_DEPASSE"], 1)
+
+    def test_ptac_inferieur_seulement_declasse(self) -> None:
+        """Un camion plus léger que la SPEC n'est pas un PTAC dépassé : la demande reste partie, gamme basse."""
+        sources = sources_test()
+        sources["demandes"]["D1"].update({"spec_ptac": 26.0, "spec": {"PTAC": "26t"}})
+        rapport = audit.calculer(sources, minute(10), "journal", flotte=flotte_test("19t"))
+        self.assertEqual(rapport["acceptation"]["partie"], 1)
+        self.assertEqual(rapport["gammes"]["comptes"]["basse"], 1)
+
+    def test_gamme_contrat(self) -> None:
+        """Le plus bas des critères : avance ≤ 1 h → médiane ; une SPEC sur deux respectée → médiane."""
+        camion = {"PTAC": "19t", "ENERGIE": "Diesel", "COULEUR": "Rouge"}
+        self.assertEqual(audit.gamme_contrat(0.5, {}, camion)["gamme"], "mediane")
+        self.assertEqual(audit.gamme_contrat(0.0, {}, camion)["gamme"], "basse")
+        self.assertEqual(audit.gamme_contrat(5.0, {"COL": "rouge", "ENR": "GPL"}, camion)["gamme"], "mediane")
+        self.assertEqual(audit.gamme_contrat(5.0, {"COL": "Bleu"}, None)["gamme"], "haute")  # SPEC non vérifiable
+
+    def test_cibles_du_jour_et_note(self) -> None:
+        """Avec la flotte du moteur : N_F = 1, N_S = 1, cible TA calculée ; note = TR + gammes + TA."""
+        rapport = audit.calculer(sources_test(), minute(10), "journal", flotte=flotte_test(libre_a=30))
+        cible = rapport["cibles"]["ta"]
+        self.assertEqual((cible["camions_frigo"], cible["camions_sec"], cible["source"]), (1, 1, "contrat"))
+        self.assertIsNotNone(cible["valeur"])
+        self.assertEqual(rapport["score"]["max"], 40)
+        self.assertEqual(rapport["camions"]["types"]["frigo"]["en_route"], 1)
+        self.assertEqual(rapport["camions"]["types"]["sec"]["libres"], 1)
+
+    def test_carte_camions(self) -> None:
+        """À 11 min, AA-1 roule sur son premier tronçon (6 → 16 min) ; BB-2 est à son usine (Amsterdam, PK 1)."""
+        flotte = flotte_test()
+        carte = audit.carte_camions(flotte, sources_test()["evenements"], minute(11))
+        self.assertEqual([c["immat"] for c in carte["en_route"]], ["AA-1"])
+        self.assertTrue(carte["en_route"][0]["charge"])
+        amsterdam = [lieu for lieu in carte["lieux"] if lieu["pk"] == 1][0]
+        self.assertEqual(amsterdam["sec"], 1)
+        # Après la dernière arrivée (26 min), AA-1 est à l'arrêt au lieu d'arrivée (Paris)
+        carte = audit.carte_camions(flotte, sources_test()["evenements"], minute(30))
+        self.assertEqual(carte["en_route"], [])
+        self.assertEqual([lieu["frigo"] for lieu in carte["lieux"] if lieu["nom"] == "Paris"], [1])
+
+    def test_cible_imposee(self) -> None:
+        """Une cible TA donnée remplace la formule ; N_F / N_S imposés remplacent la flotte."""
+        rapport = audit.calculer(sources_test(), minute(10), "journal",
+                                 cibles={"ta": 0.6, "camions_frigo": 3, "camions_sec": 4})
+        self.assertEqual(rapport["cibles"]["ta"]["valeur"], 0.6)
+        self.assertEqual(rapport["cibles"]["ta"]["source"], "fixee")
+        self.assertEqual(rapport["cibles"]["ta"]["camions_frigo"], 3)
 
 
 if __name__ == "__main__":

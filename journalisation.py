@@ -383,7 +383,7 @@ def resume_sante(sante: dict) -> list:
     lignes = []
     for service, etat in sante.items():
         lignes.append("%s : %s (écrit il y a %.0f s)" % (service, etat.get("statut", "?"), etat.get("age_s", 0)))
-        for nom in ("referentiel", "archivage", "controle"):
+        for nom in ("referentiel", "archivage", "controle", "evenements"):
             bdd = etat.get(nom)
             if not isinstance(bdd, dict) or not bdd.get("actif", True):
                 continue

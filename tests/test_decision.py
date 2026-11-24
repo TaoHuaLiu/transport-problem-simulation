@@ -167,6 +167,31 @@ class TestDACC(unittest.TestCase):
         finally:
             hypotheses.SPEC_BLOQUANTE = ancien
 
+    def test_ligne_3a_ptac_depasse_partout(self) -> None:
+        """D-ACC ligne 3a (R-SPEC-03) : SPEC PTAC=12t, flotte de 19 t seulement → REF-SPEC, même SPEC souple."""
+        demande = demande_test(self.ref, spec="PTAC=12t")
+        self.assertEqual(self.decider(demande), "refuser")
+        self.assertEqual(demande["motif"], "REF-SPEC")
+
+    def test_ptac_plus_lourd_jamais_choisi(self) -> None:
+        """R-SPEC-03 : un 26 t libre n'est pas pris pour PTAC=19t ; un 12 t (plus léger) reste possible, gamme abaissée."""
+        self.etat["flotte"]["L26"] = dict(camion_test("L26"), PTAC="26t")
+        demande = demande_test(self.ref, spec="PTAC=19t")
+        self.decider(demande)
+        self.assertEqual(self.etat["tournees"][demande["tournee"]]["camion"], "F1")
+        self.etat["flotte"] = {"L26": dict(camion_test("L26"), PTAC="26t")}
+        demande = demande_test(self.ref, id_demande="D2", spec="PTAC=19t")
+        self.decider(demande)
+        self.assertEqual(demande["motif"], "REF-SPEC")
+
+    def test_ptac_depasse_pas_dans_la_tournee(self) -> None:
+        """R-SPEC-03 : une demande PTAC=12t ne rejoint pas la tournée ouverte d'un 19 t."""
+        premiere = demande_test(self.ref)
+        self.decider(premiere)
+        tournee = self.etat["tournees"][premiere["tournee"]]
+        self.assertFalse(decision.compatible(tournee, demande_test(self.ref, id_demande="D2", spec="PTAC=12t"), self.etat, self.ref))
+        self.assertTrue(decision.compatible(tournee, demande_test(self.ref, id_demande="D3", spec="PTAC=19t"), self.etat, self.ref))
+
     def test_spec_tenue_preferee(self) -> None:
         """R-SPEC-02 : entre deux camions libres, celui qui respecte la SPEC est choisi."""
         self.etat["flotte"]["R2"] = camion_test("R2", couleur="Rouge")
@@ -276,6 +301,88 @@ class TestDDEPART(unittest.TestCase):
         self.assertGreater(tournee["plan"]["troncons"][-1]["remplissage"], 0.0)
         self.assertEqual(self.etat["flotte"][tournee["camion"]]["position"], tournee["plan"]["lieu_fin"])
         self.assertEqual(demande["gamme"], "haute")
+
+
+def tournee_a_reparer(ref: dict, etat: dict) -> dict:
+    """Ouvre à la main la tournée T00001 (camion F1) : D1 Amsterdam → Paris (4 EPAL), D2 Amsterdam → Anvers (8 EPAL).
+
+    Avec le référentiel de test, le plan est réalisable (Anvers livré d'abord,
+    D1 en gamme médiane). Les tests allongent ensuite Anvers → Paris pour
+    que D1 sorte de la gamme basse, comme après un rafraîchissement de
+    ``TRAVEL_TIME_MATRIX`` (run VM du 2026-11-20).
+
+    :param ref: Référentiel de test.
+    :param etat: État du moteur, modifié sur place.
+    :return: La tournée.
+    """
+    d1 = demande_test(ref, "D1", qte=4, h_dep_h=12.0)
+    d2 = demande_test(ref, "D2", loc_arr="Anvers", type_arr="PORT", qte=8, h_dep_h=12.0)
+    tournee = {"id": "T00001", "camion": "F1", "nature": "frais", "demandes": ["D1", "D2"], "statut": "ouverte", "plan": {}}
+    for demande in (d1, d2):
+        demande.update({"etat": "ACCEPTEE", "tournee": "T00001"})
+        etat["demandes"][demande["id"]] = demande
+    etat["tournees"]["T00001"] = tournee
+    etat["flotte"]["F1"]["tournee"] = "T00001"
+    etat["compteur"] = 1
+    return tournee
+
+
+class TestReparation(unittest.TestCase):
+    """Règle R-DEL-02 et D-DEPART ligne 0 : un plan devenu impossible hors délai ne perd que la demande en cause."""
+
+    def setUp(self) -> None:
+        """Tournée D1 + D2 sur F1 (60 % < θ = 90 %, elle attend) ; F2 libre à Amsterdam ; Anvers → Paris passe de 4 à 20 h projet."""
+        self.ref = referentiel_test()
+        self.etat = {"flotte": {"F1": camion_test("F1"), "F2": camion_test("F2")}, "tournees": {}, "demandes": {},
+                     "compteur": 0}
+        self.parametres = {"couts": COUTS, "seuil": 0.9, "marge_h": 1.0}
+        self.journal = tracabilite.ouvrir_journal(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_build", "tests"), T0, "_test")
+        self.tournee = tournee_a_reparer(self.ref, self.etat)
+        self.assertEqual(planification.decider_depart(self.tournee, self.etat, self.ref, T0, self.parametres), "attendre")
+        self.ref["trajets"][(2, 13)] = 20.0
+
+    def test_ligne_0_plan_impossible_hors_delai(self) -> None:
+        """D-DEPART ligne 0 : D1 hors gamme basse, aucune demande en retard → réparer (et non partir)."""
+        self.assertEqual(planification.decider_depart(self.tournee, self.etat, self.ref, T0, self.parametres), "reparer")
+        self.assertEqual(self.tournee["plan"]["motif"], "GAMME")
+
+    def test_retrait_minimal(self) -> None:
+        """R-DEL-02 : retirer D1 ou D2 suffit ; on garde le plus de chargement, donc D1 (4 EPAL) part, D2 (8 EPAL) reste."""
+        retirees = planification.retirer_bloquantes(self.tournee, self.etat, self.ref, T0, COUTS)
+        self.assertEqual(retirees, ["D1"])
+        self.assertEqual(self.tournee["demandes"], ["D2"])
+        self.assertTrue(self.tournee["plan"]["ok"])
+
+    def test_demande_retiree_reaffectee(self) -> None:
+        """R-DEL-02 : D1 retirée est replacée sur F2 (REAFFECTATION), D2 attend dans T00001, rien n'expire."""
+        moteur_decider_tournee(self.tournee, self.etat, self.ref, self.parametres, self.journal)
+        d1 = self.etat["demandes"]["D1"]
+        self.assertEqual(d1["etat"], "ACCEPTEE")
+        self.assertNotEqual(d1["tournee"], "T00001")
+        self.assertEqual(self.etat["tournees"][d1["tournee"]]["camion"], "F2")
+        self.assertEqual((self.tournee["statut"], self.tournee["demandes"]), ("ouverte", ["D2"]))
+        self.assertEqual(self.etat["demandes"]["D2"]["etat"], "ACCEPTEE")
+
+    def test_sans_autre_camion_motif_reel(self) -> None:
+        """R-DEL-02 : sans autre frigo libre, D1 expire REF-FRIGO (code Contrôle 8), pas REF-DELAI."""
+        del self.etat["flotte"]["F2"]
+        moteur_decider_tournee(self.tournee, self.etat, self.ref, self.parametres, self.journal)
+        d1 = self.etat["demandes"]["D1"]
+        self.assertEqual((d1["etat"], d1["motif"]), ("EXPIREE", "REF-FRIGO"))
+        self.assertEqual(self.tournee["demandes"], ["D2"])
+
+
+def moteur_decider_tournee(tournee: dict, etat: dict, ref: dict, parametres: dict, journal: dict) -> None:
+    """Appelle :func:`moteur.decider_tournee` à :data:`T0` (import tardif : le moteur charge plus de modules).
+
+    :param tournee: Tournée ouverte.
+    :param etat: État du moteur.
+    :param ref: Référentiel.
+    :param parametres: ``couts``, ``seuil``, ``marge_h``.
+    :param journal: Journal de traçabilité.
+    """
+    import moteur
+    moteur.decider_tournee(tournee, etat, ref, T0, parametres, journal)
 
 
 class TestDeclassementSpec(unittest.TestCase):

@@ -36,8 +36,9 @@ import regles  # noqa: E402
 import robustesse  # noqa: E402
 import tracabilite  # noqa: E402
 import tracabilite_controle  # noqa: E402
+import tables_direct  # noqa: E402
 import flotte  # noqa: E402
-from test_decision import COUTS, T0, camion_test, referentiel_test  # noqa: E402
+from test_decision import COUTS, T0, camion_test, referentiel_test, tournee_a_reparer  # noqa: E402
 
 DOSSIER_CODE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
@@ -149,6 +150,17 @@ class TestDemandeEnErreur(MoteurTest):
         moteur.executer_tick(self.etat, self.ref, [], T0, dict(PARAMETRES, seuil=0.0), self.journal)
         self.assertEqual(tournee["statut"], "partie")
 
+    def test_reaffectation_en_erreur_expire_la_demande(self) -> None:
+        """R-DEL-02 + R-ROB-01 : la réaffectation de D1 plante → D1 expire REF-DONNEES, D2 reste dans sa tournée."""
+        tournee = tournee_a_reparer(self.ref, self.etat)
+        self.ref["trajets"][(2, 13)] = 20.0
+        with mock.patch.object(decision, "reaffecter", side_effect=RuntimeError("bogue simulé")):
+            self.tick([])
+        d1 = self.etat["demandes"]["D1"]
+        self.assertEqual((d1["etat"], d1["motif"]), ("EXPIREE", "REF-DONNEES"))
+        self.assertEqual((tournee["statut"], tournee["demandes"]), ("ouverte", ["D2"]))
+        self.assertEqual(self.etat["messages"]["nb"], 1)
+
     def test_messages_limites_a_un_par_minute(self) -> None:
         """Une erreur répétée est comptée à chaque fois mais affichée une fois par minute réelle."""
         messages = {}
@@ -176,6 +188,117 @@ class TestRedemarrage(MoteurTest):
         champs = dict(champs_test(h_dep_h=10.0), QTE_PAL="")
         self.tick([(T0, "D1", champs)], T0 + datetime.timedelta(minutes=20))
         self.assertEqual(tracabilite_controle.code_justif(self.etat["demandes"]["D1"]), 7)
+
+
+class TestJournalEvenements(MoteurTest):
+    """R-ROB-08 : une écriture du journal des événements en échec n'arrête rien, n'est pas perdue et se voit."""
+
+    def casser(self) -> str:
+        """Rend le journal impossible à écrire (dossier absent) ; renvoie le vrai chemin.
+
+        :return: Chemin d'origine du journal.
+        """
+        chemin = self.journal["chemin"]
+        self.journal["chemin"] = os.path.join(self.dossier.name, "absent", "evenements.csv")
+        return chemin
+
+    def lignes(self, chemin: str) -> list:
+        """Événements écrits dans un journal.
+
+        :param chemin: Fichier du journal.
+        :return: Colonne ``EVENEMENT`` de chaque ligne, en-tête exclu.
+        """
+        with open(chemin, encoding="utf-8") as fichier:
+            return [ligne.split(";")[1] for ligne in fichier.read().splitlines()[1:]]
+
+    def test_echec_garde_la_ligne_et_le_signale(self) -> None:
+        """Fichier impossible à écrire : pas d'exception, ligne en attente, échec compté et journalisé en erreur."""
+        self.casser()
+        with self.assertLogs("nord.tracabilite", level="ERROR"):
+            tracabilite.noter(self.journal, T0, "REFUS", demande={"id": "D1"}, motif="REF-DONNEES")
+        self.assertEqual((self.journal["nb"], len(self.journal["en_attente"])), (0, 1))
+        self.assertEqual((self.journal["sante"]["echecs"], self.journal["sante"]["en_attente"]), (1, 1))
+        self.assertEqual(self.journal["messages"]["nb"], 1)
+
+    def test_retablissement_ecrit_dans_l_ordre(self) -> None:
+        """Fichier revenu : les lignes en attente sont écrites avant la nouvelle, le rétablissement est annoncé."""
+        chemin = self.casser()
+        tracabilite.noter(self.journal, T0, "REFUS", demande={"id": "D1"}, motif="REF-DONNEES")
+        self.journal["chemin"] = chemin
+        with self.assertLogs("nord.robustesse", level="WARNING"):
+            tracabilite.noter(self.journal, T0, "ACQUITTEMENT", demande={"id": "D2"})
+        self.assertEqual(self.lignes(chemin), ["REFUS", "ACQUITTEMENT"])
+        self.assertEqual((self.journal["nb"], self.journal["en_attente"], self.journal["sante"]["echecs"]), (2, [], 0))
+
+    def test_depart_coherent_si_journal_en_panne(self) -> None:
+        """Départ pendant la panne : tournée partie ET demande partie ; les événements sont écrits au retour."""
+        self.tick([(T0, "D1", champs_test())])
+        chemin = self.casser()
+        moteur.executer_tick(self.etat, self.ref, [], T0, dict(PARAMETRES, seuil=0.0), self.journal)
+        tournee = next(iter(self.etat["tournees"].values()))
+        self.assertEqual((tournee["statut"], self.etat["demandes"]["D1"]["etat"]), ("partie", "PARTIE"))
+        self.journal["chemin"] = chemin
+        self.assertTrue(tracabilite.ecrire_en_attente(self.journal, T0))
+        evenements = self.lignes(chemin)
+        self.assertEqual((evenements[0], evenements[1], evenements[-1]), ("ACQUITTEMENT", "DEPART", "PARTIE"))
+
+    def test_memoire_bornee(self) -> None:
+        """Au-delà de MAX_EN_ATTENTE lignes en attente, les plus anciennes sont perdues et comptées."""
+        self.casser()
+        with mock.patch.object(tracabilite, "MAX_EN_ATTENTE", 2):
+            for numero in range(5):
+                tracabilite.noter(self.journal, T0, "REFUS", demande={"id": "D%d" % numero})
+        self.assertEqual((len(self.journal["en_attente"]), self.journal["perdus"]), (2, 3))
+        self.assertEqual(self.journal["en_attente"][0]["ID_DEMANDE"], "D3")
+
+    def test_message_erreur_apres_acceptation_dit_l_etat_garde(self) -> None:
+        """Erreur levée après l'acceptation : le message dit « reste ACCEPTEE », pas « refusée »."""
+        originale = decision.traiter_demande
+
+        def traiter(demande: dict, *args: object) -> str:
+            """D-ACC simulée : accepte, puis plante.
+
+            :param demande: Demande préparée.
+            :param args: Autres arguments de :func:`decision.traiter_demande`.
+            :return: Jamais.
+            """
+            originale(demande, *args)
+            raise RuntimeError("bogue après acceptation")
+
+        with mock.patch.object(decision, "traiter_demande", side_effect=traiter):
+            with self.assertLogs("nord.moteur", level="WARNING") as journaux:
+                self.tick([(T0, "D1", champs_test())])
+        self.assertIn("reste ACCEPTEE", journaux.output[0])
+        self.assertNotIn("refusée", journaux.output[0])
+
+
+class TestFichesEcartees(unittest.TestCase):
+    """R-FLO-01 : chaque fiche camion écartée au chargement est comptée avec son motif et journalisée."""
+
+    def test_motifs_comptes_et_journalises(self) -> None:
+        """Fiche illisible, sans PTAC, PTAC inconnu, REFERENCE illisible, autre zone : un motif chacune."""
+        fiches = {"AA-illisible.json": "{pas du json",
+                  "BB-sans-ptac.json": json.dumps({"PTAC": "", "ENERGIE": "Diesel", "REFERENCE": "100001"}),
+                  "CC-ptac-inconnu.json": json.dumps({"PTAC": "99t", "ENERGIE": "Diesel", "REFERENCE": "100002"}),
+                  "DD-reference.json": json.dumps({"PTAC": "19t", "ENERGIE": "Diesel", "REFERENCE": "x"}),
+                  "EE-autre-zone.json": json.dumps({"PTAC": "19t", "ENERGIE": "Diesel", "REFERENCE": "900000"}),
+                  "FF-ok.json": json.dumps({"PTAC": "19t", "ENERGIE": "Diesel", "REFERENCE": "100003",
+                                            "REMORQUE REFRIGEREE": "oui"})}
+        with tempfile.TemporaryDirectory() as dossier:
+            for nom, contenu in fiches.items():
+                with open(os.path.join(dossier, nom), "w", encoding="utf-8") as fichier:
+                    fichier.write(contenu)
+            ecartees = {}
+            camions = flotte.charger_flotte(dossier, referentiel_test(), [1], T0, ecartees)
+        self.assertEqual(list(camions), ["FF-ok"])
+        self.assertEqual({motif: noms for motif, noms in ecartees.items()},
+                         {"illisible": ["AA-illisible.json"], "sans PTAC ou ENERGIE": ["BB-sans-ptac.json"],
+                          "PTAC absent de TRUCKS_CAPACITY": ["CC-ptac-inconnu.json"],
+                          "REFERENCE illisible": ["DD-reference.json"], "hors usines NORTH": ["EE-autre-zone.json"]})
+        with self.assertLogs("nord.moteur", level="INFO") as journaux:
+            moteur.journaliser_fiches_ecartees(ecartees)
+        avertissements = [ligne for ligne in journaux.output if ligne.startswith("WARNING")]
+        self.assertEqual(len(avertissements), 4)  # « hors usines NORTH » n'est pas un problème
 
 
 class TestEtatFlotte(MoteurTest):
@@ -581,6 +704,126 @@ class TestSante(unittest.TestCase):
         logging.getLogger(journalisation.RACINE).addHandler(logging.NullHandler())
         logging.getLogger(journalisation.RACINE).setLevel(logging.NOTSET)
         sys.excepthook = sys.__excepthook__
+
+
+
+class _CurseurFactice:
+    """Curseur PostgreSQL factice : rend des lignes fixes et garde les requêtes reçues."""
+
+    def __init__(self, requetes: list) -> None:
+        """Prépare le curseur.
+
+        :param requetes: Liste où noter chaque requête exécutée.
+        """
+        self.requetes, self.derniere = requetes, ""
+
+    def execute(self, sql: str, parametres: dict = None) -> None:
+        """Note la requête.
+
+        :param sql: Texte SQL.
+        :param parametres: Paramètres.
+        """
+        self.requetes.append(sql)
+        self.derniere = sql
+
+    def fetchall(self) -> list:
+        """Lignes : une ligne de commande, ou les groupes par statut.
+
+        :return: Lignes.
+        """
+        if "GROUP BY" in self.derniere:
+            return [("ACCEPTEE", 2), ("REFUSEE", 1)]
+        return [tuple(["N1"] + [datetime.datetime(2026, 11, 24, 15, 0)] * 2)]
+
+    def fetchone(self) -> tuple:
+        """Nombre de lignes.
+
+        :return: ``(3,)``.
+        """
+        return (3,)
+
+    def close(self) -> None:
+        """Rien à fermer."""
+
+
+class _ConnexionFactice:
+    """Connexion factice : vérifie la session en lecture seule."""
+
+    def __init__(self, requetes: list) -> None:
+        """Prépare la connexion.
+
+        :param requetes: Liste partagée avec le curseur.
+        """
+        self.requetes, self.session = requetes, None
+
+    def set_session(self, **options) -> None:
+        """Garde les options de session.
+
+        :param options: ``readonly``, ``autocommit``.
+        :type options: bool
+        """
+        self.session = options
+
+    def cursor(self) -> _CurseurFactice:
+        """Nouveau curseur.
+
+        :return: Curseur factice.
+        """
+        return _CurseurFactice(self.requetes)
+
+    def close(self) -> None:
+        """Rien à fermer."""
+
+
+class TestTablesDirect(unittest.TestCase):
+    """Onglet Tables du tableau de bord : lecture seule, jamais d'exception, pause après un échec (R-ROB-02, R-ROB-06)."""
+
+    def test_base_injoignable(self) -> None:
+        """Une connexion en échec rend une erreur, met le lien en pause et ne relance pas avant la fin de la pause."""
+        lien = tables_direct.nouveau_lien()
+        appels = []
+
+        def connecteur(**parametres) -> None:
+            """Échoue comme un serveur muet.
+
+            :param parametres: Paramètres de connexion.
+            :type parametres: object
+            :raises OSError: Toujours.
+            """
+            appels.append(parametres)
+            raise OSError("délai dépassé")
+
+        reponse = tables_direct.lire_table(lien, "LOG_NORTH_TRAJET", connecteur=connecteur)
+        self.assertFalse(reponse["ok"])
+        self.assertIn("délai dépassé", reponse["erreur"])
+        self.assertEqual(lien["sante"]["echecs"], 1)
+        self.assertIn("connect_timeout", appels[0])  # R-ROB-02 : délais bornés
+        tables_direct.lire_table(lien, "LOG_NORTH_TRAJET", connecteur=connecteur)
+        self.assertEqual(len(appels), 1)  # en pause : pas de deuxième essai
+
+    def test_lecture_seule_et_nos_lignes(self) -> None:
+        """Session en lecture seule ; tables du Contrôle filtrées sur nos ID_ENTRE ; uniquement des SELECT."""
+        lien, requetes = tables_direct.nouveau_lien(), []
+        connexion = _ConnexionFactice(requetes)
+        reponse = tables_direct.lire_table(lien, "TRACABILITE_COMMANDE", connecteur=lambda **p: connexion)
+        self.assertTrue(reponse["ok"])
+        self.assertEqual(connexion.session, {"readonly": True, "autocommit": True})
+        self.assertEqual((reponse["total"], reponse["groupes"]), (3, {"ACCEPTEE": 2, "REFUSEE": 1}))
+        self.assertTrue(all(r.lstrip().upper().startswith("SELECT") for r in requetes))
+        self.assertTrue(all('"ID_ENTRE" ~ %(motif)s' in r for r in requetes))
+        self.assertEqual(reponse["lignes"][0][1], "2026-11-24 15:00:00")
+
+    def test_table_inconnue_refusee(self) -> None:
+        """Un nom de table hors de la liste n'atteint jamais la base."""
+        lien = tables_direct.nouveau_lien()
+        reponse = tables_direct.lire_table(lien, 'X"; DROP TABLE "Y', connecteur=lambda **p: self.fail("connexion"))
+        self.assertFalse(reponse["ok"])
+
+    def test_onglet_desactive(self) -> None:
+        """``--sans-tables`` : aucune connexion."""
+        lien = tables_direct.nouveau_lien(actif=False)
+        reponse = tables_direct.lire_table(lien, "LOG_NORTH_TRAJET", connecteur=lambda **p: self.fail("connexion"))
+        self.assertIn("désactivé", reponse["erreur"])
 
 
 if __name__ == "__main__":

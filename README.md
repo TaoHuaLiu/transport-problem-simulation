@@ -24,17 +24,18 @@ Ce dossier est `4 - Spécifications et code/1 - DEV/` du projet (copie publique 
 | `flotte.py` | Fiches camion → flotte NORTH (position, disponibilité, conduite) ; état gardé d'un lancement à l'autre | R-FLO-01, R-ROB-07 |
 | `planification.py` | Plan d'une tournée (chargements puis livraisons), pauses, gamme, coût, prix ; table D-DEPART | D-DEPART, R-RENT-01, R-DEL-01, R-CON-01, R-CAP-01, R-DUR-01, R-GAM, R-SPEC-02, R-OPT-01/03 |
 | `decision.py` | Table D-ACC : ignorer, refuser ou accepter dans le meilleur plan | D-ACC, R-OPT-01/02/03 |
-| `tracabilite.py` | Journal CSV des événements ; calcul de TA et TR (surface au sol) | R-KPI-TA, R-KPI-TR |
+| `tracabilite.py` | Journal CSV des événements (jamais d'exception : lignes gardées et réécrites si le fichier est en panne) ; calcul de TA et TR (surface au sol) | R-KPI-TA, R-KPI-TR, R-ROB-08 |
 | `archivage.py` | Écrit l'état du moteur dans `LOG_NORTH_CAMION`, `LOG_NORTH_TRAJET`, `LOG_NORTH_ARCHIVAGE_COMMANDE` (`../3 - Documentation/tables-nord.sql`) ; `--etat` pour compter les lignes, `--reinitialiser` pour les vider (moteur arrêté, sauvegarde JSON avant) | R-SPEC-02, R-DEL-01, R-GAM, R-KPI-TR |
 | `tracabilite_controle.py` | Remplit les tables du Contrôle `TRACABILITE_COMMANDE` et `TRACABILITE_TRAJET` pour nos commandes (code de refus D-JUSTIF dans `JUSTIF_REFUS`) ; `--verifier` (schéma) et `--etat` (nos lignes), en lecture seule | R-CTL-01, D-JUSTIF, R-ROB-02 |
-| `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct ; enchaîne D-ACC puis D-DEPART, chaque demande et chaque tournée protégée | R-ROB-01/02/03/07 |
+| `moteur.py` | Boucle principale, en rejeu (horloge simulée) ou en direct ; enchaîne D-ACC puis D-DEPART, chaque demande et chaque tournée protégée | R-ROB-01/02/03/07/08 |
 | `audit.py` | Recalcule les indicateurs d'audit depuis le journal et les demandes reçues, sans passer par l'état du moteur ; contrôles de traçabilité | R-KPI-TA, R-KPI-TR, R-PER-01/02 |
 | `tableau_bord.py` | Serveur web local (sockets) du tableau de bord d'audit ; rapport JSON ponctuel (`--instantane`) | — |
 | `nord.sh` | Lancement sur la VM : démarrer, arrêter, état, surveillance des trois processus ; `audit` = production | R-ROB-05 |
 | `tableau_bord.html`, `static/Chart_min.js` | Page du tableau de bord et Chart.js 2.5 (copie locale, licence MIT) | — |
+| `tables_direct.py` | Lecture seule de nos tables pour l'onglet Tables du tableau de bord | R-ROB-02, R-ROB-06 |
 | `tests/test_decision.py` | Un test par ligne des tables D-ACC et D-DEPART ; taux de remplissage par surface | — |
 | `tests/test_audit.py` | Statuts finals, TA, TR, contrôles et barème du tableau de bord | — |
-| `tests/test_robustesse.py` | Garde-fous d'exploitation : erreurs sur une demande, une tournée, la base, le CSV, le collecteur ; SIGTERM ; journaux, santé et alertes ; redémarrage (échéances passées, état des camions) | R-ROB-01 à 04, 06, 07, R-VAL-02 |
+| `tests/test_robustesse.py` | Garde-fous d'exploitation : erreurs sur une demande, une tournée, la base, le CSV, le collecteur ; SIGTERM ; journaux, santé et alertes ; redémarrage (échéances passées, état des camions) ; journal des événements en panne ; fiches écartées | R-ROB-01 à 04, 06 à 08, R-VAL-02, R-FLO-01 |
 | `tests/test_mode_audit.py` | Mode audit : démarrage sur la base seulement, fiches de la VM et Annexe 2 obligatoires, options interdites (moteur et `nord.sh`) | R-ROB-05 |
 | `tests/test_tracabilite_controle.py` | Un test par ligne de D-JUSTIF ; lignes des deux tables du Contrôle ; écriture limitée à nos lignes, reprise après arrêt (base simulée) ; schéma | R-CTL-01, D-JUSTIF |
 | `tests/test_archivage.py` | Lignes et contraintes des tables `LOG_NORTH_*`, statuts des trajets dans le temps, prix, écritures (base simulée), reprise après arrêt | — |
@@ -65,9 +66,11 @@ Le code lit et écrit dans `../donnees/` (hors git) :
 | `../donnees/annexe2_confidentiel.json` | Taux horaires et seuil de rentabilité (Annexe 2, **confidentiel, à ne pas publier**) | à créer à la main |
 | `../donnees/moteur/evenements_*.csv` | Journal du moteur | `moteur.py` |
 
-Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul le classement des plans compte). Le seuil de départ θ et la marge W ne dépendent pas de ce fichier : par défaut θ = 0,85 (`hypotheses.SEUIL_DEPART_DEFAUT`, comparé au remplissage au départ du premier lieu de chargement) et W = 0,25 h projet (`hypotheses.MARGE_DEPART_H`), valeurs du balayage du 2026-11-16 (`../../_build/rejeu-c13/`) ; `--seuil` et `--marge` les remplacent. Une tournée peut charger dans plusieurs lieux (`hypotheses.REGROUPER_ENTRE_LIEUX_DEP`) : tous les chargements, puis toutes les livraisons. Sans `referentiels.json`, il génère un référentiel d'exemple dans `_build/` (valeurs du sujet + estimations, signalées au démarrage).
+`annexe2_confidentiel.json` et `cibles_contrat.json` peuvent aussi être dans `donnees/` à l'intérieur du dossier de code, disposition du miroir GitHub : `../donnees/` est lu en premier, sinon `donnees/` (`hypotheses.chemin_donnees_contrat`, même ordre dans `nord.sh`). Les autres fichiers (demandes, journaux, `run/`) restent dans `../donnees/`.
 
 ## Sur la VM ENSIBS
+Sans `annexe2_confidentiel.json`, le moteur tourne avec des taux fictifs (seul le classement des plans compte). Le seuil de départ θ et la marge W ne dépendent pas de ce fichier : par défaut θ = 0,85 (`hypotheses.SEUIL_DEPART_DEFAUT`, comparé au remplissage au départ du premier lieu de chargement) et W = 0,25 h projet (`hypotheses.MARGE_DEPART_H`), valeurs du balayage du 2026-11-16 (`../../_build/rejeu-c13/`) ; `--seuil` et `--marge` les remplacent. Une tournée peut charger dans plusieurs lieux (`hypotheses.REGROUPER_ENTRE_LIEUX_DEP`) : tous les chargements, puis toutes les livraisons. Sans `referentiels.json`, il génère un référentiel d'exemple dans `_build/` (valeurs du sujet + estimations, signalées au démarrage).
+
 
 `nord.sh` lance et surveille la chaîne (collecteur, moteur `--direct --bdd --archiver`, tableau de bord sur le VLAN) :
 
@@ -102,7 +105,7 @@ python3 tableau_bord.py --hote 0.0.0.0                             # tableau de 
 
 Pour l'audit, lancer `sh nord.sh audit` dans `tmux` ou `screen` (options permises : `--seuil`, `--marge`, `--port`). Le script :
 
-1. refuse de démarrer, sans rien arrêter, si la base ne répond pas, si nos tables `LOG_NORTH_*` manquent ou sont incomplètes (`archivage.py --verifier` ; les créer ou migrer avec `../3 - Documentation/tables-nord.sql`), si `/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion/` manque ou si `../donnees/annexe2_confidentiel.json` est absent (`paquet_vm.sh --confidentiel`) ;
+1. refuse de démarrer, sans rien arrêter, si la base ne répond pas, si nos tables `LOG_NORTH_*` manquent ou sont incomplètes (`archivage.py --verifier` ; les créer ou migrer avec `../3 - Documentation/tables-nord.sql`), si `/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion/` manque ou si `annexe2_confidentiel.json` est absent de `../donnees/` et de `donnees/` (`paquet_vm.sh --confidentiel`, ou le `donnees/` du miroir GitHub) ;
 2. relance moteur et tableau de bord en mode audit (le collecteur continue s'il tourne) : `moteur.py --audit` = `--direct --bdd --archiver`, sans copie JSON, sans fiches locales, sans coûts fictifs ; tableau de bord sur `0.0.0.0`, jamais `--confidentiel` ;
 3. surveille et relance toutes les 30 s ce qui s'arrête (un moteur refusé faute de base est relancé dès qu'elle répond).
 
@@ -121,14 +124,16 @@ Consultation : `sh nord.sh sante`, `sh nord.sh erreurs [N]`, `sh nord.sh sql [N]
 
 Mode débogage : `--debug` sur `collecteur.py`, `moteur.py`, `tableau_bord.py`, ou `sh nord.sh demarrer --debug`. La console passe au niveau DEBUG (millisecondes, module), le moteur écrit chaque décision, chaque départ, chaque tick et chaque requête SQL, le collecteur chaque message, le tableau de bord chaque requête HTTP avec sa durée. Le tableau de bord en débogage ouvre `/api/debug` et un panneau (derniers avertissements et erreurs de tous les services, avec trace ; dernières requêtes HTTP ; santé brute) ; `?debug=1` dans l'URL affiche le panneau ou dit que le serveur n'est pas en débogage.
 
-### Garde-fous d'exploitation (R-ROB-01 à R-ROB-07)
+### Garde-fous d'exploitation (R-ROB-01 à R-ROB-08)
 
 Un moteur relancé perd son état en mémoire : ses commandes acceptées et pas encore parties passent expirées (REF-DELAI), ce qui fait baisser le TA. Un collecteur arrêté perd les messages de l'ERP pour toujours. Les services ne s'arrêtent donc que sur demande :
 
 | Panne | Comportement | Où le voir |
 |---|---|---|
 | Exception sur une demande | Refusée REF-DONNEES (ignorée si hors NORTH) ; les suivantes sont décidées | `moteur.log`, journal |
-| Exception sur une tournée | Reste ouverte, réexaminée au tick suivant | `moteur.log` |
+| Exception sur une tournée | Reste ouverte, réexaminée au tick suivant (le message dit si elle était déjà partie) | `moteur.log` |
+| Journal des événements impossible à écrire (disque plein, droits) | Lignes gardées en mémoire et réécrites dans l'ordre au tick suivant ; erreur journalisée, rétablissement annoncé, lignes jamais écrites signalées à l'arrêt ; au départ, l'état est mis à jour avant le journal (R-ROB-08) | tableau de bord (tuile « Journal des événements (CSV) », alerte critique), `sh nord.sh sante`, `moteur.log` |
+| Fiche camion écartée (illisible, sans PTAC ou ENERGIE, PTAC inconnu, REFERENCE illisible) | Comptée par motif au démarrage, noms des fichiers en avertissement (R-FLO-01) | début de `moteur.log` (« fiches écartées ») |
 | Ligne illisible dans le CSV du jour | Ignorée et comptée | `moteur.log`, résumé à l'arrêt |
 | Base injoignable ou lente | Délais bornés (connexion 5 s, requête 10 s, `referentiels.BDD`) ; dernier référentiel gardé, nouvel essai chaque minute ; tables `LOG_NORTH_*` rattrapées au retour de la base | `moteur.log` (« base injoignable ») |
 | Base injoignable au démarrage | Le moteur part sur `../donnees/referentiels.json` (écrit par `nord.sh demarrer`, ou `--referentiels`) | première ligne de `moteur.log` |
@@ -219,16 +224,21 @@ Au-delà, la demande est hors contrat (pas de plan). Une SPEC non respectée fai
 
 | Bloc | Contenu |
 |---|---|
-| Indicateurs | TA (parties / reçues, R-KPI-TA), TR au départ (R-KPI-TR), part de gamme haute, contrôles bloquants passés ; pour chacun, écart à la cible et note du barème (écart ≤ 3 % → 10, ≤ 7 % → 8,5, ≤ 15 % → 6, ≤ 35 % → 3, ≤ 50 % → 1) |
+| Note du contrat | Note sur 10 de TR, gammes et TA et total mesuré (le professionnalisme est noté par le Contrôle), cibles du jour avec leur calcul (R-KPI-NOTE) : TA cible par la formule du §4.3 (N_F / N_S lus dans `../donnees/run/flotte_moteur.json`), TR cible selon le débit q (§4.1). Barème TR et gammes ≤ 3 % → 10, ≤ 7 % → 8, ≤ 15 % → 6, ≤ 35 % → 3, ≤ 50 % → 1 ; TA : 0 au-delà de 15 % |
+| Indicateurs | TA (parties / reçues, R-KPI-TA ; PTAC dépassé = refusée), TR au départ (R-KPI-TR), gammes du contrat (R-KPI-GAM : haute, haute + médiane, hors gamme), contrôles bloquants passés |
+| Camions | Camions en route par type dans le temps, flotte par type (libres, réservés, en route, par PTAC), TA frais / sec, critère qui fait descendre les trajets (délai, SPEC) |
 | Fenêtre d'audit | Début et durée (2 h par défaut) ; « Démarrer l'audit maintenant » ; barre de progression. Une demande reçue dans la fenêtre et partie après sa fin compte comme partie |
 | Graphiques | Statut final des demandes par heure de réception, TA cumulé, remplissage par heure de départ, distribution du remplissage, gammes, motifs de refus |
 | Contrôles | Demandes sans décision, acquittées en retard, parties après `H_DEP`, acquittées puis refusées, hors périmètre au journal, absentes du collecteur, décisions lentes ; en direct, moteur ou collecteur silencieux depuis plus de 60 s |
 | Exports | `/api/rapport.json` (rapport de la fenêtre, pièce pour l'audit) et `/api/statuts.csv` (statut final de chaque demande NORTH, à comparer avec le décompte du Contrôle) |
 
+| Onglet Tables en base | `tables_direct.py` : dernières lignes de `LOG_NORTH_*` et de nos lignes de `TRACABILITE_*` (session en lecture seule, `SELECT` seulement, liste fermée de tables), décompte par statut, écart avec le nombre de commandes décidées au journal. Délais bornés, cache 5 s, pas de nouvel essai pendant 30 s après un échec (R-ROB-02, R-ROB-06) ; `--sans-tables` le désactive |
+| Onglet Carte des camions | Carte schématique (pas de fond de carte) des 18 lieux : camions à l'arrêt par lieu, camions en route placés sur leur tronçon en cours (journal), chargés ou à vide (`audit.carte_camions`). Lien direct : `http://IP_VM:10000/#carte` |
 ```bash
 python3 tableau_bord.py                                    # http://localhost:10000/
 python3 tableau_bord.py --hote 0.0.0.0 --port 10000       # accessible depuis le VLAN 40
-python3 tableau_bord.py --cible-ta 0.85 --cible-tr 0.75   # cibles du contrat (sinon ../donnees/cibles_contrat.json)
+python3 tableau_bord.py --cible-ta 0.85 --cible-tr 0.75   # cibles fixes (sinon cibles du jour calculées par le contrat)
+python3 tableau_bord.py --camions-frigo 294 --camions-sec 336   # N_F / N_S du Contrôle (sinon état de la flotte du moteur)
 python3 tableau_bord.py --instantane ../donnees/audit/rapport.json   # un rapport JSON, sans serveur
 python3 tableau_bord.py --journal "../../_build/rejeu-audit/balayage/x10-th0.85-w0.5" \
     --demandes "../../_build/rejeu-audit/demandes_2h.jsonl"         # sur un rejeu, en local
@@ -285,6 +295,6 @@ Avec `--archiver` (mode direct seulement), le moteur tient à jour les trois tab
 
 ## Journal du moteur
 
-Une ligne par événement (`ACQUITTEMENT`, `REFUS` avec motif, `DEPART`, `TRONCON`, `PARTIE` avec gamme, `EXPIRATION`), séparateur `;`. Les demandes hors périmètre NORTH ne sont pas journalisées. Ce journal reste la source de référence (les tables `LOG_NORTH_*` en sont le reflet en base). La table de traçabilité partagée, dont le schéma est fixé par le groupe Contrôle (question A1), n'est pas encore écrite.
+Une ligne par événement (`ACQUITTEMENT`, `REFUS` avec motif, `REAFFECTATION` (R-DEL-02), `DEPART`, `TRONCON`, `PARTIE` avec gamme, `EXPIRATION`), séparateur `;`. Les demandes hors périmètre NORTH ne sont pas journalisées. Ce journal reste la source de référence (les tables `LOG_NORTH_*` en sont le reflet en base). La table de traçabilité partagée, dont le schéma est fixé par le groupe Contrôle (question A1), n'est pas encore écrite.
 
 Unités : 1 minute réelle = 1 heure projet. Les dates sont en heure réelle, les durées en heures projet.

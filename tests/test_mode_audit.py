@@ -158,5 +158,91 @@ class TestLigneDeCommande(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(dossier, "donnees", "run", "options")))
 
 
+
+class TestDispositionDonnees(unittest.TestCase):
+    """R-ROB-05 : l'Annexe 2 est trouvée dans le paquet VM (``../donnees/``) et dans le miroir GitHub (``donnees/``)."""
+
+    def setUp(self) -> None:
+        """Crée un dossier ``racine/DEV`` vide (ni ``racine/donnees`` ni ``DEV/donnees``)."""
+        self.racine = tempfile.mkdtemp()
+        self.code = os.path.join(self.racine, "DEV")
+        os.makedirs(self.code)
+        self.voisin = os.path.join(self.racine, "donnees", "annexe2_confidentiel.json")
+        self.interne = os.path.join(self.code, "donnees", "annexe2_confidentiel.json")
+
+    def tearDown(self) -> None:
+        """Supprime le dossier temporaire."""
+        shutil.rmtree(self.racine)
+
+    def poser(self, chemin: str) -> None:
+        """Écrit un fichier Annexe 2 minimal.
+
+        :param chemin: Chemin du fichier à créer.
+        """
+        os.makedirs(os.path.dirname(chemin), exist_ok=True)
+        with open(chemin, "w", encoding="utf-8") as fichier:
+            json.dump({"taux_conducteur_h": 1.0}, fichier)
+
+    def chemin(self) -> str:
+        """Chemin retenu par :func:`hypotheses.chemin_donnees_contrat`, normalisé.
+
+        :return: Chemin absolu normalisé.
+        """
+        return os.path.normpath(hypotheses.chemin_donnees_contrat("annexe2_confidentiel.json", self.code))
+
+    def test_paquet_vm(self) -> None:
+        """Fichier dans ``../donnees/`` : il est retenu."""
+        self.poser(self.voisin)
+        self.assertEqual(self.chemin(), os.path.normpath(self.voisin))
+
+    def test_miroir_github(self) -> None:
+        """Fichier seulement dans ``donnees/`` du dossier de code : il est retenu."""
+        self.poser(self.interne)
+        self.assertEqual(self.chemin(), os.path.normpath(self.interne))
+        self.assertEqual(hypotheses.charger_confidentiel(self.chemin())["source"], self.chemin())
+
+    def test_les_deux_priorite_paquet(self) -> None:
+        """Fichier aux deux endroits : ``../donnees/`` l'emporte."""
+        self.poser(self.voisin)
+        self.poser(self.interne)
+        self.assertEqual(self.chemin(), os.path.normpath(self.voisin))
+
+    def test_absent(self) -> None:
+        """Fichier absent : chemin attendu ``../donnees/``, coûts par défaut (refusés en audit)."""
+        self.assertEqual(self.chemin(), os.path.normpath(self.voisin))
+        self.assertEqual(hypotheses.charger_confidentiel(self.chemin())["source"], "defaut")
+
+    def lancer_nord_audit(self) -> str:
+        """Lance ``nord.sh audit`` dans la copie isolée, avec un faux ``psycopg2`` (connexion refusée).
+
+        Le faux module fait passer la vérification « psycopg2 présent » pour atteindre
+        les conditions bloquantes ; la base injoignable et les fiches absentes font
+        toujours refuser l'audit.
+
+        :return: Sorties standard et d'erreur réunies.
+        """
+        shutil.copy(os.path.join(DOSSIER_CODE, "nord.sh"), self.code)
+        faux = os.path.join(self.racine, "faux")
+        os.makedirs(faux)
+        with open(os.path.join(faux, "psycopg2.py"), "w", encoding="utf-8") as fichier:
+            fichier.write("def connect(**options):\n    raise OSError('base simulée injoignable')\n")
+        env = dict(os.environ, PYTHONPATH=faux)
+        sortie = subprocess.run(["sh", "nord.sh", "audit"], cwd=self.code, capture_output=True, text=True,
+                                timeout=60, env=env)
+        texte = sortie.stdout + sortie.stderr
+        self.assertNotEqual(sortie.returncode, 0)
+        self.assertIn("Mode audit refusé", texte)
+        return texte
+
+    def test_nord_sh_audit_trouve_le_miroir(self) -> None:
+        """``nord.sh audit`` ne signale pas l'Annexe 2 absente quand elle est dans ``donnees/`` (miroir)."""
+        self.poser(self.interne)
+        self.assertNotIn("annexe2_confidentiel.json absent", self.lancer_nord_audit())
+
+    def test_nord_sh_audit_signale_l_absence(self) -> None:
+        """``nord.sh audit`` signale l'Annexe 2 absente des deux emplacements."""
+        self.assertIn("annexe2_confidentiel.json absent", self.lancer_nord_audit())
+
+
 if __name__ == "__main__":
     unittest.main()

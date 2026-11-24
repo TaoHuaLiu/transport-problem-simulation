@@ -51,6 +51,11 @@ DEV=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$DEV/../donnees"
 DONNEES=$(cd "$DEV/../donnees" && pwd)
 RUN="$DONNEES/run"
+# Fichiers du contrat (Annexe 2, cibles) : ../donnees/ (paquet VM), sinon donnees/ (miroir GitHub),
+# même ordre que hypotheses.chemin_donnees_contrat
+fichier_contrat() {
+    if [ ! -f "$DONNEES/$1" ] && [ -f "$DEV/donnees/$1" ]; then echo "$DEV/donnees/$1"; else echo "$DONNEES/$1"; fi
+}
 LOGS="$DONNEES/logs"
 SERVICES="collecteur moteur tableau"
 
@@ -233,8 +238,8 @@ verifier() {
     if [ "$SANS_BDD" -eq 1 ] && [ ! -f "$DONNEES/referentiels.json" ]; then
         echo "  ! ../donnees/referentiels.json absent : le moteur utilisera un référentiel d'exemple"
     fi
-    [ -f "$DONNEES/annexe2_confidentiel.json" ] || \
-        echo "  ! ../donnees/annexe2_confidentiel.json absent : coûts et prix fictifs (θ et W gardent leurs valeurs par défaut)"
+    [ -f "$(fichier_contrat annexe2_confidentiel.json)" ] || \
+        echo "  ! annexe2_confidentiel.json absent de ../donnees/ et de donnees/ : coûts et prix fictifs (θ et W gardent leurs valeurs par défaut)"
 }
 
 # Conditions bloquantes du mode audit : base joignable, fiches de la VM, Annexe 2
@@ -256,12 +261,12 @@ FIN
         echo "  ! fiches camion de la VM introuvables (/mnt/tp4010/DuCapteurJusquauCloud/FichesCamion)" >&2
         erreurs=1
     fi
-    if [ ! -f "$DONNEES/annexe2_confidentiel.json" ]; then
-        echo "  ! ../donnees/annexe2_confidentiel.json absent (paquet_vm.sh --confidentiel)" >&2
+    if [ ! -f "$(fichier_contrat annexe2_confidentiel.json)" ]; then
+        echo "  ! annexe2_confidentiel.json absent de $DONNEES/ et de $DEV/donnees/ (paquet_vm.sh --confidentiel)" >&2
         erreurs=1
     fi
-    [ -f "$DONNEES/cibles_contrat.json" ] || \
-        echo "  ! ../donnees/cibles_contrat.json absent : le tableau de bord affichera les cibles par défaut"
+    [ -f "$(fichier_contrat cibles_contrat.json)" ] || \
+        echo "  ! cibles_contrat.json absent de ../donnees/ et de donnees/ : le tableau de bord affichera les cibles par défaut"
     # Nos tables LOG_NORTH_* : bloquant (l'archivage est imposé en audit ; sinon chaque écriture échouerait)
     if [ "$erreurs" -eq 0 ] && ! (cd "$DEV" && python3 archivage.py --verifier >> "$LOGS/audit.log" 2>&1); then
         echo "  ! tables LOG_NORTH_CAMION / LOG_NORTH_TRAJET / LOG_NORTH_ARCHIVAGE_COMMANDE absentes ou incomplètes" >&2

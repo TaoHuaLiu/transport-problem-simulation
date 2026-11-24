@@ -160,6 +160,33 @@ def verifier_spec(demande: dict, camion: dict) -> list:
     return ecarts
 
 
+def ptac_depasse(demande: dict, camion: dict) -> bool:
+    """Dit si le camion est plus lourd que le PTAC demandé dans la SPEC.
+
+    Applique la règle R-SPEC-03 (contrat §4.2 : un PTAC dépassé est
+    éliminatoire) quand :data:`hypotheses.PTAC_DEPASSE_INTERDIT` est vrai.
+    Une SPEC sans PTAC, ou un PTAC illisible, ne fait rien écarter.
+
+    :param demande: Demande préparée (``demande["spec"]`` déjà découpé).
+    :param camion: Camion de la flotte.
+    :return: ``True`` si le camion ne doit pas servir cette demande.
+    """
+    if not hypotheses.PTAC_DEPASSE_INTERDIT or "PTAC" not in demande["spec"]:
+        return False
+    exige, reel = tonnes(demande["spec"]["PTAC"]), tonnes(camion["PTAC"])
+    return exige is not None and reel is not None and reel > exige + 1e-9
+
+
+def ptac_depasse_partout(demande: dict, flotte: dict) -> bool:
+    """Dit si la SPEC fixe un PTAC et qu'aucun camion de la flotte n'est assez léger (R-SPEC-03, D-ACC ligne 3a).
+
+    :param demande: Demande préparée.
+    :param flotte: Flotte ``{IMMAT: camion}``.
+    :return: ``True`` si au moins un camion existe et que tous dépassent le PTAC demandé.
+    """
+    return bool(flotte) and all(ptac_depasse(demande, camion) for camion in flotte.values())
+
+
 def verifier_frigo(demande: dict, camion: dict) -> bool:
     """Dit si le camion convient à la nature (frais ou sec) de la demande.
 

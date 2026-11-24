@@ -9,6 +9,9 @@ collecteur (:mod:`audit`) et sert :
 - ``/api/statuts.csv`` : statut final de chaque demande NORTH ;
 - ``/api/sante`` : santé de la chaîne (fichiers ``../donnees/run/sante_*.json``) et alertes
   (moteur muet, écriture en base en échec, ERP muet…), règle R-ROB-06 ;
+- ``/api/tables`` et ``/api/table?nom=TRACABILITE_COMMANDE&n=50`` : nos tables de la base, en lecture
+  seule (:mod:`tables_direct`), avec le nombre de commandes décidées au journal pour comparer ;
+- ``/api/carte`` : position de chaque camion NORTH (lieu, ou point d'un tronçon en cours) ;
 - ``/api/sql?n=100&erreurs=1`` : derniers événements du journal SQL du moteur (``../donnees/logs/sql.jsonl``) ;
 - ``/api/debug`` (seulement avec ``--debug``) : configuration, temps de réponse des dernières
   requêtes, derniers avertissements et erreurs de tous les services ;
@@ -46,6 +49,7 @@ import audit
 import hypotheses
 import journalisation
 import robustesse
+import tables_direct
 
 JOURNAL = journalisation.journal("tableau")
 
@@ -84,9 +88,16 @@ def lire_parametres() -> argparse.Namespace:
     parseur.add_argument("--hote", default="127.0.0.1", help="adresse d'écoute (0.0.0.0 pour le VLAN)")
     parseur.add_argument("--port", type=int, default=10000, help="port TCP")
     parseur.add_argument("--cibles", default=audit.FICHIER_CIBLES, help="cibles du contrat (JSON)")
-    parseur.add_argument("--cible-ta", type=float, default=None, help="cible du taux d'acceptation (0-1)")
-    parseur.add_argument("--cible-tr", type=float, default=None, help="cible du taux de remplissage (0-1)")
+    parseur.add_argument("--cible-ta", type=float, default=None,
+                         help="cible TA fixe (0-1) ; par défaut, cible du jour calculée par le contrat §4.3")
+    parseur.add_argument("--cible-tr", type=float, default=None,
+                         help="cible TR fixe (0-1) ; par défaut, cible du jour selon le débit, contrat §4.1")
     parseur.add_argument("--cible-haute", type=float, default=None, help="cible de la part de gamme haute (0-1)")
+    parseur.add_argument("--camions-frigo", type=int, default=None,
+                         help="N_F imposé (camions NORTH frigorifiques) ; par défaut, lu dans l'état de la flotte du moteur")
+    parseur.add_argument("--camions-sec", type=int, default=None, help="N_S imposé (camions NORTH non frigorifiques)")
+    parseur.add_argument("--flotte", default=None,
+                         help="état de la flotte écrit par le moteur (défaut : <run>/flotte_moteur.json)")
     parseur.add_argument("--horloge", choices=["auto", "reelle", "journal"], default="auto",
                          help="heure de référence : réelle (direct), dernier événement (rejeu), ou auto")
     parseur.add_argument("--confidentiel", action="store_true",
@@ -94,6 +105,8 @@ def lire_parametres() -> argparse.Namespace:
     parseur.add_argument("--instantane", default=None, help="écrit un rapport JSON dans ce fichier et s'arrête")
     parseur.add_argument("--debug", action="store_true",
                          help="mode débogage : requêtes journalisées avec leur durée, panneau et /api/debug (pas en audit)")
+    parseur.add_argument("--sans-tables", action="store_true",
+                         help="désactive l'onglet Tables (aucune lecture de la base par le tableau de bord)")
     parseur.add_argument("--logs", default=journalisation.REPERTOIRE_LOGS, help="dossier des journaux")
     parseur.add_argument("--run", default=journalisation.REPERTOIRE_RUN, help="dossier des fichiers de santé")
     return parseur.parse_args()
@@ -106,7 +119,8 @@ def preparer_config(options: argparse.Namespace) -> dict:
     :return: ``{"cibles", "seuil", "taux_horaire"}``.
     """
     cibles = audit.charger_cibles(options.cibles)
-    for cle, valeur in (("ta", options.cible_ta), ("tr", options.cible_tr), ("part_haute", options.cible_haute)):
+    for cle, valeur in (("ta", options.cible_ta), ("tr", options.cible_tr), ("part_haute", options.cible_haute),
+                        ("camions_frigo", options.camions_frigo), ("camions_sec", options.camions_sec)):
         if valeur is not None:
             cibles[cle] = valeur
     seuil = taux = None
@@ -114,7 +128,8 @@ def preparer_config(options: argparse.Namespace) -> dict:
         couts = hypotheses.charger_confidentiel()
         seuil = couts["seuil_rentabilite"]
         taux = couts["taux_conducteur_h"] + couts["taux_vehicule_h"] if couts["source"] != "defaut" else None
-    return {"cibles": cibles, "seuil": seuil, "taux_horaire": taux, "requetes": [], "debut": datetime.datetime.now()}
+    return {"cibles": cibles, "seuil": seuil, "taux_horaire": taux, "requetes": [], "debut": datetime.datetime.now(),
+            "tables": tables_direct.nouveau_lien(actif=not getattr(options, "sans_tables", False))}
 
 
 def _age(texte: str, maintenant: datetime.datetime):
@@ -159,13 +174,17 @@ def alertes_sante(services: dict, maintenant: datetime.datetime) -> list:
     if moteur is not None and moteur.get("statut") == "en marche":
         for cle, nom, niveau in (("archivage", "écriture LOG_NORTH_*", "critique"),
                                  ("controle", "écriture TRACABILITE_*", "critique"),
-                                 ("referentiel", "lecture du référentiel", "attention")):
+                                 ("referentiel", "lecture du référentiel", "attention"),
+                                 ("evenements", "journal des événements (CSV)", "critique")):
             bdd = moteur.get(cle) or {}
             if bdd.get("actif") and bdd.get("echecs"):
                 ajouter(niveau, "moteur", "%s EN ÉCHEC depuis %s (%d essai(s), %d ligne(s) en attente) : %s"
                         % (nom, bdd.get("depuis"), bdd["echecs"], bdd.get("en_attente", 0), bdd.get("derniere_erreur")))
             elif bdd.get("actif") and bdd.get("rejetees"):
                 ajouter("attention", "moteur", "%s : %d ligne(s) rejetée(s) par la base (voir journal SQL)" % (nom, bdd["rejetees"]))
+        if (moteur.get("evenements") or {}).get("perdus"):
+            ajouter("critique", "moteur", "journal des événements : %d ligne(s) perdue(s) (mémoire pleine, R-ROB-08)"
+                    % moteur["evenements"]["perdus"])
         if moteur.get("duree_tick_s", 0) > moteur.get("tick_s", hypotheses.TICK_S):
             ajouter("attention", "moteur", "tick de %.1f s : le moteur prend du retard" % moteur["duree_tick_s"])
     collecteur = services.get("collecteur")
@@ -192,6 +211,35 @@ def rapport_sante(options: argparse.Namespace) -> dict:
     services = journalisation.lire_sante(options.run)
     return {"maintenant": maintenant.isoformat(timespec="seconds"), "services": services,
             "alertes": alertes_sante(services, maintenant), "debug": bool(options.debug)}
+
+
+def rapport_table(options: argparse.Namespace, config: dict, requete: dict) -> dict:
+    """Lignes d'une de nos tables pour ``/api/table``, avec le décompte du journal pour comparer.
+
+    Pour les tables de commandes, ajoute le nombre de demandes NORTH décidées
+    et parties d'après le journal du moteur (tout le journal) : un écart avec
+    le nombre de lignes de la table montre des écritures en retard ou perdues
+    (le contrat ne compte une commande acceptée que si elle est dans la table).
+
+    :param options: Options de la ligne de commande.
+    :param config: Configuration (``tables`` : lien de :func:`tables_direct.nouveau_lien`).
+    :param requete: Paramètres de l'URL : ``nom`` (table), ``n`` (nombre de lignes, défaut 50).
+    :return: Réponse de :func:`tables_direct.lire_table` plus ``journal`` (``{"decidees", "parties"}`` ou ``None``).
+    """
+    try:
+        n = int(requete.get("n", 50))
+    except ValueError:
+        n = 50
+    nom = requete.get("nom", "")
+    reponse = tables_direct.lire_table(config["tables"], nom, n)
+    reponse["journal"] = None
+    if nom in ("TRACABILITE_COMMANDE", "LOG_NORTH_ARCHIVAGE_COMMANDE"):
+        sources = audit.charger_sources(options.journal, options.demandes)
+        maintenant, _ = heure_reference(sources, options.horloge)
+        statuts = [s for s in audit.statuts_demandes(sources["evenements"], sources["demandes"], maintenant).values()
+                   if not s["hors_perimetre"] and s["h_decision"] is not None]
+        reponse["journal"] = {"decidees": len(statuts), "parties": sum(1 for s in statuts if s["statut"] == "partie")}
+    return reponse
 
 
 def rapport_sql(options: argparse.Namespace, requete: dict) -> dict:
@@ -249,6 +297,15 @@ def heure_reference(sources: dict, mode: str) -> tuple:
     return maintenant, "reelle"
 
 
+def fichier_flotte(options: argparse.Namespace) -> str:
+    """Chemin de l'état de la flotte écrit par le moteur (R-ROB-07), lu pour N_F / N_S et les PTAC.
+
+    :param options: Options de la ligne de commande.
+    :return: ``--flotte``, sinon ``<run>/flotte_moteur.json``.
+    """
+    return options.flotte or os.path.join(options.run, "flotte_moteur.json")
+
+
 def calculer_rapport(options: argparse.Namespace, config: dict, requete: dict) -> tuple:
     """Lit les sources et calcule le rapport pour une fenêtre demandée.
 
@@ -269,7 +326,7 @@ def calculer_rapport(options: argparse.Namespace, config: dict, requete: dict) -
     except ValueError:
         duree = None
     rapport = audit.calculer(sources, maintenant, horloge, debut, duree, config["seuil"],
-                             config["cibles"], config["taux_horaire"])
+                             config["cibles"], config["taux_horaire"], audit.charger_flotte(fichier_flotte(options)))
     rapport["confidentiel"] = config["seuil"] is not None
     return rapport, sources, maintenant
 
@@ -330,6 +387,19 @@ def traiter_requete(ligne: str, options: argparse.Namespace, config: dict) -> by
     if url.path == "/api/sante":
         return reponse_http("200 OK", "application/json; charset=utf-8",
                             json.dumps(rapport_sante(options), ensure_ascii=False, default=str).encode("utf-8"))
+    if url.path == "/api/tables":
+        corps = {"tables": tables_direct.liste_tables(), "actif": config["tables"]["actif"],
+                 "sante": config["tables"]["sante"]}
+        return reponse_http("200 OK", "application/json; charset=utf-8",
+                            json.dumps(corps, ensure_ascii=False, default=str).encode("utf-8"))
+    if url.path == "/api/table":
+        return reponse_http("200 OK", "application/json; charset=utf-8",
+                            json.dumps(rapport_table(options, config, requete), ensure_ascii=False, default=str).encode("utf-8"))
+    if url.path == "/api/carte":
+        sources = audit.charger_sources(options.journal, options.demandes)
+        maintenant, _ = heure_reference(sources, options.horloge)
+        corps = audit.carte_camions(audit.charger_flotte(fichier_flotte(options)), sources["evenements"], maintenant)
+        return reponse_http("200 OK", "application/json; charset=utf-8", json.dumps(corps, ensure_ascii=False).encode("utf-8"))
     if url.path == "/api/sql":
         return reponse_http("200 OK", "application/json; charset=utf-8",
                             json.dumps(rapport_sql(options, requete), ensure_ascii=False, default=str).encode("utf-8"))
@@ -339,7 +409,7 @@ def traiter_requete(ligne: str, options: argparse.Namespace, config: dict) -> by
     if url.path == "/api/statuts.csv":
         _, sources, maintenant = calculer_rapport(options, config, requete)
         nom = "statuts_NORTH_%s.csv" % datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        return reponse_http("200 OK", "text/csv; charset=utf-8", audit.statuts_csv(sources, maintenant).encode("utf-8"),
+        return reponse_http("200 OK", "text/csv; charset=utf-8", audit.statuts_csv(sources, maintenant, audit.charger_flotte(fichier_flotte(options))).encode("utf-8"),
                             {"Content-Disposition": 'attachment; filename="%s"' % nom})
     return reponse_http("404 Not Found", "text/plain; charset=utf-8", b"introuvable")
 
@@ -431,6 +501,13 @@ def ecrire_instantane(options: argparse.Namespace, config: dict) -> dict:
     print("TA %s (%d parties / %d reçues) ; TR %s ; gamme haute %s"
           % (pourcent(acceptation["ta"]), acceptation["partie"], acceptation["recues"],
              pourcent(remplissage["tr"]), pourcent(rapport["gammes"]["part_haute"])))
+    score, cibles = rapport["score"], rapport["cibles"]
+    print("Cibles du jour : TA %s (%s), TR %s (%s, q = %s demandes/h)"
+          % (pourcent(cibles["ta"]["valeur"]), cibles["ta"]["source"], pourcent(cibles["tr"]["valeur"]),
+             cibles["tr"]["source"], "—" if cibles["tr"]["debit"] is None else "%.0f" % cibles["tr"]["debit"]))
+    print("Note : %s / %d mesurés (TR %s, gammes %s, TA %s ; professionnalisme noté par le Contrôle)"
+          % ("—" if score["total"] is None else "%.1f" % score["total"], score["max_mesure"],
+             *("—" if score["notes"][k] is None else "%.1f" % score["notes"][k] for k in ("tr", "gammes", "ta"))))
     for controle in rapport["controles"]:
         print("  [%s] %s : %d" % ("OK" if controle["ok"] else "KO", controle["libelle"], controle["n"]))
     print("Rapport : %s" % os.path.abspath(options.instantane))

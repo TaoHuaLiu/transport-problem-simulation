@@ -86,6 +86,7 @@ def lire_rejeu(chemin: str) -> list:
     :return: Liste de ``(h_reception, id_demande, champs)``.
     """
     demandes = []
+    illisibles = 0
     with open(chemin, newline="", encoding="utf-8") as fichier:
         if chemin.endswith(".jsonl"):
             for ligne in fichier:
@@ -93,13 +94,17 @@ def lire_rejeu(chemin: str) -> list:
                 h_reception = datetime.datetime.strptime(entree["H_RECEPTION"], "%Y-%m-%d %H:%M:%S")
                 try:
                     message = decoder_message(entree["MESSAGE"])
-                except ValueError:
+                except ValueError as erreur:
+                    illisibles += 1
+                    JOURNAL.debug("rejeu : message reçu à %s illisible (%s)", entree["H_RECEPTION"], erreur)
                     continue
                 demandes += [(h_reception, id_demande, champs) for id_demande, champs in message.items() if isinstance(champs, dict)]
         else:
             for ligne in csv.DictReader(fichier, delimiter=";"):
                 h_reception = datetime.datetime.strptime(ligne["H_RECEPTION"], "%Y-%m-%d %H:%M:%S")
                 demandes.append((h_reception, ligne["ID_DEMANDE"], ligne))
+    if illisibles:
+        JOURNAL.warning("rejeu : %d message(s) illisible(s) ignoré(s) dans %s", illisibles, os.path.basename(chemin))
     return sorted(demandes, key=lambda element: element[0])
 
 
@@ -193,33 +198,46 @@ def decider_demande(id_demande: str, champs: dict, h_reception: datetime.datetim
                           demande.get("motif") or "", demande.get("tournee") or "-")
         return
     except Exception as erreur:  # R-ROB-01 : une demande en erreur ne doit pas arrêter le moteur
-        robustesse.signaler(etat.setdefault("messages", {}), "demande", maintenant,
-                            "demande %s en erreur (%r) : refusée REF-DONNEES" % (id_demande, erreur), module="moteur")
+        probleme = erreur
         JOURNAL.debug("trace de la demande %s en erreur", id_demande, exc_info=True)
+    messages = etat.setdefault("messages", {})
     demande = etat["demandes"].get(id_demande)
     if demande is None:
         demande = dict(champs)
         demande.update({"id": id_demande, "h_reception": h_reception, "etat": "RECUE", "motif": ""})
         etat["demandes"][id_demande] = demande
     if demande.get("etat") not in ("RECUE", None):
+        # Décidée avant l'erreur : le message dit l'état réellement gardé
+        robustesse.signaler(messages, "demande", maintenant, "demande %s en erreur après sa décision (%r) : reste %s%s"
+                            % (id_demande, probleme, demande.get("etat"),
+                               " " + demande["motif"] if demande.get("motif") else ""), module="moteur")
         return
     try:
         north = regles.est_demande_north(demande)
-    except Exception:  # périmètre indécidable : on la compte comme refusée, c'est le choix prudent pour le TA
+    except Exception as erreur:  # périmètre indécidable : on la compte comme refusée, c'est le choix prudent pour le TA
+        JOURNAL.debug("demande %s : périmètre NORTH indécidable (%r), comptée NORTH", id_demande, erreur)
         north = True
     if not north:
         demande["etat"] = "IGNOREE"
+        robustesse.signaler(messages, "demande", maintenant, "demande %s en erreur (%r) : hors NORTH, ignorée"
+                            % (id_demande, probleme), module="moteur")
         return
+    robustesse.signaler(messages, "demande", maintenant, "demande %s en erreur (%r) : refusée REF-DONNEES"
+                        % (id_demande, probleme), module="moteur")
     try:
         decision.refuser(demande, "REF-DONNEES", maintenant, journal)
-    except Exception:  # journal inaccessible : l'état reste juste, l'événement manque
+    except Exception as erreur:  # ne devrait plus arriver (noter() ne lève pas, R-ROB-08) : l'état reste juste
         demande.update({"etat": "REFUSEE", "motif": "REF-DONNEES"})
+        robustesse.signaler(messages, "refus", maintenant, "refus REF-DONNEES de %s non journalisé (%r)"
+                            % (id_demande, erreur), logging.ERROR, "moteur")
 
 
 def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime,
                     parametres: dict, journal: dict) -> None:
     """Décide le départ d'une tournée ouverte (table D-DEPART) sans que son erreur arrête le moteur.
 
+    Si D-DEPART répond « réparer » (ligne 0, R-DEL-02), la tournée est
+    réparée (:func:`reparer_tournee`) puis D-DEPART est réévaluée une fois.
     Si D-DEPART répond « refuser » (ligne 3), les demandes à bord sont
     refusées avec le motif ``REF-RENTABILITE`` (R-RENT-01). Applique la règle
     R-ROB-01 : une exception est signalée et la tournée reste ouverte ; elle
@@ -234,6 +252,14 @@ def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.d
     """
     try:
         choix = planification.decider_depart(tournee, etat, ref, maintenant, parametres)
+        if choix == "reparer":
+            # D-DEPART ligne 0 (R-DEL-02) : retirer le moins possible, replacer le reste, puis redécider
+            reparer_tournee(tournee, etat, ref, maintenant, parametres, journal)
+            if tournee["statut"] != "ouverte":
+                return
+            choix = planification.decider_depart(tournee, etat, ref, maintenant, parametres)
+            if choix == "reparer":
+                choix = "partir"  # dernier recours : faire_partir retire ce qui ne peut plus partir
         if choix != "attendre":
             JOURNAL.debug("tournée %s (camion %s, %d demande(s)) : %s", tournee.get("id"), tournee.get("camion"),
                           len(tournee.get("demandes", [])), choix)
@@ -246,10 +272,49 @@ def decider_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.d
             tournee["statut"] = "annulee"
             etat["flotte"][tournee["camion"]]["tournee"] = None
     except Exception as erreur:  # R-ROB-01 : la tournée sera réexaminée au tick suivant
+        suite = ("nouvel essai au prochain tick" if tournee.get("statut") == "ouverte"
+                 else "statut %s gardé, pas de nouvel essai" % tournee.get("statut"))
         robustesse.signaler(etat.setdefault("messages", {}), "tournee", maintenant,
-                            "tournée %s en erreur (%r) : nouvel essai au prochain tick" % (tournee.get("id"), erreur),
-                            module="moteur")
+                            "tournée %s en erreur (%r) : %s" % (tournee.get("id"), erreur, suite), module="moteur")
         JOURNAL.debug("trace de la tournée %s en erreur", tournee.get("id"), exc_info=True)
+
+
+def reparer_tournee(tournee: dict, etat: dict, ref: dict, maintenant: datetime.datetime,
+                    parametres: dict, journal: dict) -> None:
+    """Répare une tournée dont le plan est devenu impossible hors délai (D-DEPART ligne 0).
+
+    Applique la règle R-DEL-02 : :func:`planification.retirer_bloquantes`
+    retire le moins de demandes possible, la tournée vidée est annulée (son
+    camion redevient libre), puis chaque demande retirée est replacée par
+    :func:`decision.reaffecter`. Applique aussi R-ROB-01 au niveau de chaque
+    demande : une erreur pendant sa réaffectation est signalée et la demande
+    expire (REF-DONNEES) au lieu de rester acceptée sans tournée.
+
+    :param tournee: Tournée ouverte, modifiée sur place.
+    :param etat: État du moteur, modifié sur place.
+    :param ref: Référentiel.
+    :param maintenant: Heure réelle (ou simulée en rejeu).
+    :param parametres: ``couts``, ``seuil``, ``marge_h``.
+    :param journal: Journal de traçabilité.
+    """
+    motif = tournee.get("plan", {}).get("motif")
+    retirees = planification.retirer_bloquantes(tournee, etat, ref, maintenant, parametres["couts"])
+    if not tournee["demandes"]:
+        tournee["statut"] = "annulee"
+        etat["flotte"][tournee["camion"]]["tournee"] = None
+    for id_demande in retirees:
+        demande = etat["demandes"][id_demande]
+        try:
+            decision.reaffecter(demande, etat, ref, maintenant, parametres, journal, tournee, motif)
+        except Exception as erreur:  # R-ROB-01 : la demande ne reste pas acceptée sans tournée
+            robustesse.signaler(etat.setdefault("messages", {}), "reaffectation", maintenant,
+                                "réaffectation de %s en erreur (%r) : demande expirée" % (id_demande, erreur),
+                                module="moteur")
+            demande.update({"etat": "EXPIREE", "motif": "REF-DONNEES"})
+            tracabilite.noter(journal, maintenant, "EXPIRATION", demande=demande, tournee=tournee, motif="REF-DONNEES",
+                              detail="erreur pendant la réaffectation")
+    if retirees:
+        JOURNAL.debug("tournée %s : plan %s, %d demande(s) retirée(s)", tournee.get("id"), motif, len(retirees))
 
 
 def executer_tick(etat: dict, ref: dict, nouvelles: list, maintenant: datetime.datetime,
@@ -426,7 +491,8 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     if audit:
         verifier_conditions_audit(fiches, couts)
     usines = [referentiels.pk_lieu(ref, nom) for nom in hypotheses.USINES_NORTH]
-    flotte = module_flotte.charger_flotte(fiches, ref, usines, debut)
+    ecartees = {}
+    flotte = module_flotte.charger_flotte(fiches, ref, usines, debut, ecartees)
     if audit and not flotte:
         raise ErreurAudit("mode audit : aucun camion NORTH exploitable dans %s" % fiches)
     parametres = {"couts": couts, "seuil": arguments.seuil if arguments.seuil is not None else hypotheses.SEUIL_DEPART_DEFAUT,
@@ -438,6 +504,7 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
         JOURNAL.warning("référentiel : %s", remarque)
     JOURNAL.info("fiches camion : %s ; flotte NORTH : %d camions\n%s", os.path.abspath(fiches), len(flotte),
                  module_flotte.resume_flotte(flotte, ref))
+    journaliser_fiches_ecartees(ecartees)
     if not flotte:
         JOURNAL.error("aucun camion NORTH exploitable dans %s : toutes les demandes seront refusées", os.path.abspath(fiches))
     JOURNAL.info("coûts : %s ; seuil de départ θ = %.2f ; marge W = %.1f h projet",
@@ -446,6 +513,28 @@ def preparer(arguments: argparse.Namespace, debut: datetime.datetime) -> tuple:
     etat = {"flotte": flotte, "tournees": {}, "demandes": {}, "compteur": 0,
             "prefixe": debut.strftime("T%y%m%d%H%M%S-"), "deja_archivees": set(), "messages": {}}
     return etat, ref, parametres
+
+
+def journaliser_fiches_ecartees(ecartees: dict) -> None:
+    """Journalise les fiches camion écartées au chargement, par motif (règle R-FLO-01).
+
+    Les fiches d'autres zones sont normales (niveau ``INFO``) ; une fiche
+    NORTH ou inconnue écartée pour ses données est un avertissement. Les noms
+    de fichiers sont au niveau ``DEBUG``.
+
+    :param ecartees: ``{motif: [nom de fichier]}`` rempli par :func:`flotte.charger_flotte`.
+    """
+    if not ecartees:
+        return
+    JOURNAL.info("fiches écartées : %s", ", ".join("%s %d" % (motif, len(ecartees[motif]))
+                                                    for motif in module_flotte.MOTIFS_ECART if motif in ecartees))
+    for motif in module_flotte.MOTIFS_ECART:
+        noms = ecartees.get(motif, [])
+        if noms and motif != "hors usines NORTH":
+            JOURNAL.warning("%d fiche(s) camion écartée(s) (%s) : %s%s", len(noms), motif, ", ".join(noms[:10]),
+                            "…" if len(noms) > 10 else "")
+        if noms:
+            JOURNAL.debug("fiches écartées (%s) : %s", motif, ", ".join(noms))
 
 
 def rejouer(arguments: argparse.Namespace) -> dict:
@@ -464,6 +553,7 @@ def rejouer(arguments: argparse.Namespace) -> dict:
     horloge = demandes[0][0]
     etat, ref, parametres = preparer(arguments, horloge)
     journal = tracabilite.ouvrir_journal(arguments.sortie, horloge, "_rejeu")
+    journal["messages"] = etat["messages"]
     pas = datetime.timedelta(seconds=hypotheses.TICK_S)
     indice = 0
     while indice < len(demandes) or any(t["statut"] == "ouverte" for t in etat["tournees"].values()):
@@ -476,7 +566,11 @@ def rejouer(arguments: argparse.Namespace) -> dict:
     kpi = tracabilite.calculer_kpi(etat)
     print("\nRejeu de %s (%d demandes, fin %s)" % (os.path.basename(arguments.rejeu), len(demandes), horloge.strftime("%H:%M:%S")))
     print(tracabilite.resume_kpi(kpi))
+    tracabilite.ecrire_en_attente(journal, horloge)
     print("Journal : %s (%d événements)" % (os.path.abspath(journal["chemin"]), journal["nb"]))
+    if journal["en_attente"] or journal["perdus"]:
+        print("! %d événement(s) jamais écrit(s) dans le journal (dernière erreur : %s)"
+              % (len(journal["en_attente"]) + journal["perdus"], journal["sante"]["derniere_erreur"]))
     return kpi
 
 
@@ -497,6 +591,7 @@ def en_direct(arguments: argparse.Namespace) -> None:
     reprendre_flotte(etat, ref, FICHIER_ETAT_FLOTTE, debut)
     messages = etat["messages"]
     journal = tracabilite.ouvrir_journal(arguments.sortie, debut)
+    journal["messages"] = messages  # incidents du journal comptés avec ceux du moteur (R-ROB-08)
     lecteur = {"repertoire": arguments.demandes, "messages": messages}
     dernier_rafraichissement = debut
     sante_ref = robustesse.nouvel_etat_bdd(actif=bool(arguments.bdd))
@@ -542,6 +637,7 @@ def en_direct(arguments: argparse.Namespace) -> None:
                 "tournees_ouvertes": sum(1 for t in etat["tournees"].values() if t["statut"] == "ouverte"),
                 "ta": kpi["ta"], "tr": kpi["tr"], "incidents": messages.get("nb", 0),
                 "lignes_illisibles": lecteur.get("ignorees", 0), "journal": os.path.abspath(journal["chemin"]),
+                "evenements": dict(journal["sante"], perdus=journal["perdus"]),
                 "referentiel": dict(sante_ref, source=ref.get("source"), lu_a=ref.get("lu_a")),
                 "archivage": dict(archive["sante"], non_archivables=len(archive["non_archivables"]))
                 if archive is not None else robustesse.nouvel_etat_bdd(actif=False),
@@ -563,6 +659,7 @@ def en_direct(arguments: argparse.Namespace) -> None:
                 nouvelles = lire_nouvelles_lignes(lecteur, maintenant)
                 suivi["nouvelles"] += len(nouvelles)
                 executer_tick(etat, ref, nouvelles, maintenant, parametres, journal)
+                tracabilite.ecrire_en_attente(journal, maintenant)  # R-ROB-08 : réessai même sans nouvel événement
                 garder_flotte(etat, FICHIER_ETAT_FLOTTE, maintenant, suivi)
                 if archive is not None:
                     archivage.synchroniser(archive, etat, ref, parametres["couts"], maintenant)
@@ -590,6 +687,9 @@ def en_direct(arguments: argparse.Namespace) -> None:
         JOURNAL.info("arrêt du moteur (%d incident(s) signalé(s), %d ligne(s) illisible(s) ignorée(s)).\n%s",
                      messages.get("nb", 0), lecteur.get("ignorees", 0), tracabilite.resume_kpi(tracabilite.calculer_kpi(etat)))
     finally:
+        if not tracabilite.ecrire_en_attente(journal, datetime.datetime.now()) or journal["perdus"]:
+            JOURNAL.error("journal des événements : %d ligne(s) jamais écrites à l'arrêt (dernière erreur : %s)",
+                          len(journal["en_attente"]) + journal["perdus"], journal["sante"]["derniere_erreur"])
         garder_flotte(etat, FICHIER_ETAT_FLOTTE, datetime.datetime.now(), suivi)
         if archive is not None:
             archivage.synchroniser(archive, etat, ref, parametres["couts"], datetime.datetime.now())

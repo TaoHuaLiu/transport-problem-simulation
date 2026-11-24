@@ -25,6 +25,7 @@ import os
 import statistics
 import unicodedata
 
+import hypotheses
 from collecteur import decoder_message
 
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
@@ -35,8 +36,8 @@ REPERTOIRE_JOURNAUX = os.path.join(DOSSIER, "..", "donnees", "moteur")
 #: Dossier des demandes écrites par le collecteur.
 REPERTOIRE_DEMANDES = os.path.join(DOSSIER, "..", "donnees", "demandes")
 
-#: Fichier des cibles du contrat (hors git), voir :func:`charger_cibles`.
-FICHIER_CIBLES = os.path.join(DOSSIER, "..", "donnees", "cibles_contrat.json")
+#: Fichier des cibles du contrat (``../donnees/`` ou ``donnees/``), voir :func:`charger_cibles`.
+FICHIER_CIBLES = hypotheses.chemin_donnees_contrat("cibles_contrat.json", DOSSIER)
 
 #: Usines NORTH, noms normalisés (majuscules, sans accents).
 USINES_NORTH = ("AMSTERDAM", "DUSSELDORF", "MANCHESTER")
@@ -44,11 +45,34 @@ USINES_NORTH = ("AMSTERDAM", "DUSSELDORF", "MANCHESTER")
 #: Format des dates du journal et du CSV du collecteur.
 FORMAT_DATE = "%Y-%m-%d %H:%M:%S"
 
-#: Barème du sujet : écart relatif unilatéral maximal → note sur 10 (``methode-contrat.md`` §1.4).
-BAREME = [(0.03, 10.0), (0.07, 8.5), (0.15, 6.0), (0.35, 3.0), (0.50, 1.0)]
+#: Barème du contrat (§4.1, TR ; appliqué aussi aux gammes) : écart relatif unilatéral maximal → note sur 10.
+#: Le contrat donne 8 points pour un écart de 3 à 7 % ; la figure du sujet (p. 21) en donne 8,5.
+BAREME = [(0.03, 10.0), (0.07, 8.0), (0.15, 6.0), (0.35, 3.0), (0.50, 1.0)]
 
-#: Cibles par défaut : TA = notre proposition (85 % sur 2 h), les autres restent à saisir.
-CIBLES_DEFAUT = {"ta": 0.85, "tr": None, "part_haute": None}
+#: Barème du TA (contrat §4.3), plus sévère : 0 point au-delà de 15 % d'écart.
+BAREME_TA = [(0.03, 10.0), (0.07, 8.0), (0.15, 6.0)]
+
+#: Cibles par défaut. ``None`` pour TA et TR : cible du jour calculée par les formules du
+#: contrat (:func:`cible_ta_contrat`, :func:`cible_tr_contrat`) ; un nombre (fichier
+#: ``cibles_contrat.json`` ou option du tableau de bord) remplace la formule.
+#: ``camions_frigo`` / ``camions_sec`` : N_F / N_S imposés (sinon lus dans l'état de la flotte du moteur).
+CIBLES_DEFAUT = {"ta": None, "tr": None, "part_haute": 0.30, "part_haute_mediane": 0.70,
+                 "camions_frigo": None, "camions_sec": None}
+
+#: Contrat v3 §4.3 : demandes assurées par camion et par heure réelle d'audit (k = 2,5 × D_audit).
+DEMANDES_PAR_CAMION_H = 2.5
+
+#: Contrat v3 §4.3 : la cible TA est plafonnée à 75 % de chaque type de marchandise.
+PLAFOND_TA = 0.75
+
+#: Contrat v3 §4.1 : TR cible selon le débit q (demandes NORTH par heure réelle), du plus haut palier au plus bas.
+PALIERS_TR = [(1000, 0.62), (500, 0.55), (250, 0.46), (0, 0.40)]
+
+#: Motif donné à une demande partie dans un camion de PTAC supérieur à celui de sa SPEC (contrat §4.2).
+MOTIF_PTAC_DEPASSE = "PTAC-DEPASSE"
+
+#: État de la flotte écrit par le moteur à chaque changement (R-ROB-07), lu pour N_F / N_S et les camions libres.
+FICHIER_FLOTTE = os.path.join(DOSSIER, "..", "donnees", "run", "flotte_moteur.json")
 
 #: Délai (secondes réelles) après la réception au-delà duquel une demande sans décision est une anomalie.
 DELAI_DECISION_S = 30
@@ -133,13 +157,59 @@ def _decoder_demande(id_demande: str, champs: dict, h_reception: datetime.dateti
     :param id_demande: Identifiant unique.
     :param champs: Champs bruts (JSONL ou CSV du collecteur).
     :param h_reception: Heure réelle de réception.
-    :return: ``{"id", "h_reception", "h_dep", "type_mvt", "usine", "loc_dep", "loc_arr", "qte_pal"}``.
+    :return: ``{"id", "h_reception", "h_dep", "type_mvt", "usine", "loc_dep", "loc_arr", "qte_pal", "frais",
+        "spec_ptac"}`` (``frais`` : ``None`` si ``TYPE_MAT`` est absent ; ``spec_ptac`` : tonnes, ou ``None``).
     """
+    type_mat = str(champs.get("TYPE_MAT", "")).strip()
     return {"id": id_demande, "h_reception": h_reception,
             "h_dep": lire_heure(champs.get("H_DEP_ISO") or champs.get("H_DEP", "")),
             "type_mvt": champs.get("TYPE_MVT", ""), "usine": usine_north(champs),
             "loc_dep": champs.get("LOC_DEP", ""), "loc_arr": champs.get("LOC_ARR", ""),
-            "qte_pal": champs.get("QTE_PAL", "")}
+            "qte_pal": champs.get("QTE_PAL", ""),
+            "frais": ("FRAIS" in type_mat.upper()) if type_mat else None,
+            "spec_ptac": ptac_spec(champs.get("SPEC", "")), "spec": lire_spec(champs.get("SPEC", ""))}
+
+
+def lire_spec(spec: str) -> dict:
+    """Découpe le champ ``SPEC`` d'une demande (``"PTAC=12t, COL=Rouge"`` → ``{"PTAC": "12t", "COL": "Rouge"}``).
+
+    :param spec: Champ ``SPEC`` brut.
+    :return: Clés en majuscules → valeurs.
+    """
+    cles = {}
+    for morceau in str(spec or "").split(","):
+        cle, egal, valeur = morceau.partition("=")
+        if egal and cle.strip():
+            cles[cle.strip().upper()] = valeur.strip()
+    return cles
+
+
+def tonnes(ptac: str) -> float:
+    """Convertit un PTAC (``"19t"``, ``"19 t"``, ``"19"``) en tonnes.
+
+    :param ptac: PTAC en texte.
+    :return: Tonnes, ou ``None`` si illisible.
+    :rtype: float
+    """
+    texte = str(ptac or "").strip().lower().replace(" ", "").rstrip("t").replace(",", ".")
+    try:
+        return float(texte)
+    except ValueError:
+        return None
+
+
+def ptac_spec(spec: str) -> float:
+    """Lit le PTAC demandé dans le champ ``SPEC`` d'une demande (``"PTAC=12t, COL=Rouge"``).
+
+    :param spec: Champ ``SPEC`` brut.
+    :return: Tonnes demandées, ou ``None`` si la SPEC ne fixe pas de PTAC.
+    :rtype: float
+    """
+    for morceau in str(spec or "").split(","):
+        cle, _, valeur = morceau.partition("=")
+        if cle.strip().upper() == "PTAC":
+            return tonnes(valeur)
+    return None
 
 
 def _lire_fichier_demandes(chemin: str) -> dict:
@@ -282,7 +352,7 @@ def statuts_demandes(evenements: list, demandes: dict, maintenant: datetime.date
     :param demandes: Demandes reçues par le collecteur.
     :param maintenant: Heure réelle de référence.
     :return: ``{id: {"statut", "motif", "gamme", "usine", "type_mvt", "h_reception", "h_dep", "h_decision",
-        "h_partie", "depart", "acq_puis_refus", "hors_perimetre", "inconnue"}}``.
+        "h_partie", "depart", "acq_puis_refus", "hors_perimetre", "inconnue", "frais", "spec_ptac", "immat"}}``.
     """
     statuts = {}
     for id_demande, demande in demandes.items():
@@ -290,7 +360,9 @@ def statuts_demandes(evenements: list, demandes: dict, maintenant: datetime.date
             statuts[id_demande] = {"statut": "sans_decision", "motif": "", "gamme": "", "usine": demande["usine"],
                                    "type_mvt": demande["type_mvt"], "h_reception": demande["h_reception"],
                                    "h_dep": demande["h_dep"], "h_decision": None, "h_partie": None, "depart": None,
-                                   "acq_puis_refus": False, "hors_perimetre": False, "inconnue": False}
+                                   "acq_puis_refus": False, "hors_perimetre": False, "inconnue": False,
+                                   "frais": demande.get("frais"), "spec_ptac": demande.get("spec_ptac"),
+                                   "spec": demande.get("spec"), "immat": ""}
     for evenement in evenements:
         id_demande = evenement.get("ID_DEMANDE", "")
         if not id_demande or evenement["EVENEMENT"] not in ("ACQUITTEMENT", "REFUS", "EXPIRATION", "PARTIE"):
@@ -310,7 +382,10 @@ def statuts_demandes(evenements: list, demandes: dict, maintenant: datetime.date
                                    "h_reception": connue["h_reception"] if connue else evenement["H"],
                                    "h_dep": connue["h_dep"] if connue else None, "h_decision": None, "h_partie": None,
                                    "depart": None, "acq_puis_refus": False,
-                                   "hors_perimetre": connue is not None, "inconnue": connue is None}
+                                   "hors_perimetre": connue is not None, "inconnue": connue is None,
+                                   "frais": connue.get("frais") if connue else None,
+                                   "spec_ptac": connue.get("spec_ptac") if connue else None,
+                                   "spec": connue.get("spec") if connue else None, "immat": ""}
         suivi = statuts[id_demande]
         if suivi["h_decision"] is None:
             suivi["h_decision"] = evenement["H"]
@@ -321,35 +396,356 @@ def statuts_demandes(evenements: list, demandes: dict, maintenant: datetime.date
             suivi.update({"statut": "refusee", "motif": evenement.get("MOTIF", "") or "REF-?"})
         elif evenement["EVENEMENT"] == "PARTIE":
             suivi.update({"statut": "partie", "gamme": evenement.get("GAMME", ""), "h_partie": evenement["H"],
-                          "depart": heure_depart_controle(evenement), "motif": ""})
+                          "depart": heure_depart_controle(evenement), "motif": "", "immat": evenement.get("IMMAT", "")})
     for suivi in statuts.values():
         if suivi["statut"] == "en_attente" and suivi["h_dep"] is not None and maintenant > suivi["h_dep"]:
             suivi["statut"] = "en_retard"
     return statuts
 
 
-def ecart_et_note(realise: float, cible: float, sens: str = "haut") -> dict:
+def ecart_et_note(realise: float, cible: float, sens: str = "haut", bareme: list = None) -> dict:
     """Calcule l'écart relatif unilatéral à la cible et la note du barème.
 
-    Faire mieux que la cible ne rapporte rien de plus (``methode-contrat.md`` §1.4).
+    Faire mieux que la cible ne rapporte rien de plus (contrat §4.1 et §4.3).
 
     >>> ecart_et_note(0.80, 0.85)["note"]
-    8.5
+    8.0
 
     :param realise: Valeur mesurée.
     :param cible: Cible du contrat (``None`` : pas de note).
     :param sens: ``"haut"`` si plus c'est haut mieux c'est, ``"bas"`` sinon.
+    :param bareme: Paliers ``(écart maximal, note)`` (défaut :data:`BAREME` ; :data:`BAREME_TA` pour le TA).
     :return: ``{"cible", "ecart", "note"}`` (``None`` si pas de cible ou pas de mesure).
     """
     if cible is None or realise is None or cible <= 0:
         return {"cible": cible, "ecart": None, "note": None}
     ecart = max(0.0, (cible - realise) / cible) if sens == "haut" else max(0.0, (realise - cible) / cible)
     note = 0.0
-    for ecart_max, valeur in BAREME:
+    for ecart_max, valeur in (bareme or BAREME):
         if ecart <= ecart_max + 1e-9:
             note = valeur
             break
     return {"cible": cible, "ecart": ecart, "note": note}
+
+
+def cible_ta_contrat(n_frais: int, n_sec: int, n_frigo: int, n_non_frigo: int, duree_h: float) -> dict:
+    """Calcule la cible TA du jour selon le contrat §4.3.
+
+    ``TA_cible = (min(k × N_F, 75 % × N_D,frais) + min(k × N_S, 75 % × N_D,sec)) / N_D``
+    avec ``k = 2,5 × D_audit`` (heures réelles). Pendant l'audit, ``D`` est la
+    durée déjà écoulée : ``k`` et ``N_D`` grandissent ensemble et la cible
+    rejoint celle du contrat à la fin de la fenêtre.
+
+    >>> round(cible_ta_contrat(1777, 339, 294, 336, 2.0)["valeur"], 3)
+    0.75
+
+    :param n_frais: Demandes NORTH reçues de marchandises fraîches (N_D,frais).
+    :param n_sec: Demandes NORTH reçues de marchandises sèches (N_D,sec).
+    :param n_frigo: Camions NORTH frigorifiques (N_F), ou ``None`` si inconnu.
+    :param n_non_frigo: Camions NORTH non frigorifiques (N_S), ou ``None`` si inconnu.
+    :param duree_h: Durée de l'audit en heures réelles (D_audit).
+    :return: ``{"valeur", "k", "capacite_frais", "capacite_sec", "plafond_frais", "plafond_sec"}`` ;
+        ``valeur`` vaut ``None`` si une donnée manque.
+    """
+    n_d = n_frais + n_sec
+    if n_frigo is None or n_non_frigo is None or not duree_h or n_d == 0:
+        return {"valeur": None, "k": None, "capacite_frais": None, "capacite_sec": None,
+                "plafond_frais": None, "plafond_sec": None}
+    k = DEMANDES_PAR_CAMION_H * duree_h
+    frais = min(k * n_frigo, PLAFOND_TA * n_frais)
+    sec = min(k * n_non_frigo, PLAFOND_TA * n_sec)
+    return {"valeur": (frais + sec) / n_d, "k": k, "capacite_frais": k * n_frigo, "capacite_sec": k * n_non_frigo,
+            "plafond_frais": PLAFOND_TA * n_frais, "plafond_sec": PLAFOND_TA * n_sec}
+
+
+def cible_tr_contrat(debit: float) -> float:
+    """Donne la cible TR du jour selon le débit, contrat §4.1.
+
+    >>> cible_tr_contrat(1060), cible_tr_contrat(520), cible_tr_contrat(100)
+    (0.62, 0.55, 0.4)
+
+    :param debit: q = demandes NORTH reçues par heure réelle d'audit, ou ``None``.
+    :return: Cible entre 0 et 1, ou ``None`` sans débit.
+    :rtype: float
+    """
+    if debit is None:
+        return None
+    for minimum, cible in PALIERS_TR:
+        if debit >= minimum:
+            return cible
+    return PALIERS_TR[-1][1]
+
+
+def _lire_flotte(chemin: str) -> dict:
+    """Lit l'état de la flotte écrit par le moteur (``flotte.etat_a_sauvegarder``).
+
+    :param chemin: Fichier ``flotte_moteur.json``.
+    :return: Contenu du fichier.
+    """
+    with open(chemin, encoding="utf-8") as fichier:
+        return json.load(fichier)
+
+
+def charger_flotte(chemin: str = FICHIER_FLOTTE) -> dict:
+    """Lit l'état de la flotte du moteur, s'il existe (moteur en direct seulement).
+
+    Ne lève jamais d'erreur : un fichier absent, en cours de remplacement ou
+    illisible donne ``None`` et le tableau de bord affiche « flotte inconnue ».
+
+    :param chemin: Fichier ``flotte_moteur.json``.
+    :return: ``{"jour", "camions": {immat: {"PTAC", "frigo", "usine", "position", "libre_a", "reserve"…}}}``, ou ``None``.
+    """
+    try:
+        if not chemin or not os.path.isfile(chemin):
+            return None
+        flotte = _lire_avec_cache(chemin, _lire_flotte)
+        return flotte if isinstance(flotte.get("camions"), dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def appliquer_ptac_depasse(statuts: dict, flotte: dict) -> list:
+    """Requalifie en refus les demandes parties dans un camion de PTAC supérieur à leur SPEC.
+
+    Applique le contrat §4.2 : « pour un PTAC dépassé, c'est éliminatoire »
+    (camion de PTAC supérieur au PTAC demandé dans SPEC). Lecture prudente,
+    écrite ainsi dans le contrat : le trajet est hors gamme et la demande
+    compte comme refusée au §4.3. Le PTAC du camion est lu dans l'état de la flotte
+    du moteur ; sans lui, rien n'est requalifié.
+
+    :param statuts: Statuts (:func:`statuts_demandes`), modifiés sur place.
+    :param flotte: État de la flotte (:func:`charger_flotte`), ou ``None``.
+    :return: Identifiants requalifiés.
+    """
+    if not flotte:
+        return []
+    camions = flotte["camions"]
+    requalifiees = []
+    for id_demande, suivi in statuts.items():
+        if suivi["statut"] != "partie" or suivi.get("spec_ptac") is None:
+            continue
+        reel = tonnes(camions.get(suivi.get("immat"), {}).get("PTAC"))
+        if reel is not None and reel > suivi["spec_ptac"] + 1e-9:
+            suivi.update({"statut": "refusee", "motif": MOTIF_PTAC_DEPASSE, "gamme": "hors"})
+            requalifiees.append(id_demande)
+    return requalifiees
+
+
+#: Contrat v3 §4.2 : clés SPEC → champ de la fiche camion.
+CHAMPS_SPEC = {"PTAC": "PTAC", "ENR": "ENERGIE", "COL": "COULEUR"}
+
+#: Gammes de la plus basse à la plus haute.
+ORDRE_GAMMES = ["basse", "mediane", "haute"]
+
+
+def gamme_contrat(avance_min: float, spec: dict, camion: dict) -> dict:
+    """Classe un trajet selon le contrat §4.2 : le plus bas niveau des critères délai et spécifications.
+
+    Délai (avance = ``H_DEP`` − départ contrôlé, en heures projet = minutes
+    réelles) : > 1 h → haute, entre 0 et 1 h → médiane, à l'heure → basse.
+    Spécifications (clés PTAC, ENR, COL de ``SPEC`` comparées à la fiche) :
+    toutes respectées (ou pas de SPEC) → haute, certaines → médiane, aucune → basse.
+    Sans fiche du camion, le critère des spécifications n'est pas évalué (``None``).
+
+    >>> gamme_contrat(3.0, {"COL": "Rouge"}, {"COULEUR": "rouge"})["gamme"]
+    'haute'
+    >>> gamme_contrat(0.5, {}, {})["gamme"], gamme_contrat(3.0, {"PTAC": "12t"}, {"PTAC": "19t"})["gamme"]
+    ('mediane', 'basse')
+
+    :param avance_min: Avance en minutes réelles, ou ``None`` si le départ est illisible.
+    :param spec: Clés de ``SPEC`` (:func:`lire_spec`).
+    :param camion: Fiche du camion (``PTAC``, ``ENERGIE``, ``COULEUR``), ou ``None``.
+    :return: ``{"gamme", "delai", "spec"}`` (gammes ``basse``/``mediane``/``haute``, ``None`` si non évaluée).
+    """
+    delai = None
+    if avance_min is not None:
+        delai = "haute" if avance_min > 1 else "mediane" if avance_min > 0 else "basse"
+    critere_spec = None
+    cles = {k: v for k, v in (spec or {}).items() if k in CHAMPS_SPEC}
+    if not cles:
+        critere_spec = "haute"  # une demande sans SPEC respecte toutes ses spécifications
+    elif camion is not None:
+        respectees = [str(camion.get(CHAMPS_SPEC[k], "")).strip().lower() == str(v).strip().lower()
+                      if k != "PTAC" else tonnes(camion.get("PTAC")) == tonnes(v) for k, v in cles.items()]
+        critere_spec = "haute" if all(respectees) else "basse" if not any(respectees) else "mediane"
+    criteres = [c for c in (delai, critere_spec) if c is not None]
+    return {"gamme": min(criteres, key=ORDRE_GAMMES.index) if criteres else None, "delai": delai, "spec": critere_spec}
+
+
+def classer_gammes(statuts: dict, flotte: dict) -> None:
+    """Ajoute à chaque demande partie sa gamme au sens du contrat (:func:`gamme_contrat`).
+
+    La gamme écrite par le moteur dans le journal (``GAMME``) suit nos seuils
+    internes (``methode-contrat.md`` §3) : elle est gardée dans ``gamme_moteur``.
+
+    :param statuts: Statuts (:func:`statuts_demandes`), modifiés sur place.
+    :param flotte: État de la flotte du moteur (fiches des camions), ou ``None``.
+    """
+    camions = flotte["camions"] if flotte else {}
+    for suivi in statuts.values():
+        if suivi["statut"] != "partie":
+            continue
+        avance = (suivi["h_dep"] - suivi["depart"]).total_seconds() / 60 if suivi["h_dep"] and suivi["depart"] else None
+        classe = gamme_contrat(avance, suivi.get("spec"), camions.get(suivi.get("immat")) if flotte else None)
+        suivi.update({"gamme_moteur": suivi["gamme"], "gamme": classe["gamme"] or suivi["gamme"],
+                      "gamme_delai": classe["delai"], "gamme_spec": classe["spec"]})
+
+
+def _occupations(evenements: list) -> list:
+    """Intervalles pendant lesquels chaque camion roule (du premier départ à la dernière arrivée de sa tournée).
+
+    :param evenements: Journal du moteur.
+    :return: Liste de ``(immat, debut, fin)``.
+    """
+    tournees = {}
+    for evenement in evenements:
+        if evenement["EVENEMENT"] != "TRONCON":
+            continue
+        debut, fin = lire_heure(evenement.get("H_DEBUT", "")), lire_heure(evenement.get("H_FIN", ""))
+        if debut is None or fin is None:
+            continue
+        cle = evenement.get("ID_TOURNEE", "")
+        immat, d0, f0 = tournees.get(cle, (evenement.get("IMMAT", ""), debut, fin))
+        tournees[cle] = (immat, min(d0, debut), max(f0, fin))
+    return list(tournees.values())
+
+
+def resume_flotte(flotte: dict, evenements: list, maintenant: datetime.datetime, etiquettes: list,
+                  debut: datetime.datetime, pas: int) -> dict:
+    """Résume la flotte NORTH par type de camion : composition, état actuel, camions en route dans le temps.
+
+    Camion NORTH (contrat §4.3) = fiche du jour rattachée à une usine NORTH
+    avec PTAC et ENERGIE renseignés : c'est la flotte chargée par le moteur.
+    « En route » : entre le premier départ et la dernière arrivée de sa tournée
+    (journal) ; « réservé » : affecté à une tournée ouverte, pas encore parti.
+
+    :param flotte: État de la flotte (:func:`charger_flotte`), ou ``None``.
+    :param evenements: Journal du moteur.
+    :param maintenant: Heure réelle de référence.
+    :param etiquettes: Étiquettes des cases de la série (une par pas).
+    :param debut: Début de la fenêtre.
+    :param pas: Pas de la série, en minutes réelles.
+    :return: ``{"connue", "jour", "types": {"frigo"|"sec": {"total", "libres", "reserves", "en_route", "par_ptac"}},
+        "serie": {"frigo": [...], "sec": [...]}}`` (camions en route à la fin de chaque case).
+    """
+    vide = {"total": 0, "libres": 0, "reserves": 0, "en_route": 0, "par_ptac": {}}
+    resume = {"connue": flotte is not None, "jour": flotte.get("jour") if flotte else None,
+              "types": {"frigo": dict(vide, par_ptac={}), "sec": dict(vide, par_ptac={})},
+              "serie": {"frigo": [0] * len(etiquettes), "sec": [0] * len(etiquettes)}}
+    if not flotte:
+        return resume
+    camions = flotte["camions"]
+    for camion in camions.values():
+        groupe = resume["types"]["frigo" if camion.get("frigo") else "sec"]
+        groupe["total"] += 1
+        ptac = str(camion.get("PTAC", "?"))
+        groupe["par_ptac"][ptac] = groupe["par_ptac"].get(ptac, 0) + 1
+        libre_a = lire_heure(str(camion.get("libre_a", "")).replace("T", " "))
+        if libre_a is not None and libre_a > maintenant:
+            groupe["en_route"] += 1
+        elif camion.get("reserve"):
+            groupe["reserves"] += 1
+        else:
+            groupe["libres"] += 1
+    occupations = _occupations(evenements)
+    for k in range(len(etiquettes)):
+        instant = min(maintenant, debut + datetime.timedelta(minutes=pas * (k + 1)))
+        for immat, d0, f0 in occupations:
+            if d0 <= instant < f0 and immat in camions:
+                resume["serie"]["frigo" if camions[immat].get("frigo") else "sec"][k] += 1
+    return resume
+
+
+#: Lieux de ``LOCATIONS_NAMES`` (``PK_LOCATIONS`` → nom, latitude, longitude approchées, rôle) pour la carte.
+#: Coordonnées publiques des villes, arrondies : la carte est schématique (pas de fond de carte, VM sans internet).
+LIEUX_CARTE = {
+    1: ("Amsterdam", 52.37, 4.90, "NORTH"), 2: ("Anvers", 51.22, 4.40, "port"), 3: ("Athenes", 37.98, 23.73, "port"),
+    4: ("Brest", 48.39, -4.49, "WEST"), 5: ("Bucarest", 44.43, 26.10, "EAST"), 6: ("Dusseldorf", 51.23, 6.77, "NORTH"),
+    7: ("Florence", 43.77, 11.26, "SOUTH"), 8: ("Le Havre", 49.49, 0.11, "port"), 9: ("Lyon", 45.76, 4.84, "WEST"),
+    10: ("Manchester", 53.48, -2.24, "NORTH"), 11: ("Marseille", 43.30, 5.37, "port"), 12: ("Munich", 48.14, 11.58, "EAST"),
+    13: ("Paris", 48.86, 2.35, "GMS"), 14: ("Rotterdam", 51.92, 4.48, "port"), 15: ("Seville", 37.39, -5.98, "SOUTH"),
+    16: ("Valence", 39.47, -0.38, "SOUTH"), 17: ("Vienne", 48.21, 16.37, "GMS"), 18: ("Zagreb", 45.81, 15.98, "EAST")}
+
+#: Nom normalisé → ``PK_LOCATIONS`` (pour lire les lieux du journal).
+_PK_PAR_NOM = {normaliser_lieu(nom): pk for pk, (nom, _, _, _) in LIEUX_CARTE.items()}
+
+
+def pk_lieu(valeur: str) -> int:
+    """Lit un lieu du journal : ``PK_LOCATIONS`` (``"6"``) ou nom (``"Dusseldorf"``).
+
+    :param valeur: Lieu tel qu'écrit dans le journal.
+    :return: ``PK_LOCATIONS``, ou ``None`` si inconnu.
+    :rtype: int
+    """
+    texte = str(valeur or "").strip()
+    if texte.isdigit():
+        return int(texte) if int(texte) in LIEUX_CARTE else None
+    return _PK_PAR_NOM.get(normaliser_lieu(texte))
+
+
+def carte_camions(flotte: dict, evenements: list, maintenant: datetime.datetime) -> dict:
+    """Place chaque camion NORTH sur la carte à l'heure ``maintenant``.
+
+    Position lue dans les tronçons du journal : sur un tronçon en cours, le
+    camion est placé entre ses deux lieux au prorata du temps (ligne droite) ;
+    entre deux tronçons, au lieu d'arrivée du précédent ; après sa dernière
+    arrivée, à ce lieu ; sans tournée, à son usine (état de la flotte).
+
+    :param flotte: État de la flotte du moteur (:func:`charger_flotte`), ou ``None`` (camions du journal seulement).
+    :param evenements: Journal du moteur.
+    :param maintenant: Heure réelle de référence.
+    :return: ``{"lieux": [{"pk", "nom", "lat", "lon", "role", "frigo", "sec"}], "en_route": [{"immat", "frigo", "lat",
+        "lon", "de", "vers", "charge", "remplissage", "fin"}], "maintenant", "flotte_connue"}``.
+    """
+    troncons = {}
+    for evenement in evenements:
+        if evenement["EVENEMENT"] == "TRONCON" and evenement["H"] <= maintenant:
+            debut, fin = lire_heure(evenement.get("H_DEBUT", "")), lire_heure(evenement.get("H_FIN", ""))
+            if debut is not None and fin is not None:
+                troncons.setdefault(evenement.get("IMMAT", ""), []).append((debut, fin, evenement))
+    camions = dict(flotte["camions"]) if flotte else {immat: {} for immat in troncons}
+    lieux = {pk: {"pk": pk, "nom": nom, "lat": lat, "lon": lon, "role": role, "frigo": 0, "sec": 0}
+             for pk, (nom, lat, lon, role) in LIEUX_CARTE.items()}
+    en_route = []
+    for immat, camion in camions.items():
+        frigo = bool(camion.get("frigo"))
+        position = None
+        passes = sorted((t for t in troncons.get(immat, []) if t[0] <= maintenant), key=lambda t: t[0])
+        if passes:
+            debut, fin, troncon = passes[-1]
+            de, vers = pk_lieu(troncon.get("LIEU_DEP", "")), pk_lieu(troncon.get("LIEU_ARR", ""))
+            if maintenant < fin and de in lieux and vers in lieux:
+                part = (maintenant - debut).total_seconds() / max(1.0, (fin - debut).total_seconds())
+                remplissage = float(troncon.get("REMPLISSAGE") or 0)
+                en_route.append({"immat": immat, "frigo": frigo, "de": lieux[de]["nom"], "vers": lieux[vers]["nom"],
+                                 "lat": round(lieux[de]["lat"] + part * (lieux[vers]["lat"] - lieux[de]["lat"]), 4),
+                                 "lon": round(lieux[de]["lon"] + part * (lieux[vers]["lon"] - lieux[de]["lon"]), 4),
+                                 "charge": remplissage > 0, "remplissage": remplissage, "fin": fin.strftime("%H:%M:%S")})
+                continue
+            position = vers
+        if position is None:
+            try:
+                position = int(camion.get("position", camion.get("usine")))
+            except (TypeError, ValueError):
+                position = None
+        if position in lieux:
+            lieux[position]["frigo" if frigo else "sec"] += 1
+    return {"lieux": sorted(lieux.values(), key=lambda l: l["pk"]), "en_route": en_route,
+            "maintenant": maintenant.strftime(FORMAT_DATE), "flotte_connue": flotte is not None}
+
+
+def score_contrat(notes: dict) -> dict:
+    """Additionne les notes sur 10 des indicateurs du contrat (§4).
+
+    Le professionnalisme (§4.4) est noté par le Contrôle sur 20 puis converti
+    sur 10 : il ne se mesure pas ici et reste ``None``.
+
+    :param notes: ``{"tr", "gammes", "ta", "professionnalisme"}`` → note sur 10 ou ``None``.
+    :return: ``{"notes", "total", "max_mesure", "max"}`` : total des notes connues, sur ``max_mesure``.
+    """
+    connues = [n for n in notes.values() if n is not None]
+    return {"notes": notes, "total": sum(connues) if connues else None,
+            "max_mesure": 10 * len(connues), "max": 10 * len(notes)}
 
 
 def quantiles(valeurs: list) -> dict:
@@ -422,7 +818,7 @@ def _tournees(evenements: list, debut: datetime.datetime, fin: datetime.datetime
 
 
 def _controles(statuts_fenetre: dict, statuts: dict, tournees: list, sources: dict, maintenant: datetime.datetime,
-               horloge: str, seuil: float) -> list:
+               horloge: str, seuil: float, flotte: dict = None) -> list:
     """Liste les contrôles de traçabilité et de délai que le Contrôle peut faire.
 
     :param statuts_fenetre: Statuts des demandes reçues dans la fenêtre.
@@ -432,6 +828,7 @@ def _controles(statuts_fenetre: dict, statuts: dict, tournees: list, sources: di
     :param maintenant: Heure réelle de référence.
     :param horloge: ``"reelle"`` (moteur en direct) ou ``"journal"`` (journal figé).
     :param seuil: Seuil de rentabilité (Annexe 2), ou ``None`` s'il n'est pas affiché.
+    :param flotte: État de la flotte du moteur (PTAC des camions), ou ``None``.
     :return: Liste de ``{"code", "libelle", "n", "ok", "bloquant", "exemples"}``.
     """
     def controle(code: str, libelle: str, ids: list, bloquant: bool = True) -> dict:
@@ -466,6 +863,13 @@ def _controles(statuts_fenetre: dict, statuts: dict, tournees: list, sources: di
                  [i for i, s in statuts_fenetre.items() if s["h_decision"] and s["h_reception"]
                   and s["h_decision"] - s["h_reception"] > delai], bloquant=False),
     ]
+    if flotte is not None:
+        liste.append(controle("PTAC_DEPASSE", "Parties dans un camion de PTAC supérieur à la SPEC (hors gamme, "
+                              "comptées refusées, contrat §4.2)",
+                              [i for i, s in statuts_fenetre.items() if s["motif"] == MOTIF_PTAC_DEPASSE]))
+    else:
+        liste.append(controle("PTAC_NON_VERIFIE", "PTAC des camions inconnu (pas d'état de la flotte du moteur) : "
+                              "PTAC dépassé non vérifié", ["flotte_moteur.json absent"], bloquant=False))
     if seuil is not None:
         liste.append(controle("SOUS_SEUIL", "Tournées parties sous le seuil de rentabilité (Annexe 2)",
                               [t["id"] for t in tournees if t["remplissage"] < seuil], bloquant=False))
@@ -483,8 +887,21 @@ def _controles(statuts_fenetre: dict, statuts: dict, tournees: list, sources: di
     return liste
 
 
+def _compte_type(fenetre: dict, frais: bool) -> dict:
+    """Compte les demandes reçues et parties d'un type de marchandise (TYPE_MAT inconnu compté frais).
+
+    :param fenetre: Statuts des demandes de la fenêtre.
+    :param frais: ``True`` pour le frais, ``False`` pour le sec.
+    :return: ``{"recues", "partie", "ta"}``.
+    """
+    groupe = [s for s in fenetre.values() if (s.get("frais") is not False) == frais]
+    parties = sum(1 for s in groupe if s["statut"] == "partie")
+    return {"recues": len(groupe), "partie": parties, "ta": parties / len(groupe) if groupe else None}
+
+
 def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: datetime.datetime = None,
-             duree_min: float = None, seuil: float = None, cibles: dict = None, taux_horaire: float = None) -> dict:
+             duree_min: float = None, seuil: float = None, cibles: dict = None, taux_horaire: float = None,
+             flotte: dict = None) -> dict:
     """Calcule tous les indicateurs d'audit sur une fenêtre de temps.
 
     Applique R-KPI-TA (TA = demandes NORTH parties / demandes NORTH reçues
@@ -493,6 +910,11 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
     le remplissage est lu dans la colonne ``REMPLISSAGE`` du journal, surface
     au sol des palettes / surface du camion).
     Une demande reçue dans la fenêtre et partie après sa fin compte comme partie.
+    Une demande partie dans un camion de PTAC supérieur à sa SPEC compte comme
+    refusée et hors gamme (contrat §4.2, :func:`appliquer_ptac_depasse`).
+    Les cibles TA et TR sont celles du jour (:func:`cible_ta_contrat`,
+    :func:`cible_tr_contrat`) sauf si ``cibles`` en impose une ; les notes
+    suivent :data:`BAREME` et sont additionnées par :func:`score_contrat`.
 
     :param sources: Sources lues par :func:`charger_sources`.
     :param maintenant: Heure réelle de référence.
@@ -502,6 +924,7 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
     :param seuil: Seuil de rentabilité de l'Annexe 2, affiché seulement si donné (donnée confidentielle).
     :param cibles: Cibles du contrat ``{"ta", "tr", "part_haute"}``.
     :param taux_horaire: Coût horaire hors énergie (confidentiel) ; ``None`` : pas d'estimation en euros.
+    :param flotte: État de la flotte du moteur (:func:`charger_flotte`), ou ``None`` (N_F / N_S et PTAC inconnus).
     :return: Rapport JSON-sérialisable (dates en texte).
     """
     cibles = dict(CIBLES_DEFAUT, **(cibles or {}))
@@ -513,6 +936,8 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
     fin_mesure = min(fin, maintenant)
 
     statuts = statuts_demandes(evenements, demandes, maintenant)
+    ptac_depasse = appliquer_ptac_depasse(statuts, flotte)
+    classer_gammes(statuts, flotte)
     fenetre = {i: s for i, s in statuts.items() if not s["hors_perimetre"] and s["h_reception"]
                and debut <= s["h_reception"] <= fin}
     compte = {k: sum(1 for s in fenetre.values() if s["statut"] == k)
@@ -533,11 +958,45 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
     heures_camion = sum(t["duree_h"] for t in tournees)
     parties_tournees = sum(1 for e in evenements if e["EVENEMENT"] == "PARTIE" and e.get("ID_TOURNEE") in {t["id"] for t in tournees})
 
-    gammes = {"haute": 0, "mediane": 0, "basse": 0}
+    # Gammes (contrat §4.2) : un trajet à PTAC dépassé est « hors gamme » et reste au dénominateur
+    gammes = {"haute": 0, "mediane": 0, "basse": 0, "hors": 0}
+    for suivi in fenetre.values():
+        if suivi["statut"] == "partie" or suivi["gamme"] == "hors":
+            gammes[suivi["gamme"] or "?"] = gammes.get(suivi["gamme"] or "?", 0) + 1
+    trajets = sum(gammes.values())
+    # Ce qui fait descendre les trajets (délai, spécifications) et la gamme écrite par le moteur, pour comparer
+    criteres = {"delai": {g: 0 for g in ORDRE_GAMMES}, "spec": {g: 0 for g in ORDRE_GAMMES},
+                "moteur": {g: 0 for g in ORDRE_GAMMES}}
     for suivi in fenetre.values():
         if suivi["statut"] == "partie":
-            gammes[suivi["gamme"] or "?"] = gammes.get(suivi["gamme"] or "?", 0) + 1
-    part_haute = gammes["haute"] / compte["partie"] if compte["partie"] else None
+            for cle, valeur in (("delai", suivi.get("gamme_delai")), ("spec", suivi.get("gamme_spec")),
+                                ("moteur", suivi.get("gamme_moteur"))):
+                if valeur in criteres[cle]:
+                    criteres[cle][valeur] += 1
+    part_haute = gammes["haute"] / trajets if trajets else None
+    part_haute_mediane = (gammes["haute"] + gammes["mediane"]) / trajets if trajets else None
+
+    # Cibles du jour (contrat §4.1 et §4.3), sur la durée déjà mesurée de la fenêtre
+    duree_h = max(0.0, (fin_mesure - debut).total_seconds() / 3600)
+    n_frais = sum(1 for s in fenetre.values() if s.get("frais") is not False)  # TYPE_MAT inconnu : compté frais
+    n_sec = recues - n_frais
+    camions = resume_flotte(flotte, evenements, maintenant, [], debut, 1)
+    n_frigo = cibles["camions_frigo"] if cibles["camions_frigo"] is not None else (
+        camions["types"]["frigo"]["total"] if camions["connue"] else None)
+    n_non_frigo = cibles["camions_sec"] if cibles["camions_sec"] is not None else (
+        camions["types"]["sec"]["total"] if camions["connue"] else None)
+    formule_ta = cible_ta_contrat(n_frais, n_sec, n_frigo, n_non_frigo, duree_h)
+    debit = recues / duree_h if duree_h >= 1 / 60 else None
+    cible_ta = cibles["ta"] if cibles["ta"] is not None else formule_ta["valeur"]
+    cible_tr = cibles["tr"] if cibles["tr"] is not None else cible_tr_contrat(debit)
+    cibles_jour = {
+        "ta": {**formule_ta, "formule": formule_ta["valeur"], "valeur": cible_ta,
+               "source": "fixee" if cibles["ta"] is not None else "contrat",
+               "n_frais": n_frais, "n_sec": n_sec, "camions_frigo": n_frigo, "camions_sec": n_non_frigo,
+               "source_camions": "imposee" if cibles["camions_frigo"] is not None else
+               ("moteur" if camions["connue"] else None), "duree_h": duree_h},
+        "tr": {"valeur": cible_tr, "source": "fixee" if cibles["tr"] is not None else "contrat", "debit": debit},
+        "part_haute": {"valeur": cibles["part_haute"]}, "part_haute_mediane": {"valeur": cibles["part_haute_mediane"]}}
 
     motifs = {}
     for suivi in fenetre.values():
@@ -580,11 +1039,19 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
     serie["tr"] = [round(statistics.mean(v), 4) if v else None for v in remplissage_cases]
     serie["departs"] = [len(v) for v in remplissage_cases]
 
+    camions = resume_flotte(flotte, evenements, maintenant, serie["etiquettes"], debut, pas)
+
     histogramme = [0] * 10
     for valeur in remplissages:
         histogramme[min(9, int(valeur * 10))] += 1
 
     duree_fenetre = (fin - debut).total_seconds() / 60
+    objectif_ta, objectif_tr = ecart_et_note(ta, cible_ta, bareme=BAREME_TA), ecart_et_note(tr, cible_tr)
+    objectif_haute = ecart_et_note(part_haute, cibles["part_haute"])
+    objectif_hm = ecart_et_note(part_haute_mediane, cibles["part_haute_mediane"])
+    # §4.2 ne donne pas de barème : méthode régressive (barème du TR) sur chaque engagement, la plus basse note retenue
+    notes_gammes = [o["note"] for o in (objectif_haute, objectif_hm) if o["note"] is not None]
+    note_gammes = min(notes_gammes) if notes_gammes else None
     derniers = [{"h": e["H"].strftime("%H:%M:%S"), "evenement": e["EVENEMENT"], "demande": e.get("ID_DEMANDE", ""),
                  "tournee": e.get("ID_TOURNEE", ""), "immat": e.get("IMMAT", ""), "de": e.get("LIEU_DEP", ""),
                  "vers": e.get("LIEU_ARR", ""), "remplissage": e.get("REMPLISSAGE", ""), "gamme": e.get("GAMME", ""),
@@ -603,11 +1070,19 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
                     "ecoule_min": max(0.0, (fin_mesure - debut).total_seconds() / 60),
                     "restant_min": max(0.0, (fin - maintenant).total_seconds() / 60) if duree_min else None},
         "acceptation": {"recues": recues, **compte, "ta": ta, "ta_decidees": ta_decidees, "ta_projete": ta_projete,
-                        "objectif": ecart_et_note(ta, cibles["ta"]), "motifs": motifs, "par_usine": par_usine},
-        "remplissage": {"tr": tr, "objectif": ecart_et_note(tr, cibles["tr"]), "tr_troncons": tr_troncons,
+                        "objectif": objectif_ta, "motifs": motifs, "par_usine": par_usine,
+                        "frais": _compte_type(fenetre, True), "sec": _compte_type(fenetre, False)},
+        "remplissage": {"tr": tr, "objectif": objectif_tr, "tr_troncons": tr_troncons,
                         "quantiles": quantiles(remplissages), "histogramme": histogramme, "seuil": seuil,
                         "sous_seuil": sum(1 for v in remplissages if seuil is not None and v < seuil)},
-        "gammes": {"comptes": gammes, "part_haute": part_haute, "objectif": ecart_et_note(part_haute, cibles["part_haute"])},
+        "gammes": {"comptes": gammes, "trajets": trajets, "part_haute": part_haute, "objectif": objectif_haute,
+                   "part_haute_mediane": part_haute_mediane, "objectif_hm": objectif_hm, "note": note_gammes,
+                   "ptac_depasse": len([i for i in ptac_depasse if i in fenetre]), "criteres": criteres,
+                   "ptac_verifiable": flotte is not None},
+        "cibles": cibles_jour,
+        "score": score_contrat({"tr": objectif_tr["note"], "gammes": note_gammes, "ta": objectif_ta["note"],
+                                "professionnalisme": None}),
+        "camions": camions,
         "flotte": {"tournees": len(tournees), "camions": len({t["immat"] for t in tournees}),
                    "demandes_par_tournee": parties_tournees / len(tournees) if tournees else None,
                    "heures_camion": heures_camion, "heures_vide": heures_vide,
@@ -615,21 +1090,24 @@ def calculer(sources: dict, maintenant: datetime.datetime, horloge: str, debut: 
                    "heures_camion_par_demande": heures_camion / parties_tournees if parties_tournees else None,
                    "cout_par_demande": heures_camion * taux_horaire / parties_tournees
                    if taux_horaire is not None and parties_tournees else None},
-        "series": serie, "controles": _controles(fenetre, statuts, tournees, sources, maintenant, horloge, seuil),
+        "series": serie, "controles": _controles(fenetre, statuts, tournees, sources, maintenant, horloge, seuil, flotte),
         "derniers_evenements": derniers,
     }
 
 
-def statuts_csv(sources: dict, maintenant: datetime.datetime) -> str:
+def statuts_csv(sources: dict, maintenant: datetime.datetime, flotte: dict = None) -> str:
     """Exporte le statut final de chaque demande NORTH, pour comparer avec l'audit du Contrôle.
 
     :param sources: Sources lues par :func:`charger_sources`.
     :param maintenant: Heure réelle de référence.
+    :param flotte: État de la flotte du moteur : les parties à PTAC dépassé passent refusées (contrat §4.2).
     :return: Texte CSV (séparateur ``;``).
     """
+    statuts = statuts_demandes(sources["evenements"], sources["demandes"], maintenant)
+    appliquer_ptac_depasse(statuts, flotte)
     lignes = ["ID_DEMANDE;USINE;TYPE_MVT;H_RECEPTION;H_DEP;STATUT;MOTIF;GAMME;H_DECISION;DEPART_CONTROLE"]
     format_h = lambda h: h.strftime(FORMAT_DATE) if h else ""  # noqa: E731
-    for id_demande, s in sorted(statuts_demandes(sources["evenements"], sources["demandes"], maintenant).items(),
+    for id_demande, s in sorted(statuts.items(),
                                 key=lambda element: element[1]["h_reception"] or datetime.datetime.min):
         lignes.append(";".join([id_demande, s["usine"].capitalize(), s["type_mvt"], format_h(s["h_reception"]),
                                 format_h(s["h_dep"]), "hors_perimetre" if s["hors_perimetre"] else s["statut"],
@@ -640,8 +1118,10 @@ def statuts_csv(sources: dict, maintenant: datetime.datetime) -> str:
 def charger_cibles(chemin: str = FICHIER_CIBLES) -> dict:
     """Lit les cibles négociées avec le Contrôle.
 
-    Fichier JSON facultatif, par exemple ``{"ta": 0.85, "tr": 0.75, "part_haute": 0.3}``
-    (parts entre 0 et 1). Sans fichier, :data:`CIBLES_DEFAUT`.
+    Fichier JSON facultatif, par exemple ``{"part_haute": 0.5, "part_haute_mediane": 0.9}``
+    (parts entre 0 et 1). ``ta`` ou ``tr`` donnés remplacent la cible du jour
+    calculée par le contrat ; ``camions_frigo`` / ``camions_sec`` imposent N_F / N_S.
+    Sans fichier, :data:`CIBLES_DEFAUT`.
 
     :param chemin: Chemin du fichier.
     :return: Cibles.
