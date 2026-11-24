@@ -129,8 +129,9 @@ PREFIXE_ENTREPRISE = "N"
 #: et lectures dans ``TRACABILITE_COMMANDE`` sont limitées aux lignes qui le respectent.
 MOTIF_ID_ENTRE = "^" + PREFIXE_ENTREPRISE + "[0-9]+$"
 
-#: A1 : ``TRACABILITE_TRAJET.TYPE_CAMI`` selon que la remorque est réfrigérée (varchar(20)).
-TYPES_CAMION = {True: "FRIGORIFIQUE", False: "SEC"}
+#: ``TRACABILITE_TRAJET.TYPE_CAMI`` selon que la remorque est réfrigérée (varchar(20)) : « frais ou sec »
+#: dans la spécification du Contrôle, écrit en capitales comme ``STATUT`` (décision d'équipe du 24/11/2026).
+TYPES_CAMION = {True: "FRAIS", False: "SEC"}
 
 #: A1 : ``TRACABILITE_TRAJET.TAUX_REMPLI`` en pour cent (0-100, comme ``LOG_NORTH_TRAJET.TAUX_REMPL``) ;
 #: ``False`` : en fraction (0-1).

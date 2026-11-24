@@ -273,7 +273,7 @@ class TestLignes(Contexte):
         self.assertEqual(self.commande("D1")["STATUT"], "ACCEPTEE")
         self.assertIsNotNone(self.commande("D1")["H_DEP_R"])
         trajet = dict(zip(tc.COLONNES[tc.TABLE_TRAJET], tc.ligne_trajet(self.etat["demandes"]["D1"], self.etat, self.ref, COUTS)))
-        self.assertEqual((trajet["IMMAT_CAMI"], trajet["TYPE_CAMI"], trajet["CAPA_CAMI"]), ("F1", "FRIGORIFIQUE", "19t"))
+        self.assertEqual((trajet["IMMAT_CAMI"], trajet["TYPE_CAMI"], trajet["CAPA_CAMI"]), ("F1", "FRAIS", "19t"))
         self.assertGreater(trajet["COUT_PRESTA"], 0)
         self.assertTrue(0 < trajet["TAUX_REMPLI"] <= 100)
         self.assertEqual((trajet["SPEC_PTAC"], trajet["SPEC_ENER"], trajet["SPEC_COL"]), (None, None, None))
