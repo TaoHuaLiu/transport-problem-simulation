@@ -133,7 +133,8 @@ MOTIF_ID_ENTRE = "^" + PREFIXE_ENTREPRISE + "[0-9]+$"
 #: dans la spécification du Contrôle, écrit en capitales comme ``STATUT`` (décision d'équipe du 24/11/2026).
 TYPES_CAMION = {True: "FRAIS", False: "SEC"}
 
-#: A1 : ``TRACABILITE_TRAJET.TAUX_REMPLI`` en pour cent (0-100, comme ``LOG_NORTH_TRAJET.TAUX_REMPL``) ;
+#: ``TRACABILITE_TRAJET.TAUX_REMPLI`` en pour cent (0-100, une décimale, comme ``LOG_NORTH_TRAJET.TAUX_REMPL``),
+#: format confirmé par l'équipe le 24/11/2026 ;
 #: ``False`` : en fraction (0-1).
 TAUX_REMPLI_EN_POURCENT = True
 
